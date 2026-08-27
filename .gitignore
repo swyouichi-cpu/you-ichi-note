@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Secrets / local credentials (never commit these)
+.env
+*.env
+google-service-account.json
+note_storage_state.json
+*storage_state*.json
+credentials.json
+
+# Playwright
+test-results/
+playwright-report/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
