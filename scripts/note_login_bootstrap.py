@@ -13,6 +13,12 @@
   - GitHub Secrets の NOTE_STORAGE_STATE に登録する(下記手順を参照)
   - このファイル自体は絶対にGitHubへコミットしない(.gitignoreで除外済み)
 
+★重要: このファイルの中身は、Claudeを含む誰にもチャットで貼り付けたり
+共有したりしないでください。GitHub Secretsへ直接登録するだけで完結する
+運用にしています。動作確認は、GitHub Actionsの実行ログや、
+(デバッグ用に有効化した場合のみ)スクリーンショットのArtifactを
+確認する形で行います。
+
 事前準備:
   pip install playwright
   playwright install chromium

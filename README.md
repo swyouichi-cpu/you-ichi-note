@@ -12,12 +12,16 @@ ChatGPTで作成した記事を Google Sheets 経由で note に「下書き」�
 | 3 | note下書き作成(Playwright) | 🚧 スケルトンのみ。実画面での検証が必要 |
 | 4 | Craftアーカイブ | ⏳ 未着手(CraftのAPI Connection設定待ち) |
 | 5 | 全体統合 | ⏳ 未着手 |
-| 6 | GitHub Actions定時実行 | ⏳ 未着手 |
+| 6 | GitHub Actions定時実行 | ✅ ワークフロー作成済み(手動実行で検証可能) |
 
 **重要な安全設計**
 - このシステムは **noteの「公開」ボタンを絶対に自動で押しません**。行うのは「下書き保存」までです。
 - 二重投稿防止を最優先しています。処理が途中で止まった場合、自動では復旧させず、
   必ず `needs_review` という状態にして人間の確認を求めます。
+- **秘密情報(Googleサービスアカウントの鍵、noteのログインセッション)は、
+  あなたがGitHub Secretsに直接登録し、Claudeとのチャットには一切貼り付けません。**
+  動作確認はGitHub Actionsの実行ログ、または(必要な場合のみ)デバッグ用の
+  スクリーンショットArtifactを通じて行います(詳細は「5. 秘密情報を共有せずに動作確認する方法」)。
 
 ---
 
@@ -87,7 +91,10 @@ ready → processing → draft → published
    (`xxxx@xxxx.iam.gserviceaccount.com` のような形式)と共有(**編集者**権限)
 4. スプレッドシートのURLからID部分をコピー
 
-### 4-2. ローカルでの動作確認
+### 4-2. ローカルでの動作確認(任意)
+
+自分のPCで試したい場合は以下の手順です。**`.env`はあなたのPCの中だけに置き、
+Claudeとのチャットには内容を貼り付けないでください。**
 
 ```bash
 python3 -m venv .venv
@@ -96,6 +103,7 @@ pip install -r requirements-dev.txt
 
 cp .env.example .env
 # .env を開いて、GOOGLE_SERVICE_ACCOUNT_JSON / SPREADSHEET_ID を実際の値に書き換える
+# (この.envファイルはあなたのPCだけに置く。Claudeには絶対に共有しない)
 
 # シートに接続できるか、対象記事があるか確認する(何も書き換えない)
 python -m src.main fetch
@@ -103,6 +111,10 @@ python -m src.main fetch
 # processingのまま残っている行をneeds_reviewに変更する
 python -m src.main reconcile
 ```
+
+これらのコマンドの**画面出力(ログ)には秘密情報は表示されません**。
+うまく動かない場合は、その出力テキストだけをClaudeに共有してもらえれば
+デバッグできます(鍵の中身を貼る必要はありません)。
 
 ### 4-3. noteのログインセッション取得(Phase3で使用)
 
@@ -113,14 +125,55 @@ python scripts/note_login_bootstrap.py
 ```
 
 表示されたブラウザで手動でnoteにログインし、ターミナルでEnterを押すと
-`note_storage_state.json` が生成されます。中身をGitHub Secretsの
-`NOTE_STORAGE_STATE` に登録してください(詳細はスクリプト内のコメント参照)。
+`note_storage_state.json` が生成されます。**このファイルの中身は
+Claudeを含め誰にも共有せず**、下記4-4の手順でGitHub Secretsへ直接登録して
+ください。
 
-**注意**: このファイルにはログイン済みセッション情報が入っています。
-パスワードそのものではありませんが、あなたのnoteアカウントを操作できてしまう
-機密情報です。GitHubには絶対にコミットしないでください(`.gitignore`で除外済み)。
+### 4-4. GitHub Secretsへの登録(値は必ずGitHubの画面で直接入力する)
 
-## 5. テスト実行
+1. GitHubリポジトリの `Settings > Secrets and variables > Actions` を開く
+2. `New repository secret` から、以下をそれぞれ登録する
+
+| Secret名 | 登録する値 |
+|---|---|
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | サービスアカウントの鍵ファイルの中身(JSON全文) |
+| `SPREADSHEET_ID` | スプレッドシートのID |
+| `NOTE_STORAGE_STATE` | `note_storage_state.json` の中身(JSON全文) |
+
+3. (任意) `Settings > Secrets and variables > Actions > Variables` タブで
+   `SHEET_NAME` を登録すると、シート(タブ)名を`Sheet1`以外にできる
+
+**これらの値は、Claudeとのチャット・Issue・コミットメッセージなど、
+GitHub Secrets以外のどこにも入力しないでください。**登録が終わったら、
+ローカルに残っている `note_storage_state.json` や `.env` は削除して構いません。
+
+## 5. 秘密情報を共有せずに動作確認する方法
+
+Claudeは秘密情報の中身を一切受け取らずに、以下の方法で動作確認・デバッグを
+手伝うことができます。
+
+**方法A: GitHub Actionsを手動実行して、ログだけ確認する**
+
+1. GitHubリポジトリの `Actions` タブ → `Content Pipeline` を開く
+2. `Run workflow` から手動実行(`mode`に `fetch` を選ぶと、何も書き換えず
+   Sheets接続と対象記事の検出だけを確認できる。`reconcile`はprocessing残留の
+   整理のみ。`run`が本番の全体処理)
+3. 実行が終わったら、そのログをコピーしてClaudeに共有する
+   (ログには本文・パスワード・Cookie・トークンなどは一切出力されない設計)
+
+**方法B: noteの画面操作をスクリーンショットで確認する(Phase3のセレクタ検証用)**
+
+1. `Run workflow` 実行時に `mode: run` かつ `debug_screenshots: true` を指定する
+2. 実行後、そのワークフロー実行ページ下部の `Artifacts` から
+   `note-debug-screenshots` をダウンロードする
+3. 中身の画像を確認し、**個人情報が写っていないか自分の目で確認したうえで**
+   問題なさそうな画像だけをClaudeに共有する(セッション情報そのものは
+   画像には含まれない)
+
+この方法で、`src/note.py` の未検証部分(タイトル欄・本文欄・タグ欄の
+指定など)を、実際の画面を見ながら一緒に直していきます。
+
+## 6. テスト実行
 
 ```bash
 pip install -r requirements-dev.txt
@@ -129,13 +182,18 @@ pytest
 
 Sheets・note実際のAPIへは一切アクセスせず、ロジック部分だけをテストしています。
 
-## 6. 既知の未検証事項・今後の作業
+## 7. GitHub Actionsのスケジュール
+
+`.github/workflows/content-pipeline.yml` は毎日 UTC 00:00(=日本時間 09:00)に
+自動実行されます。手動実行(`workflow_dispatch`)にも対応しています。
+同時に複数の実行が重ならないよう`concurrency`設定を入れているため、
+前回の実行が終わる前に手動実行しても、待機されるだけで二重実行にはなりません。
+
+## 8. 既知の未検証事項・今後の作業
 
 - `src/note.py` のセレクタ(どのボタン・入力欄を操作するか)は、note.comの
   実際の画面を見ながらユーザーと一緒に検証する前提の暫定実装です。特に
-  タグ入力部分は未実装(`NotImplementedError`)です。
+  タグ入力部分は未実装(`NotImplementedError`)です。上記「5. 秘密情報を
+  共有せずに動作確認する方法」の手順で一緒に検証・修正します。
 - Craft連携(Phase4)は、Craftアプリの「Connections」から発行される
   API URL・認証情報が確定してから実装します。
-- GitHub Actionsのワークフロー(Phase6)はまだ作成していません。
-  スケジュールはUTC基準になるため、日本時間との対応をワークフロー作成時に
-  明記します。

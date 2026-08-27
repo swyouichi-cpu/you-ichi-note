@@ -1,0 +1,67 @@
+name: Content Pipeline
+
+# スケジュールはUTC基準。 "0 0 * * *" = UTC 00:00 = 日本時間(JST) 09:00
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: >
+          run: 通常の自動処理(note下書き作成まで実行)。
+          fetch: 対象記事があるか確認するだけで何も書き換えない(Sheets接続確認用)。
+          reconcile: processing残留をneeds_reviewに変更するだけ。
+        type: choice
+        options: [run, fetch, reconcile]
+        default: run
+      debug_screenshots:
+        description: >
+          (modeがrunの場合のみ有効) note操作の各ステップでスクリーンショットを
+          撮影し、Artifactとして保存する(セレクタ検証用)。スクリーンショット
+          にはnoteの画面全体(アカウント名や他の下書き一覧などUIの周辺情報を
+          含む場合がある)が写るため、内容を確認してから共有するかどうか
+          判断してください。
+        type: boolean
+        default: false
+
+# 前回の実行が終わる前に次の実行が重ならないようにする(二重投稿防止のため)。
+concurrency:
+  group: content-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install --with-deps chromium
+
+      - name: Run pipeline
+        env:
+          # 実際の値はすべて GitHub Secrets 側で登録する。
+          # このワークフローファイル自体には秘密情報を一切書かない。
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_NAME: ${{ vars.SHEET_NAME }}
+          NOTE_STORAGE_STATE: ${{ secrets.NOTE_STORAGE_STATE }}
+          NOTE_DEBUG_SCREENSHOT_DIR: ${{ github.event.inputs.debug_screenshots == 'true' && 'debug_screenshots' || '' }}
+        run: python -m src.main "${{ github.event.inputs.mode || 'run' }}"
+
+      - name: Upload debug screenshots
+        if: ${{ github.event.inputs.debug_screenshots == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: note-debug-screenshots
+          path: debug_screenshots/
+          retention-days: 7
+          if-no-files-found: ignore
