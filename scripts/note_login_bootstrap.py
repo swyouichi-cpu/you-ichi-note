@@ -5,8 +5,15 @@
   1. あなたのパソコンでブラウザ(Chromium)を開く
   2. あなたが手動でnoteにログインする(パスワードはこの画面にしか入力されず、
      どこにも送信・記録されません)
-  3. ログイン完了後、Enterキーを押すと、ログイン済みの状態(Cookie等)を
-     note_storage_state.json というファイルに保存する
+  3. ログイン完了後、Enterキーを押すと、実際に記事を作成する画面
+     (note.com/notes/new。現在はeditor.note.comへ転送される)を一度開いてから、
+     ログイン済みの状態(Cookie・localStorage等)を note_storage_state.json
+     というファイルに保存する
+
+     ※ 記事作成画面を一度開いてから保存するのは、note.comとは別ドメインの
+     editor.note.com側でしか作られない情報(そのドメイン用のlocalStorage等)
+     が、ログイン画面(note.com/login)だけを開いた状態だと保存されない
+     可能性があるため。
 
 保存されたファイルの中身(セッション情報)は、あなたのnoteアカウントに
 そのままログインできてしまう機密情報です。次の用途以外に使わないでください。
@@ -46,6 +53,11 @@ from playwright.sync_api import sync_playwright
 
 OUTPUT_PATH = Path(__file__).resolve().parent.parent / "note_storage_state.json"
 
+# src/note.py の NOTE_NEW_NOTE_URL と同じ値。このスクリプトは単独でも
+# 実行できるようにするため、あえてimportせず値を重複させている
+# (src/note.py側を変更したら、ここも合わせて変更すること)。
+NOTE_NEW_NOTE_URL = "https://note.com/notes/new"
+
 
 def main() -> None:
     print("ブラウザを起動します。表示された画面で、手動でnoteにログインしてください。")
@@ -58,6 +70,14 @@ def main() -> None:
         page.goto("https://note.com/login")
 
         input("\nnoteへのログインが完了したら、ここでEnterキーを押してください... ")
+
+        print("記事作成画面を開いて、その画面用の情報も取得します...")
+        page.goto(NOTE_NEW_NOTE_URL, wait_until="networkidle")
+        print(f"到達したURL: {page.url}")
+        input(
+            "記事作成画面が正常に表示されていることを確認したら、"
+            "ここでEnterキーを押してください... "
+        )
 
         context.storage_state(path=str(OUTPUT_PATH))
         browser.close()

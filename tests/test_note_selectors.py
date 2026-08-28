@@ -47,6 +47,7 @@ def _bare_poster() -> NotePoster:
     poster._page_errors = []
     poster._failed_requests = []
     poster._responses = []
+    poster._cors_notes = []
     return poster
 
 
@@ -135,3 +136,18 @@ def test_diagnostics_text_includes_url_title_and_readystate(page):
     assert "page.url()" in text
     assert "document.readyState" in text
     assert "本文サンプル" in text
+    assert "APIパスへのレスポンスとCORSヘッダ" in text
+
+
+def test_diagnostics_text_reports_cors_headers_for_api_responses(page):
+    poster = _bare_poster()
+    poster._cors_notes = [
+        "403 https://note.com/api/v1/text_notes "
+        "access-control-allow-origin=(なし) access-control-allow-credentials=(なし)"
+    ]
+    page.set_content("<div>ダミー</div>")
+
+    text = poster._diagnostics_text(page, step_name="テストステップ")
+
+    assert "403 https://note.com/api/v1/text_notes" in text
+    assert "access-control-allow-origin=(なし)" in text

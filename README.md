@@ -124,10 +124,13 @@ playwright install chromium
 python scripts/note_login_bootstrap.py
 ```
 
-表示されたブラウザで手動でnoteにログインし、ターミナルでEnterを押すと
-`note_storage_state.json` が生成されます。**このファイルの中身は
-Claudeを含め誰にも共有せず**、下記4-4の手順でGitHub Secretsへ直接登録して
-ください。
+表示されたブラウザで手動でnoteにログインし、ターミナルでEnterを押すと、
+続けて記事作成画面(note.com/notes/new。現在はeditor.note.comへ転送される)
+を自動で開きます。その画面が表示されたことを確認してもう一度Enterを押すと
+`note_storage_state.json` が生成されます(記事作成画面を一度開くのは、
+note.comとは別ドメインのeditor.note.com側でしか作られない情報を
+取りこぼさないようにするためです)。**このファイルの中身はClaudeを含め
+誰にも共有せず**、下記4-4の手順でGitHub Secretsへ直接登録してください。
 
 ### 4-4. GitHub Secretsへの登録(値は必ずGitHubの画面で直接入力する)
 

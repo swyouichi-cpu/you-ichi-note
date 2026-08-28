@@ -33,14 +33,25 @@ NOTE_DEBUG_SCREENSHOT_DIR が設定されている場合、各ステップの成
 テキスト診断ファイル(_diag.txt)を保存する。_diag.txtには以下を含める。
   - 失敗時点の page.url() / document.title / document.readyState
   - JSコンソールに出力されたログ・エラー(ブラウザ内のJS実行状況を見るため)
-  - 読み込みに失敗したリクエスト(requestfailed)
+  - 読み込みに失敗したリクエスト(requestfailed)。resource_type・Originヘッダ・
+    Cookieヘッダが「付いていたかどうか」(値そのものは含まない)を含む
   - HTTPステータスが2xx/3xx以外だったレスポンスの一覧
+  - APIパス(/api/を含むURL)へのレスポンスについて、
+    access-control-allow-origin / access-control-allow-credentials
+    ヘッダの値(CORS許可設定そのものであり、認証情報ではない)
 これらはいずれもDOM・ネットワークの状態を見るための情報であり、
 Cookie・セッション情報・GitHub Secretsの中身は一切含まれない
 (レスポンスのヘッダ・ボディそのものは記録しない。URL・メソッド・
 ステータスコードのみを記録し、URLのクエリ文字列も念のため除去する)。
 ただし記事本文などあなたのコンテンツそのものは画面/ページ内テキストとして
 写り得るため、共有前に中身を確認すること。
+
+★ブラウザcontextの設定★
+GitHub Actions(クラウドIP・ヘッドレス)からのアクセスがnote側のbot対策等に
+引っかかっていないかを切り分けるため、一般的なデスクトップChromeに近い
+User-Agent・locale(ja-JP)・timezone(Asia/Tokyo)・viewportを明示的に設定して
+いる。これは特定の人物・組織を装うものではなく、一般的なブラウザ環境を
+再現するテスト目的の設定。
 """
 from __future__ import annotations
 
@@ -103,6 +114,7 @@ class NotePoster:
         self._page_errors: list[str] = []
         self._failed_requests: list[str] = []
         self._responses: list[tuple[str, int]] = []
+        self._cors_notes: list[str] = []
 
     def __enter__(self) -> "NotePoster":
         self._playwright = sync_playwright().start()
@@ -115,7 +127,21 @@ class NotePoster:
                 "scripts/note_login_bootstrap.py で取得したファイルの中身を"
                 "そのまま設定しているか確認してください。"
             ) from exc
-        self._context = self._browser.new_context(storage_state=storage_state)
+        # GitHub Actions(ヘッドレス・クラウドIP)からのアクセスがnote側の
+        # bot対策等に引っかかっていないかを切り分けるため、実在のデスクトップ
+        # Chromeに近いUser-Agent/locale/timezone/viewportを明示的に設定する。
+        # これは特定の人物・組織を装うものではなく、一般的なブラウザ環境を
+        # 再現するテスト目的の設定。
+        self._context = self._browser.new_context(
+            storage_state=storage_state,
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="ja-JP",
+            timezone_id="Asia/Tokyo",
+            viewport={"width": 1280, "height": 800},
+        )
         return self
 
     def __exit__(self, *_exc_info) -> None:
@@ -149,13 +175,38 @@ class NotePoster:
         def _on_requestfailed(request) -> None:
             if len(self._failed_requests) < _MAX_DIAG_ENTRIES:
                 failure = request.failure or "(不明)"
+                try:
+                    headers = request.headers
+                except Exception:  # noqa: BLE001
+                    headers = {}
+                # Cookieが「送信されようとしたか」を確認するため、値ではなく
+                # ヘッダの有無だけを記録する(値そのものは絶対に記録しない)。
+                cookie_present = "cookie" in headers
+                origin = headers.get("origin", "(なし)")
                 self._failed_requests.append(
-                    f"{request.method} {_strip_query(request.url)} -> {failure}"
+                    f"{request.method} {_strip_query(request.url)} "
+                    f"resource_type={request.resource_type} origin={origin} "
+                    f"cookie_header_present={cookie_present} -> {failure}"
                 )
 
         def _on_response(response) -> None:
             if len(self._responses) < _MAX_DIAG_ENTRIES:
                 self._responses.append((_strip_query(response.url), response.status))
+            # CORS関連ヘッダの有無だけを別途記録する(APIパスのみ、件数上限あり)。
+            # ヘッダの値そのものは記録するが、これは通信可否の設定値であり
+            # 秘密情報ではない(Cookie等の認証情報は含まれない)。
+            if "/api/" in response.url and len(self._cors_notes) < _MAX_DIAG_ENTRIES:
+                try:
+                    headers = response.headers
+                except Exception:  # noqa: BLE001
+                    headers = {}
+                allow_origin = headers.get("access-control-allow-origin", "(なし)")
+                allow_credentials = headers.get("access-control-allow-credentials", "(なし)")
+                self._cors_notes.append(
+                    f"{response.status} {_strip_query(response.url)} "
+                    f"access-control-allow-origin={allow_origin} "
+                    f"access-control-allow-credentials={allow_credentials}"
+                )
 
         page.on("console", _on_console)
         page.on("pageerror", _on_pageerror)
@@ -210,6 +261,9 @@ class NotePoster:
             f"response status件数: {status_counts}",
             f"4xx/5xxのレスポンス ({len(error_responses)}件):",
             *[f"  {m}" for m in error_responses],
+            "",
+            f"APIパスへのレスポンスとCORSヘッダ ({len(self._cors_notes)}件):",
+            *[f"  {m}" for m in self._cors_notes],
         ]
         return "\n".join(lines)
 
@@ -262,7 +316,7 @@ class NotePoster:
         error_response_count = sum(1 for _u, status in self._responses if status >= 400)
         logger.warning(
             "診断サマリ [%s]: url=%s title=%r console=%d件 pageerror=%d件 "
-            "requestfailed=%d件 4xx/5xx応答=%d件",
+            "requestfailed=%d件 4xx/5xx応答=%d件 API応答=%d件",
             step_name,
             url,
             title,
@@ -270,6 +324,7 @@ class NotePoster:
             len(self._page_errors),
             len(self._failed_requests),
             error_response_count,
+            len(self._cors_notes),
         )
 
     # -- 複数候補セレクタから最初に見つかったものを使う仕組み -------------------
