@@ -1,10 +1,11 @@
-"""実行エントリポイント。
+"""実行エントリポイント(Phase 1: 完成・実機検証済み)。
 
 サブコマンド:
-  reconcile   前回processingのまま残った行をneeds_reviewにする(実行の最初に必ず行う)
+  reconcile   前回processingのまま残った行、およびready+note_url不整合な行を
+              needs_reviewにする(実行の最初に必ず行う)
   fetch       次に処理すべき記事があるか確認するだけ(何も書き換えない)
-  run         reconcile -> 対象記事取得 -> processing -> note下書き作成 -> draft
-              (note.py が未実装のPhase1〜2段階では使えない)
+  run         reconcile -> 対象記事取得 -> processing -> note下書き作成
+              -> Sheetsへの書き戻し(read-back検証込み) -> draft_created
 """
 from __future__ import annotations
 
@@ -88,10 +89,12 @@ def cmd_run(_args: argparse.Namespace) -> int:
         return 0
 
     try:
-        from src.note import NotePoster  # 遅延import(Phase3で追加)
+        # 遅延import。Playwright/note関連の依存を、Sheetsのみを使う
+        # reconcile/fetchサブコマンドの実行時には読み込ませないため。
+        from src.note import NotePoster
     except ImportError:
         manager.mark_needs_review(
-            article, stage="note", message="note.py が未実装です(Phase3未着手)。"
+            article, stage="note", message="src/note.py の読み込みに失敗しました。"
         )
         return 1
 
