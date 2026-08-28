@@ -403,3 +403,100 @@ def test_open_publish_settings_not_fooled_by_preexisting_ai_tooltip_dialog(page)
     # メッセージ(編集画面のままでした)になることを確認する。
     with pytest.raises(NotePosterError, match="編集画面のままでした"):
         poster._open_publish_settings(page)
+
+
+# -- タグ保持確認の堅牢性(実機で見つかった偽陽性の回帰テスト) --------------
+#
+# 実機テストで、「テスト」「自動投稿」というタグを入力したのに、キャンセル後
+# 再度開いた画面には無関係な単語(記事本文由来と見られるもの)がタグとして
+# 残っているという不具合が見つかった。原因は、タグの確認処理が「#」無しの
+# 素の単語にも部分一致していたため、本文・タイトル中に同じ単語が出現すると
+# 実際にはタグが反映されていなくても「確認できた」と誤判定していたこと。
+
+
+def test_assert_hashtags_present_not_fooled_by_bare_word_in_prose(page):
+    # 「自動投稿」という単語は本文中に(#無しで)出現するが、実際のタグ
+    # チップ(#自動投稿)は存在しない、という実機で発生した状況を再現する。
+    page.set_content("<p>自動投稿テストという記事です。#違うタグ</p>")
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError, match=r"\['自動投稿'\]"):
+        poster._assert_hashtags_present(page, ["自動投稿"])
+
+
+def test_assert_hashtags_present_error_lists_actually_visible_chips(page):
+    page.set_content("<div><span>#記事</span> <span>#note</span></div>")
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError) as exc_info:
+        poster._assert_hashtags_present(page, ["自動投稿"])
+
+    message = str(exc_info.value)
+    assert "#記事" in message
+    assert "#note" in message
+
+
+def test_assert_hashtags_present_succeeds_when_all_chips_present(page):
+    page.set_content("<p>#テスト #自動投稿 #サンプル</p>")
+    poster = _bare_poster()
+
+    poster._assert_hashtags_present(page, ["テスト", "自動投稿", "サンプル"])  # 例外が出なければOK
+
+
+def test_assert_hashtags_present_reports_all_missing_tags_together(page):
+    # 途中のタグだけ保存されないケース: 3件中、真ん中の1件だけ無い。
+    page.set_content("<p>#テスト #サンプル</p>")
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError, match=r"\['自動投稿'\]"):
+        poster._assert_hashtags_present(page, ["テスト", "自動投稿", "サンプル"])
+
+
+def test_assert_hashtags_present_waits_for_delayed_chip_render(page):
+    # 保存反映が遅れるケース: チップがすぐには無く、少し遅れて表示される。
+    page.set_content("<div id='chips'></div>")
+    poster = _bare_poster()
+    page.evaluate(
+        "setTimeout(() => { "
+        "document.getElementById('chips').textContent = '#テスト'; "
+        "}, 300)"
+    )
+
+    poster._assert_hashtags_present(page, ["テスト"])  # 例外が出なければOK
+
+
+def test_fill_tags_reports_needs_review_when_only_some_tags_persist(page):
+    # 複数タグのうち一部だけがキャンセル後に失われるケースの統合テスト。
+    # 「自動投稿」だけを消し、他は保持する挙動を再現する。
+    page.set_content(
+        _PUBLISH_SETTINGS_HTML_TEMPLATE.format(
+            clear_chips_js=(
+                "document.querySelectorAll('#chips span').forEach(el => {"
+                "  if (el.textContent === '#自動投稿') { el.remove(); }"
+                "});"
+            )
+        )
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError, match=r"\['自動投稿'\]"):
+        poster._fill_tags(page, ["テスト", "自動投稿", "サンプル"])
+
+
+def test_fill_tags_partial_failure_never_clicks_the_post_button(page):
+    """安全設計の確認: 一部タグの保持に失敗した場合でも「投稿する」は押さない。"""
+    page.set_content(
+        _PUBLISH_SETTINGS_HTML_TEMPLATE.format(
+            clear_chips_js="document.getElementById('chips').innerHTML = '';"
+        )
+    )
+    page.evaluate(
+        "document.getElementById('post').addEventListener('click', "
+        "() => { window.__posted = true; })"
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._fill_tags(page, ["テスト"])
+
+    assert page.evaluate("window.__posted === true") is False

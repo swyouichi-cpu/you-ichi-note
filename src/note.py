@@ -52,6 +52,24 @@ AIアシスタントの案内ツールチップが常時 role="dialog" として
 無かったダイアログが新たに現れたか」だけを見るようにしている
 (_visible_dialog_locator / dialog_was_visible_before)。
 
+★タグ保持確認の偽陽性について(既知の問題への対処)★
+実機テストで、「テスト」「自動投稿」というタグを入力・確定・キャンセル後、
+もう一度公開設定パネルを開いたところ、入力していないはずの無関係な単語
+(記事本文由来と見られるもの)がタグとして残っており、逆に「自動投稿」が
+消えている、という不具合が見つかった。原因は、タグの確認処理が「#」無しの
+素の単語にも部分一致する候補を持っていたため、本文・タイトル中に同じ単語
+(例:「自動投稿テスト」というタイトル中の「自動投稿」)が出現すると、
+実際にはタグチップが無くても地の文への一致で「確認できた」と誤判定して
+いたこと。そのため _hashtag_chip_candidate() は「#タグ名」への一致のみを
+判定基準にし(#無しの素の単語への一致は候補から除外)、
+_assert_hashtags_present() は全タグを確認したうえで欠けているものを
+まとめて報告し、実際に画面上に見えている#付き文字列の一覧
+(_list_visible_hashtag_chips)もエラーメッセージに含めるようにした。
+また _enter_hashtags() は、各タグをチップとして確定させた直後に
+_wait_for_autosave_idle() でnote側の内部状態・自動保存が反映されるのを
+待ってから次のタグの入力へ進むようにし、前のタグの保存が完了する前に
+次を入力してしまう競合を避けている。
+
 ★本文入力の内部状態反映について(既知の問題への対処)★
 以前は本文の入力に keyboard.insert_text() を行単位でまとめて流し込む
 実装を使っていた。画面上はテキストが表示され document.title にも
@@ -818,11 +836,46 @@ class NotePoster:
             ("css input[placeholder*=ハッシュタグ]", page.locator('input[placeholder*="ハッシュタグ"]')),
         ]
 
-    def _hashtag_chip_candidates(self, page: Page, tag: str) -> list[tuple[str, Locator]]:
-        return [
-            (f"text=#{tag}", page.get_by_text(f"#{tag}", exact=False)),
-            (f"text={tag}", page.get_by_text(tag, exact=False)),
-        ]
+    def _hashtag_chip_candidate(self, page: Page, tag: str) -> Locator:
+        """「#タグ名」というチップを指すロケータを1つだけ返す。
+
+        以前は "#タグ名" に加えて "タグ名"(#無し)への部分一致も候補に
+        入れていたが、実機テストで「テスト」「自動投稿」がタイトル・本文中の
+        同じ単語(例:「自動投稿テスト...」)に誤って一致し、実際にはタグが
+        反映されていないのに「確認できた」と誤判定する不具合が発生した。
+        タグチップは必ず"#"付きで表示されることが実機で確認できているため、
+        "#タグ名" への一致のみを判定基準にする(本文中の地の文に"#"付きで
+        同じ語が出現する可能性は極めて低い)。
+        """
+        return page.get_by_text(f"#{tag}", exact=False)
+
+    def _list_visible_hashtag_chips(self, page: Page) -> list[str]:
+        """画面上に見えている「#で始まる短いテキスト」要素を列挙する(診断用)。
+
+        タグチップの実際のコンテナ要素が不明なため確実な一覧取得は保証
+        できないが、「意図したタグが本当に無いのか、想定外の別のタグに
+        置き換わっているのか」を切り分けるための手がかりとして使う。
+        """
+        try:
+            return page.evaluate(
+                """
+                () => {
+                  const seen = new Set();
+                  const results = [];
+                  document.querySelectorAll('*').forEach(el => {
+                    if (el.children.length > 0) return;
+                    const text = (el.textContent || '').trim();
+                    if (/^#\\S{1,30}$/.test(text) && !seen.has(text)) {
+                      seen.add(text);
+                      results.push(text);
+                    }
+                  });
+                  return results.slice(0, 50);
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001 - 診断目的なので失敗しても処理は続ける
+            return []
 
     def _enter_hashtags(self, page: Page, tags: list[str]) -> None:
         tag_input = self._resolve_locator(
@@ -836,27 +889,45 @@ class NotePoster:
             # (確定していなければ次のタグの入力に進まない)。
             self._resolve_locator(
                 page,
-                self._hashtag_chip_candidates(page, tag),
+                [(f"text=#{tag}", self._hashtag_chip_candidate(page, tag))],
                 step_name=f"ハッシュタグ確定確認({tag})",
-                timeout_ms=3000,
+                timeout_ms=5000,
             )
+            # noteの内部状態・非同期保存(自動保存)が反映されるのを待ってから
+            # 次のタグの入力へ進む。前のタグの保存が完了する前に次を入力すると
+            # 状態を上書きしてしまう可能性があるため。
+            self._wait_for_autosave_idle(page, timeout_ms=10000)
 
     def _assert_hashtags_present(self, page: Page, tags: list[str]) -> None:
+        """すべてのタグがチップとして残っているか確認する。
+
+        1件ずつ確認して最初の不一致で即座に諦めるのではなく、まず全件を
+        チェックして「何が欠けているか」をまとめて把握したうえでエラーに
+        する。エラーメッセージには、欠けているタグに加えて、実際に画面上に
+        見えている#付きの文字列一覧も含める。前回の実機テストでは、
+        入力していないはずの無関係な単語(記事本文由来と見られるもの)が
+        チップとして残っており、原因調査にはこの実際の一覧が重要な手がかりに
+        なったため。
+        """
+        missing: list[str] = []
         for tag in tags:
             try:
-                self._resolve_locator(
-                    page,
-                    self._hashtag_chip_candidates(page, tag),
-                    step_name=f"ハッシュタグ保持確認({tag})",
-                    timeout_ms=3000,
+                self._hashtag_chip_candidate(page, tag).first.wait_for(
+                    state="visible", timeout=5000
                 )
-            except NotePosterError as exc:
-                raise NotePosterError(
-                    f"タグ '{tag}' が「キャンセル」で編集画面に戻った後に"
-                    "見当たりませんでした。「公開に進む→タグ入力→キャンセル」"
-                    "では下書きにタグが反映されないことが確認できたため、"
-                    "この経路でのタグ設定は安全に行えません。処理を中断します。"
-                ) from exc
+            except PlaywrightTimeoutError:
+                missing.append(tag)
+
+        if missing:
+            actual_chips = self._list_visible_hashtag_chips(page)
+            self._capture_failure(page, "ハッシュタグ保持確認")
+            raise NotePosterError(
+                f"以下のタグが「キャンセル」で編集画面に戻った後に見当たりません"
+                f"でした: {missing}。画面上に実際に見えている#付きの文字列: "
+                f"{actual_chips}。「公開に進む→タグ入力→キャンセル」では意図した"
+                "タグが正しく反映されない可能性があるため、この経路でのタグ設定は"
+                "安全に行えません。処理を中断します。"
+            )
 
     def _save_draft(self, page: Page) -> None:
         candidates = [
