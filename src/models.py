@@ -8,17 +8,17 @@ from enum import StrEnum
 class Status(StrEnum):
     """記事の処理状態。
 
-    正常系: READY -> PROCESSING -> DRAFT -> PUBLISHED
+    正常系: READY -> PROCESSING -> DRAFT_CREATED -> PUBLISHED
     失敗系(原因が明確):      PROCESSING -> ERROR
     失敗系(成否が不明):      PROCESSING -> NEEDS_REVIEW
 
     NEEDS_REVIEW は人間が note / Craft の実際の状態を確認し、
-    手動で READY か DRAFT に書き換えるまで、自動処理の対象にしない。
+    手動で READY か DRAFT_CREATED に書き換えるまで、自動処理の対象にしない。
     """
 
     READY = "ready"
     PROCESSING = "processing"
-    DRAFT = "draft"
+    DRAFT_CREATED = "draft_created"
     PUBLISHED = "published"
     ERROR = "error"
     NEEDS_REVIEW = "needs_review"

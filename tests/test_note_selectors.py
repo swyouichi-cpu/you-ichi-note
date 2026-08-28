@@ -4,9 +4,12 @@
 note.comへは(この開発環境からもGitHub Actionsからも)アクセスしないため、
 「本当にnoteの画面で動くか」はここでは保証できない。ここで保証するのは、
 「複数の候補セレクタから正しく要素を見つけ、textarea/contenteditable
-どちらにも安全にテキストを入力できる」という仕組み自体の正しさ。
+どちらにも安全にテキストを入力できる」という仕組み自体の正しさと、
+タグ正規化・本文末尾ハッシュタグ組み立てのロジックの正しさ。
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -14,7 +17,15 @@ pytest.importorskip("playwright")
 
 from playwright.sync_api import sync_playwright  # noqa: E402
 
-from src.note import NotePoster, NotePosterError  # noqa: E402
+from src.note import (  # noqa: E402
+    NotePoster,
+    NotePosterError,
+    TagValidationError,
+    build_body_with_hashtags,
+    normalize_tags,
+)
+
+_NOTE_SOURCE_PATH = Path(__file__).resolve().parent.parent / "src" / "note.py"
 
 
 @pytest.fixture(scope="module")
@@ -141,13 +152,16 @@ def test_assert_not_publish_action_blocks_publish_labeled_button(page):
         poster._assert_not_publish_action(page.get_by_role("button"))
 
 
-def test_assert_not_publish_action_allows_proceed_to_publish_settings_button(page):
-    # 「公開に進む」は公開設定パネルを開くだけの画面遷移であり、
-    # それ自体は公開しないことを実機で確認済み(投稿するボタンは別)。
-    page.set_content("<button>公開に進む</button>")
+@pytest.mark.parametrize("label", ["投稿する", "公開する", "予約投稿", "公開に進む"])
+def test_assert_not_publish_action_blocks_all_forbidden_publish_labels(page, label):
+    # 本文末尾ハッシュタグ方式への移行後、「公開に進む」ボタンへは一切
+    # 遷移しなくなった。誤ってこのボタンがクリック対象になってしまった
+    # 場合の保険として、安全装置は「公開に進む」も含めてブロックする。
+    page.set_content(f"<button>{label}</button>")
     poster = _bare_poster()
 
-    poster._assert_not_publish_action(page.get_by_role("button"))  # 例外が出なければOK
+    with pytest.raises(NotePosterError):
+        poster._assert_not_publish_action(page.get_by_role("button"))
 
 
 def test_assert_not_publish_action_allows_draft_save_button(page):
@@ -201,80 +215,7 @@ def test_diagnostics_text_reports_cors_headers_for_api_responses(page):
     assert "access-control-allow-origin=(なし)" in text
 
 
-# -- 「公開設定パネル」経由のタグ入力(実機確認済みのUI構造を模したページ) --
-#
-# 実際のnoteのHTML構造そのものではなく、ユーザーが実機で確認した要素
-# (「公開に進む」「ハッシュタグ」見出し・入力欄・「キャンセル」・「投稿する」)
-# を最小限のダミーページとして再現し、_fill_tagsのロジック(開く→入力→
-# チップ確定確認→キャンセル→再度開いて保持確認)そのものを検証する。
-_PUBLISH_SETTINGS_HTML_TEMPLATE = """
-<button id="proceed">公開に進む</button>
-<div id="panel" style="display:none">
-  <h2>ハッシュタグ</h2>
-  <input id="tag-input" placeholder="ハッシュタグを追加する" />
-  <div id="chips"></div>
-  <button id="cancel">キャンセル</button>
-  <button id="post">投稿する</button>
-</div>
-<script>
-  document.getElementById('proceed').addEventListener('click', () => {{
-    document.getElementById('panel').style.display = 'block';
-  }});
-  document.getElementById('tag-input').addEventListener('keydown', (e) => {{
-    if (e.key === 'Enter') {{
-      const span = document.createElement('span');
-      span.textContent = '#' + e.target.value;
-      document.getElementById('chips').appendChild(span);
-      e.target.value = '';
-    }}
-  }});
-  document.getElementById('cancel').addEventListener('click', () => {{
-    document.getElementById('panel').style.display = 'none';
-    {clear_chips_js}
-  }});
-</script>
-"""
-
-
-def test_fill_tags_succeeds_when_hashtags_persist_after_cancel(page):
-    page.set_content(_PUBLISH_SETTINGS_HTML_TEMPLATE.format(clear_chips_js=""))
-    poster = _bare_poster()
-
-    poster._fill_tags(page, ["テスト", "サンプル"])
-
-    chips_text = page.locator("#chips").inner_text()
-    assert "#テスト" in chips_text
-    assert "#サンプル" in chips_text
-
-
-def test_fill_tags_raises_when_hashtags_are_discarded_by_cancel(page):
-    # 「キャンセル」でタグが失われてしまうケース(未確認だった懸念)を再現。
-    page.set_content(
-        _PUBLISH_SETTINGS_HTML_TEMPLATE.format(
-            clear_chips_js="document.getElementById('chips').innerHTML = '';"
-        )
-    )
-    poster = _bare_poster()
-
-    with pytest.raises(NotePosterError, match="見当たりませんでした"):
-        poster._fill_tags(page, ["テスト"])
-
-
-def test_fill_tags_never_clicks_the_post_button(page):
-    """安全設計の確認: タグ入力の一連の流れで「投稿する」ボタンは一度も押さない。"""
-    page.set_content(_PUBLISH_SETTINGS_HTML_TEMPLATE.format(clear_chips_js=""))
-    page.evaluate(
-        "document.getElementById('post').addEventListener('click', "
-        "() => { window.__posted = true; })"
-    )
-    poster = _bare_poster()
-
-    poster._fill_tags(page, ["テスト"])
-
-    assert page.evaluate("window.__posted === true") is False
-
-
-# -- 自動保存完了待ち・「公開に進む」後の3状態判定 --------------------------
+# -- 自動保存完了待ち(下書き保存の直前に呼ぶ) -------------------------------
 
 
 def test_wait_for_autosave_idle_returns_immediately_when_not_saving(page):
@@ -307,196 +248,133 @@ def test_wait_for_autosave_idle_raises_when_stuck_saving(page):
         poster._wait_for_autosave_idle(page, timeout_ms=300)
 
 
-def test_classify_post_click_state_detects_opened_panel(page):
-    page.set_content('<h2 style="display:none" id="h">ハッシュタグ</h2>')
-    poster = _bare_poster()
-    page.evaluate(
-        "setTimeout(() => { document.getElementById('h').style.display = 'block'; }, 100)"
-    )
-
-    result = poster._classify_post_click_state(
-        page, dialog_was_visible_before=False, timeout_ms=2000, poll_interval_ms=50
-    )
-
-    assert result == "opened"
-
-
-def test_classify_post_click_state_detects_new_dialog(page):
-    page.set_content('<div role="dialog" style="display:none" id="d">タイトル、本文を入力してください</div>')
-    poster = _bare_poster()
-    page.evaluate(
-        "setTimeout(() => { document.getElementById('d').style.display = 'block'; }, 100)"
-    )
-
-    result = poster._classify_post_click_state(
-        page, dialog_was_visible_before=False, timeout_ms=2000, poll_interval_ms=50
-    )
-
-    assert result == "dialog"
-    assert "入力してください" in poster._extract_dialog_text(page)
-
-
-def test_classify_post_click_state_returns_unchanged_when_nothing_happens(page):
-    page.set_content("<div>編集画面のまま何も変わらない</div>")
-    poster = _bare_poster()
-
-    result = poster._classify_post_click_state(
-        page, dialog_was_visible_before=False, timeout_ms=500, poll_interval_ms=100
-    )
-
-    assert result == "unchanged"
-
-
-def test_classify_post_click_state_ignores_dialog_already_visible_before_click(page):
-    # 実機で発生した誤検知の再現: 「AIと構成づくりや推敲を一緒に進められます」
-    # のような、クリックとは無関係に最初から表示されているダイアログ(ツール
-    # チップ等)を、クリックが引き起こしたエラーダイアログと誤判定しないこと。
-    page.set_content('<div role="dialog">AIと構成づくりや推敲を一緒に進められます</div>')
-    poster = _bare_poster()
-
-    result = poster._classify_post_click_state(
-        page, dialog_was_visible_before=True, timeout_ms=500, poll_interval_ms=100
-    )
-
-    assert result == "unchanged"
-
-
-def test_open_publish_settings_raises_with_dialog_text_when_dialog_appears_instead(page):
-    # 「公開に進む」を押しても公開設定パネルではなくダイアログが出るケース
-    # (今回実機で観測された状況の再現)。
-    page.set_content(
-        """
-        <button id="proceed">公開に進む</button>
-        <div role="dialog" id="dialog" style="display:none">
-          タイトル、本文を入力してください
-        </div>
-        <script>
-          document.getElementById('proceed').addEventListener('click', () => {
-            document.getElementById('dialog').style.display = 'block';
-          });
-        </script>
-        """
-    )
-    poster = _bare_poster()
-
-    with pytest.raises(NotePosterError, match="入力してください"):
-        poster._open_publish_settings(page)
-
-
-def test_open_publish_settings_not_fooled_by_preexisting_ai_tooltip_dialog(page):
-    # 実機で発生した誤検知の再現・回帰テスト: 「公開に進む」を押しても
-    # 公開設定パネルへ遷移せず、かつ新しいダイアログも出ない(クリック前から
-    # 表示されているAIアシスタントの案内ツールチップがそのまま残っているだけ)
-    # 場合、それを「新しいダイアログが出た」と誤判定しない。
-    page.set_content(
-        """
-        <div role="dialog">AIと構成づくりや推敲を一緒に進められます</div>
-        <button id="proceed">公開に進む</button>
-        <script>
-          // クリックしても何も起きない(パネルへの遷移も新しいダイアログも無い)
-        </script>
-        """
-    )
-    poster = _bare_poster()
-
-    # 「新しいダイアログが表示されました」ではなく、「変化なし」側の
-    # メッセージ(編集画面のままでした)になることを確認する。
-    with pytest.raises(NotePosterError, match="編集画面のままでした"):
-        poster._open_publish_settings(page)
-
-
-# -- タグ保持確認の堅牢性(実機で見つかった偽陽性の回帰テスト) --------------
+# -- タグ正規化・本文末尾ハッシュタグ組み立て(ブラウザ不要の純粋なロジック) --
 #
-# 実機テストで、「テスト」「自動投稿」というタグを入力したのに、キャンセル後
-# 再度開いた画面には無関係な単語(記事本文由来と見られるもの)がタグとして
-# 残っているという不具合が見つかった。原因は、タグの確認処理が「#」無しの
-# 素の単語にも部分一致していたため、本文・タイトル中に同じ単語が出現すると
-# 実際にはタグが反映されていなくても「確認できた」と誤判定していたこと。
+# 公開設定パネル経由のタグ入力は、note公式の仕様として「キャンセル」で
+# 破棄されることが実機検証とnote公式ヘルプの両方で確認されたため撤去した。
+# 代わりに、note公式ヘルプが案内する「本文中に #タグ名 と直接書く」方式に
+# 統一している。以下はその組み立てロジック(normalize_tags /
+# build_body_with_hashtags)の検証。
 
 
-def test_assert_hashtags_present_not_fooled_by_bare_word_in_prose(page):
-    # 「自動投稿」という単語は本文中に(#無しで)出現するが、実際のタグ
-    # チップ(#自動投稿)は存在しない、という実機で発生した状況を再現する。
-    page.set_content("<p>自動投稿テストという記事です。#違うタグ</p>")
-    poster = _bare_poster()
+def test_build_body_with_hashtags_appends_two_tags():
+    body = "これは本文です。"
 
-    with pytest.raises(NotePosterError, match=r"\['自動投稿'\]"):
-        poster._assert_hashtags_present(page, ["自動投稿"])
+    result = build_body_with_hashtags(body, ["テスト", "自動投稿"])
+
+    assert result == body + ("\n" * 5) + "#テスト #自動投稿"
 
 
-def test_assert_hashtags_present_error_lists_actually_visible_chips(page):
-    page.set_content("<div><span>#記事</span> <span>#note</span></div>")
-    poster = _bare_poster()
+def test_build_body_with_hashtags_appends_three_or_more_tags():
+    body = "本文"
 
-    with pytest.raises(NotePosterError) as exc_info:
-        poster._assert_hashtags_present(page, ["自動投稿"])
+    result = build_body_with_hashtags(body, ["タグ1", "タグ2", "タグ3"])
 
-    message = str(exc_info.value)
-    assert "#記事" in message
-    assert "#note" in message
+    assert result == body + ("\n" * 5) + "#タグ1 #タグ2 #タグ3"
 
 
-def test_assert_hashtags_present_succeeds_when_all_chips_present(page):
-    page.set_content("<p>#テスト #自動投稿 #サンプル</p>")
-    poster = _bare_poster()
+def test_build_body_with_hashtags_inserts_exactly_five_line_breaks():
+    body = "本文"
 
-    poster._assert_hashtags_present(page, ["テスト", "自動投稿", "サンプル"])  # 例外が出なければOK
+    result = build_body_with_hashtags(body, ["テスト"])
 
-
-def test_assert_hashtags_present_reports_all_missing_tags_together(page):
-    # 途中のタグだけ保存されないケース: 3件中、真ん中の1件だけ無い。
-    page.set_content("<p>#テスト #サンプル</p>")
-    poster = _bare_poster()
-
-    with pytest.raises(NotePosterError, match=r"\['自動投稿'\]"):
-        poster._assert_hashtags_present(page, ["テスト", "自動投稿", "サンプル"])
+    separator = result[len(body) : len(result) - len("#テスト")]
+    assert separator == "\n\n\n\n\n"
+    assert separator.count("\n") == 5
 
 
-def test_assert_hashtags_present_waits_for_delayed_chip_render(page):
-    # 保存反映が遅れるケース: チップがすぐには無く、少し遅れて表示される。
-    page.set_content("<div id='chips'></div>")
-    poster = _bare_poster()
-    page.evaluate(
-        "setTimeout(() => { "
-        "document.getElementById('chips').textContent = '#テスト'; "
-        "}, 300)"
-    )
+def test_build_body_with_hashtags_returns_body_unchanged_when_no_tags():
+    body = "タグが1つも無い記事の本文です。改行\nも含む。"
 
-    poster._assert_hashtags_present(page, ["テスト"])  # 例外が出なければOK
+    assert build_body_with_hashtags(body, []) == body
 
 
-def test_fill_tags_reports_needs_review_when_only_some_tags_persist(page):
-    # 複数タグのうち一部だけがキャンセル後に失われるケースの統合テスト。
-    # 「自動投稿」だけを消し、他は保持する挙動を再現する。
-    page.set_content(
-        _PUBLISH_SETTINGS_HTML_TEMPLATE.format(
-            clear_chips_js=(
-                "document.querySelectorAll('#chips span').forEach(el => {"
-                "  if (el.textContent === '#自動投稿') { el.remove(); }"
-                "});"
-            )
-        )
-    )
-    poster = _bare_poster()
-
-    with pytest.raises(NotePosterError, match=r"\['自動投稿'\]"):
-        poster._fill_tags(page, ["テスト", "自動投稿", "サンプル"])
+def test_normalize_tags_strips_leading_hash():
+    assert normalize_tags(["#テスト", "#自動投稿"]) == ["テスト", "自動投稿"]
 
 
-def test_fill_tags_partial_failure_never_clicks_the_post_button(page):
-    """安全設計の確認: 一部タグの保持に失敗した場合でも「投稿する」は押さない。"""
-    page.set_content(
-        _PUBLISH_SETTINGS_HTML_TEMPLATE.format(
-            clear_chips_js="document.getElementById('chips').innerHTML = '';"
-        )
-    )
-    page.evaluate(
-        "document.getElementById('post').addEventListener('click', "
-        "() => { window.__posted = true; })"
-    )
-    poster = _bare_poster()
+def test_normalize_tags_trims_surrounding_whitespace():
+    assert normalize_tags(["  テスト  ", "\t自動投稿\n"]) == ["テスト", "自動投稿"]
 
-    with pytest.raises(NotePosterError):
-        poster._fill_tags(page, ["テスト"])
 
-    assert page.evaluate("window.__posted === true") is False
+def test_normalize_tags_excludes_empty_tags():
+    assert normalize_tags(["テスト", "", "   ", "#"]) == ["テスト"]
+
+
+def test_normalize_tags_excludes_duplicate_tags():
+    assert normalize_tags(["テスト", "テスト", "#テスト"]) == ["テスト"]
+
+
+def test_normalize_tags_rejects_ambiguous_internal_whitespace_without_altering():
+    # 「広島 レモン」のようにタグ内部に空白があるケースは、本文末尾の
+    # タグ行が半角スペース区切りのため、どこまでが1つのタグかを安全に
+    # 判定できない。自動で「広島レモン」のように空白を詰めて「直す」ことは
+    # 絶対にせず、TagValidationErrorを送出してneeds_reviewに倒す。
+    with pytest.raises(TagValidationError):
+        normalize_tags(["広島 レモン"])
+
+
+def test_normalize_tags_does_not_collapse_internal_whitespace_even_on_failure():
+    # 上のテストで「広島 レモン」が拒否されることを確認しているが、
+    # 万一実装が例外を出す前に値を書き換えていないかも明示的に確認する
+    # (内部の空白を勝手に詰めた文字列を返してしまわないこと)。
+    with pytest.raises(TagValidationError) as exc_info:
+        normalize_tags(["広島 レモン"])
+
+    assert "広島 レモン" in str(exc_info.value)
+    assert "広島レモン" not in str(exc_info.value)
+
+
+def test_normalize_tags_ignores_body_content_entirely():
+    # 本文中に同じ単語が出現していても、タグの正規化・重複判定には
+    # 一切影響しない(normalize_tagsは本文を引数に取らず参照もしない)。
+    # 過去に発生した「地の文への部分一致による誤判定」バグの再発防止。
+    tags = normalize_tags(["自動投稿"])
+    body_with_same_word = "これは自動投稿のテスト記事です。自動投稿という語が複数回登場します。"
+
+    result = build_body_with_hashtags(body_with_same_word, tags)
+
+    assert result == body_with_same_word + ("\n" * 5) + "#自動投稿"
+
+
+def test_removed_publish_settings_methods_no_longer_exist():
+    """公開設定パネル方式の撤去を確認する回帰テスト(誤った復活の防止)。"""
+    removed_method_names = [
+        "_fill_tags",
+        "_open_publish_settings",
+        "_close_publish_settings",
+        "_hashtag_input_candidates",
+        "_hashtag_chip_candidate",
+        "_list_visible_hashtag_chips",
+        "_enter_hashtags",
+        "_assert_hashtags_present",
+        "_classify_post_click_state",
+        "_visible_dialog_locator",
+        "_extract_dialog_text",
+    ]
+    for name in removed_method_names:
+        assert not hasattr(NotePoster, name), f"{name} が復活しています"
+
+
+def test_publish_related_labels_are_never_used_as_click_selectors():
+    """投稿する/公開する/予約投稿/公開に進むが、クリック対象のセレクタ
+    (get_by_role/get_by_text/get_by_placeholder/locator)としてnote.py中の
+    どこにも使われていないことを確認する。
+
+    _FORBIDDEN_PUBLISH_KEYWORDS のリスト定義そのものにこれらの語が
+    含まれるのは意図通り(危険な語を検知するための安全装置)なので、
+    その行だけは除外して確認する。
+    """
+    lines = _NOTE_SOURCE_PATH.read_text(encoding="utf-8").splitlines()
+    forbidden_labels = ["投稿する", "公開する", "予約投稿", "公開に進む"]
+    selector_call_names = ("get_by_role", "get_by_text", "get_by_placeholder", "locator(")
+
+    for i, line in enumerate(lines, start=1):
+        if "_FORBIDDEN_PUBLISH_KEYWORDS" in line:
+            continue
+        for label in forbidden_labels:
+            if label in line and any(call in line for call in selector_call_names):
+                pytest.fail(
+                    f"note.py:{i} で公開系の文言 '{label}' がセレクタとして"
+                    f"使われている可能性があります: {line!r}"
+                )

@@ -69,17 +69,17 @@ def test_reconcile_stale_processing_with_note_url_still_becomes_needs_review():
     assert "重複下書きを避けるため" in updated.error_message
 
 
-def test_reconcile_leaves_ready_and_draft_rows_untouched():
+def test_reconcile_leaves_ready_and_draft_created_rows_untouched():
     ready = make_article(id="a1", status=Status.READY.value)
-    draft = make_article(id="a2", status=Status.DRAFT.value)
-    sheets = FakeSheetsClient([ready, draft])
+    draft_created = make_article(id="a2", status=Status.DRAFT_CREATED.value)
+    sheets = FakeSheetsClient([ready, draft_created])
     manager = StatusManager(sheets)
 
     stale = manager.reconcile_stale_processing()
 
     assert stale == []
     statuses = {a.id: a.status for a in sheets.list_articles()}
-    assert statuses == {"a1": Status.READY.value, "a2": Status.DRAFT.value}
+    assert statuses == {"a1": Status.READY.value, "a2": Status.DRAFT_CREATED.value}
 
 
 def test_claim_article_transitions_ready_to_processing():
@@ -105,15 +105,15 @@ def test_claim_article_raises_if_already_claimed_by_someone_else():
         manager.claim_article(article)
 
 
-def test_mark_draft_sets_urls_and_clears_error():
+def test_mark_draft_created_sets_urls_and_clears_error():
     article = make_article(status=Status.PROCESSING.value, error_message="前回のエラー")
     sheets = FakeSheetsClient([article])
     manager = StatusManager(sheets)
 
-    manager.mark_draft(article, note_url="https://note.com/x/n/abc", craft_url="")
+    manager.mark_draft_created(article, note_url="https://note.com/x/n/abc", craft_url="")
 
     updated = sheets.list_articles()[0]
-    assert updated.status == Status.DRAFT.value
+    assert updated.status == Status.DRAFT_CREATED.value
     assert updated.note_url == "https://note.com/x/n/abc"
     assert updated.error_message == ""
 

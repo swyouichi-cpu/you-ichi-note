@@ -1,7 +1,7 @@
 """記事のstatus遷移を一元管理する。
 
 設計方針(ユーザー確認済み):
-  - 基本の流れ: ready -> processing -> draft -> published
+  - 基本の流れ: ready -> processing -> draft_created -> published
   - 明確な失敗:   processing -> error
   - 成否が不明:   processing -> needs_review
 
@@ -32,7 +32,7 @@ class StatusManager:
         すべて needs_review に変更し、その一覧を返す。
 
         note_url の有無で人間向けメッセージを変える(どこまで進んでいたかの
-        手がかりを残すため)が、いずれの場合も自動では ready/draft に進めない。
+        手がかりを残すため)が、いずれの場合も自動では ready/draft_created に進めない。
         """
         stale = self._sheets.find_stale_processing_articles()
         for article in stale:
@@ -42,7 +42,7 @@ class StatusManager:
                     "note_url が記録済みのため、note下書きの作成自体は成功していた"
                     "可能性があります。重複下書きを避けるため自動では復旧しません。"
                     "note側で実際に下書きが存在するか確認し、問題なければ status を "
-                    "draft に、下書きが存在しない場合は note_url を空にしたうえで "
+                    "draft_created に、下書きが存在しない場合は note_url を空にしたうえで "
                     "status を ready に手動で変更してください。"
                 )
             else:
@@ -71,11 +71,11 @@ class StatusManager:
         logger.info("processingへ変更: id=%s", article.id)
         self._sheets.update_fields(article, status=Status.PROCESSING.value)
 
-    def mark_draft(self, article: Article, note_url: str, craft_url: str = "") -> None:
-        logger.info("draftへ変更: id=%s", article.id)
+    def mark_draft_created(self, article: Article, note_url: str, craft_url: str = "") -> None:
+        logger.info("draft_createdへ変更: id=%s", article.id)
         self._sheets.update_fields(
             article,
-            status=Status.DRAFT.value,
+            status=Status.DRAFT_CREATED.value,
             note_url=note_url,
             craft_url=craft_url,
             error_message="",

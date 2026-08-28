@@ -32,6 +32,29 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _is_publish_at_eligible(article: Article, now: datetime) -> bool:
+    """publish_at が空、または現在時刻(UTC)以前であれば対象とする。
+
+    パース不能な値は安全側に倒し、対象外(Falseを返す)にする
+    (誤って未来の予定を早く処理してしまうことを避ける)。
+    """
+    raw = article.publish_at.strip()
+    if not raw:
+        return True
+    try:
+        publish_at = datetime.fromisoformat(raw)
+    except ValueError:
+        logger.warning(
+            "publish_at をパースできませんでした: id=%s publish_at=%r。対象外とします。",
+            article.id,
+            raw,
+        )
+        return False
+    if publish_at.tzinfo is None:
+        publish_at = publish_at.replace(tzinfo=timezone.utc)
+    return publish_at <= now
+
+
 class SheetsError(RuntimeError):
     pass
 
@@ -105,14 +128,17 @@ class SheetsClient:
     def get_next_target_article(self) -> Article | None:
         """自動処理の対象となる次の1件を返す(なければNone)。
 
-        条件: status == ready かつ content_type == free かつ note_url が空。
+        条件: status == ready かつ content_type == free かつ note_url が空、
+        かつ publish_at が空、または現在時刻(UTC)以前であること。
         1回の実行で最大1件のみを対象にする設計。
         """
+        now = datetime.now(timezone.utc)
         for article in self.list_articles():
             if (
                 article.status == Status.READY
                 and article.content_type == ContentType.FREE
                 and not article.note_url.strip()
+                and _is_publish_at_eligible(article, now)
             ):
                 return article
         return None

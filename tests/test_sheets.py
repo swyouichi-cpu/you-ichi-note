@@ -5,8 +5,10 @@ gspreadのWorksheetの代わりに、必要なメソッドだけを持つ
 """
 from __future__ import annotations
 
-from src.models import Status
-from src.sheets import SheetsClient
+from datetime import datetime, timezone
+
+from src.models import Article, Status
+from src.sheets import SheetsClient, _is_publish_at_eligible
 
 
 class FakeWorksheet:
@@ -42,16 +44,16 @@ def make_client_with_rows(rows: list[list[str]]) -> tuple[SheetsClient, FakeWork
     return client, fake_ws
 
 
-def row(id_="a1", status="ready", content_type="free", note_url=""):
+def row(id_="a1", status="ready", content_type="free", note_url="", publish_at=""):
     return [
         id_, "タイトル", "本文", "タグ1,タグ2", "思考", "テーマ",
-        content_type, status, "", note_url, "", "", "", "",
+        content_type, status, publish_at, note_url, "", "", "", "",
     ]
 
 
 def test_get_next_target_article_filters_ready_free_without_note_url():
     client, _ = make_client_with_rows([
-        row(id_="a1", status="draft"),
+        row(id_="a1", status="draft_created"),
         row(id_="a2", status="ready", content_type="paid"),
         row(id_="a3", status="ready", content_type="free", note_url="https://note.com/x"),
         row(id_="a4", status="ready", content_type="free"),
@@ -65,11 +67,49 @@ def test_get_next_target_article_filters_ready_free_without_note_url():
 
 def test_get_next_target_article_returns_none_when_no_match():
     client, _ = make_client_with_rows([
-        row(id_="a1", status="draft"),
+        row(id_="a1", status="draft_created"),
         row(id_="a2", status="processing"),
     ])
 
     assert client.get_next_target_article() is None
+
+
+def test_get_next_target_article_skips_future_publish_at():
+    client, _ = make_client_with_rows([
+        row(id_="a1", status="ready", content_type="free", publish_at="2999-01-01T00:00:00+00:00"),
+        row(id_="a2", status="ready", content_type="free", publish_at=""),
+    ])
+
+    target = client.get_next_target_article()
+
+    assert target is not None
+    assert target.id == "a2"
+
+
+def test_get_next_target_article_includes_past_publish_at():
+    client, _ = make_client_with_rows([
+        row(id_="a1", status="ready", content_type="free", publish_at="2000-01-01T00:00:00+00:00"),
+    ])
+
+    target = client.get_next_target_article()
+
+    assert target is not None
+    assert target.id == "a1"
+
+
+def test_is_publish_at_eligible_empty_is_eligible():
+    article = Article.from_record(2, {"id": "a1", "publish_at": ""})
+    assert _is_publish_at_eligible(article, datetime(2026, 1, 1, tzinfo=timezone.utc)) is True
+
+
+def test_is_publish_at_eligible_unparseable_is_not_eligible():
+    article = Article.from_record(2, {"id": "a1", "publish_at": "not-a-date"})
+    assert _is_publish_at_eligible(article, datetime(2026, 1, 1, tzinfo=timezone.utc)) is False
+
+
+def test_is_publish_at_eligible_naive_datetime_treated_as_utc():
+    article = Article.from_record(2, {"id": "a1", "publish_at": "2000-01-01T00:00:00"})
+    assert _is_publish_at_eligible(article, datetime(2026, 1, 1, tzinfo=timezone.utc)) is True
 
 
 def test_find_stale_processing_articles():

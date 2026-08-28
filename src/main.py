@@ -90,9 +90,9 @@ def cmd_run(_args: argparse.Namespace) -> int:
         manager.mark_needs_review(article, stage="note", message=str(exc))
         return 1
 
-    # Craft連携(Phase4)が未実装のうちは、note下書きが作れた時点でdraftとする。
-    manager.mark_draft(article, note_url=note_url, craft_url="")
-    logger.info("draft_created: id=%s note_url=%s status=draft", article.id, note_url)
+    # Craft連携(Phase4)が未実装のうちは、note下書きが作れた時点でdraft_createdとする。
+    manager.mark_draft_created(article, note_url=note_url, craft_url="")
+    logger.info("draft_created: id=%s note_url=%s status=draft_created", article.id, note_url)
     return 0
 
 
