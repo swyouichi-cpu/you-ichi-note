@@ -113,6 +113,34 @@ read-back検証だけでは「間違った要素に入力してそのまま読�
 「入力した内容が実際に保持されているかの確認」を併用することで、今回の
 不具合の再発を防ぐ設計にしている。
 
+★本文editorの実機DOM特定(Content Pipeline #18)★
+上記の安全装置により「本文入力欄」でneeds_reviewとして安全停止できる
+ことを実機で確認した後、ユーザーが失敗時のHTMLダンプ(Artifact)から
+本文editorの実際のDOM構造を特定した。
+
+  <div contenteditable="true" role="textbox" aria-multiline="true"
+       class="ProseMirror note-common-styles__textnote-body"
+       data-placeholder="たのしかった旅行について、書いてみませんか？">
+
+タイトルは <textarea placeholder="記事タイトル"> という別要素であり、
+本文editorとは構造的に明確に区別できる。この実機DOMに基づき、
+_fill_body() の最優先候補として次の2つを追加した。
+
+  1. class名ベース: div.ProseMirror.note-common-styles__textnote-body
+     [contenteditable="true"]
+     ("note-common-styles__" のような意味のある接頭辞を持つクラス名を
+     使い、styled-componentsのハッシュ由来クラス "sc-xxxx" には依存
+     しない。ビルドごとに変わりうるため)
+  2. role/aria属性ベース: div.ProseMirror[contenteditable="true"]
+     [role="textbox"][aria-multiline="true"]
+     (class名がリネームされた場合の保険。data-placeholderの日本語
+     全文には依存しない設計にしている)
+
+これらが一致しなかった場合のフォールバックとして、従来のrole=textbox
+name=本文・class名に body/editor を含むcontenteditable、という候補も
+残しているが、位置ベースの無条件フォールバックは引き続き用意しない
+(全滅時はneeds_reviewへ倒れる)。
+
 ★ログイン方式★
 メールアドレス・パスワードを直接入力させる方式は、note側のreCAPTCHA
 導入により機能しない可能性が高いため採用しない。代わりに、
@@ -801,21 +829,51 @@ class NotePoster:
     def _fill_body(self, page: Page, body: str, *, title_locator: Locator) -> Locator:
         """本文入力欄を特定して入力する。
 
-        実機テストで、本命の候補(role=textbox name=本文、class名に
-        body/editorを含むcontenteditable)がいずれも一致せず、当時存在
-        していた「画面上に見えている最初のcontenteditableを無条件に使う」
-        という位置ベースの最終フォールバックが、本文editorではない別の
-        要素(タイトル入力欄である可能性が高い)を誤って掴み、そこに
-        本文全体を書き込んでしまう不具合が発生した。その反省から、
-        本文editorだと確証できない位置ベースのフォールバックは一切
-        用意しない。候補が全滅した場合は入力を行わずNotePosterErrorで
-        中断する(呼び出し側でneeds_reviewに倒れる)。
+        実機テスト(GitHub Actions Content Pipeline #16)で、当時の候補
+        (role=textbox name=本文、class名にbody/editorを含むcontenteditable)
+        がいずれも一致せず、当時存在していた「画面上に見えている最初の
+        contenteditableを無条件に使う」という位置ベースの最終フォールバック
+        が、本文editorではない別の要素(タイトル入力欄)を誤って掴み、
+        そこに本文全体を書き込んでしまう不具合が発生した。
+
+        その後(Content Pipeline #18)、実機のHTMLダンプから本文editorの
+        実際のDOM構造が判明した:
+          <div contenteditable="true" role="textbox" aria-multiline="true"
+               class="ProseMirror note-common-styles__textnote-body"
+               data-placeholder="...">
+        タイトルは別要素( <textarea placeholder="記事タイトル"> )であり、
+        本文とは構造的に明確に区別できる。noteのエディタはProseMirörを
+        採用しているため、class名は "note-common-styles__" のような
+        意味のある接頭辞を持つもの(styled-componentsのハッシュ由来クラス
+        "sc-xxxx" ではない)を優先的に使う。data-placeholderの日本語
+        全文には依存しない(文言変更に弱いため、属性の有無や他の属性との
+        組み合わせに留める)。
+
+        この実機DOMに基づく候補を最優先にしつつ、note側のUI変更に備えて
+        role/aria属性ベースの候補も用意する。それでも本文editorだと
+        確証できない位置ベースのフォールバックは一切用意しない。候補が
+        全滅した場合は入力を行わずNotePosterErrorで中断する(呼び出し側
+        でneeds_reviewに倒れる)。
 
         候補が一致した場合も、念のためタイトル入力欄(title_locator)と
         同一のDOM要素でないことを_same_element()で確認し、同一だった
         場合も入力せずに中断する。
         """
         candidates = [
+            (
+                "css div.ProseMirror.note-common-styles__textnote-body",
+                page.locator(
+                    'div.ProseMirror.note-common-styles__textnote-body'
+                    '[contenteditable="true"]'
+                ),
+            ),
+            (
+                "css div.ProseMirror[role=textbox][aria-multiline=true]",
+                page.locator(
+                    'div.ProseMirror[contenteditable="true"]'
+                    '[role="textbox"][aria-multiline="true"]'
+                ),
+            ),
             ("role=textbox name=本文", page.get_by_role("textbox", name=re.compile("本文"))),
             (
                 "css [class*=body] 系のcontenteditable",

@@ -420,6 +420,86 @@ def test_full_body_flow_detects_content_loss_after_save_without_ever_publishing(
     assert page.evaluate("window.__posted") is False
 
 
+# -- 実機DOM構造(Content Pipeline #18で判明)に基づく回帰テスト -------------
+#
+# 実機の失敗時HTMLダンプから、本文editorの実際のDOM構造が判明した。
+# タイトルは <textarea placeholder="記事タイトル">、本文はProseMirror製の
+# contenteditableで、class="ProseMirror note-common-styles__textnote-body"
+# role="textbox" aria-multiline="true" data-placeholder="..." を持つ。
+# 以下はこの実機DOM構造に対する回帰テスト。
+
+_REAL_EDITOR_HTML = """
+<textarea placeholder="記事タイトル"></textarea>
+<div
+  contenteditable="true"
+  translate="no"
+  class="ProseMirror note-common-styles__textnote-body"
+  role="textbox"
+  aria-multiline="true"
+  data-placeholder="たのしかった旅行について、書いてみませんか？">
+</div>
+"""
+
+
+def test_fill_body_finds_real_prosemirror_body_editor(page):
+    page.set_content(_REAL_EDITOR_HTML)
+    poster = _bare_poster()
+
+    title_locator = poster._fill_title(page, "自動投稿テスト")
+    body_locator = poster._fill_body(page, "本文テキスト", title_locator=title_locator)
+
+    assert poster._same_element(page, title_locator, body_locator) is False
+    assert "ProseMirror" in (body_locator.get_attribute("class") or "")
+    assert "本文テキスト" in body_locator.inner_text()
+
+
+def test_fill_title_and_fill_body_target_distinct_real_dom_elements(page):
+    page.set_content(_REAL_EDITOR_HTML)
+    poster = _bare_poster()
+
+    title_locator = poster._fill_title(page, "自動投稿テスト")
+    body_locator = poster._fill_body(page, "本文テキスト", title_locator=title_locator)
+
+    # タイトルはtextarea、本文はProseMirrorのcontenteditableへ入力されて
+    # いる(どちらか一方に両方の文字列が混ざっていないことを確認する)。
+    assert page.locator("textarea").input_value() == "自動投稿テスト"
+    assert "自動投稿テスト" not in body_locator.inner_text()
+
+
+def test_full_body_flow_with_real_dom_structure_verifies_readback_before_and_after_save(page):
+    """実機DOM構造(ProseMirror)を模したページで、本文入力→保存前read-back→
+    下書き保存→保存後read-backの一連の流れが正しく機能することを確認する。
+    """
+    page.set_content(
+        _REAL_EDITOR_HTML
+        + """
+        <button id="save">下書き保存</button>
+        <button id="post">投稿する</button>
+        <script>
+          window.__posted = false;
+          document.getElementById('post').addEventListener('click', () => {
+            window.__posted = true;
+          });
+        </script>
+        """
+    )
+    poster = _bare_poster()
+
+    title_locator = poster._fill_title(page, "自動投稿テスト")
+    body_text = "本文" + ("\n" * 5) + "#テスト"
+    body_locator = poster._fill_body(page, body_text, title_locator=title_locator)
+
+    poster._assert_body_matches(page, body_locator, body_text, "#テスト", stage="保存前")
+
+    page.get_by_role("button", name="下書き保存").click()
+
+    # このダミーページでは保存によって本文が失われないため、保存後の
+    # read-backも成功するはず。
+    poster._assert_body_matches(page, body_locator, body_text, "#テスト", stage="保存後")
+
+    assert page.evaluate("window.__posted") is False
+
+
 # -- タグ正規化・本文末尾ハッシュタグ組み立て(ブラウザ不要の純粋なロジック) --
 #
 # 公開設定パネル経由のタグ入力は、note公式の仕様として「キャンセル」で
