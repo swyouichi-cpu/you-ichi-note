@@ -94,6 +94,44 @@ def test_set_multiline_text_on_contenteditable(page):
     assert "3行目" in text
 
 
+# 「本文は画面上に表示されているのに、noteの内部の文字数カウンタが
+# 「0 文字」のまま反映されない」という実機で確認された不具合の再現・検証用。
+_COUNTER_HTML = """
+<div contenteditable="true" class="editor"></div>
+<div id="counter">0 文字</div>
+<script>
+  document.querySelector('.editor').addEventListener('input', (e) => {
+    const len = e.target.innerText.replace(/\\n/g, '').length;
+    document.getElementById('counter').textContent = len + ' 文字';
+  });
+</script>
+"""
+
+
+def test_assert_body_registered_passes_when_counter_updates(page):
+    page.set_content(_COUNTER_HTML)
+    poster = _bare_poster()
+    editor = page.locator(".editor")
+
+    # press_sequentially() は実際のキー入力に近いイベントを発生させるため、
+    # ページ側のinputリスナー(=noteの内部状態更新を模したもの)が反応する。
+    poster._set_multiline_text(page, editor, "テスト本文です")
+
+    poster._assert_body_registered(page)  # 例外が出なければOK
+
+
+def test_assert_body_registered_raises_when_counter_stays_zero(page):
+    page.set_content(_COUNTER_HTML)
+    poster = _bare_poster()
+
+    # inputイベントを発生させずにDOMだけ書き換える(内部状態が更新されない
+    # 不具合を模した状態)。画面上は文字が見えても文字数カウンタは0のまま。
+    page.evaluate('document.querySelector(".editor").innerText = "テスト本文です"')
+
+    with pytest.raises(NotePosterError, match="0 文字"):
+        poster._assert_body_registered(page)
+
+
 def test_assert_not_publish_action_blocks_publish_labeled_button(page):
     # 「投稿する」は実機確認済みの、実際に記事を公開してしまうボタンの文言。
     page.set_content("<button>投稿する</button>")

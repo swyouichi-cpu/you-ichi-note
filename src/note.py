@@ -34,6 +34,20 @@ KEYWORDS に含まれる単語(「投稿する」「公開する」「予約投�
 (_assert_hashtags_present)。「投稿する」ボタンへのセレクタや
 クリック処理はコード中のどこにも存在しない。
 
+★本文入力の内部状態反映について(既知の問題への対処)★
+以前は本文の入力に keyboard.insert_text() を行単位でまとめて流し込む
+実装を使っていた。画面上はテキストが表示され document.title にも
+反映されるため一見成功しているように見えたが、実機テストで「公開に進む」
+を押した際に「タイトル、本文を入力してください」という検証ダイアログが
+表示され、実際にはnote側の文字数カウンタ(「0 文字」表示)が更新されて
+おらず、内部状態には反映されていなかったことが判明した。insert_textは
+1回のinputイベントとしてまとめてテキストを差し込むため、noteのリッチ
+テキストエディタが実際のキー入力イベント列を前提に内部状態を更新して
+いる場合に検知されないと考えられる。そのため press_sequentially()
+(1文字ずつ実際のキー入力に近いイベントを発生させる)に変更し、
+本文入力の直後に文字数カウンタが「0 文字」のままでないかを確認する
+_assert_body_registered() を追加している。
+
 ★ログイン方式★
 メールアドレス・パスワードを直接入力させる方式は、note側のreCAPTCHA
 導入により機能しない可能性が高いため採用しない。代わりに、
@@ -480,6 +494,9 @@ class NotePoster:
         self._run_step(page, "本文入力", lambda: self._fill_body(page, article.body))
         self._screenshot(page, "03_body_filled")
 
+        logger.info("本文がnote側に反映されたか確認")
+        self._run_step(page, "本文反映確認", lambda: self._assert_body_registered(page))
+
         tags = article.tag_list()
         if tags:
             logger.info("タグを入力(%d件)", len(tags))
@@ -511,18 +528,25 @@ class NotePoster:
     def _set_multiline_text(self, page: Page, locator: Locator, text: str) -> None:
         """本文などリッチテキストエディタ(contenteditable)へ複数行を入力する。
 
-        1文字ずつ全体をタイプすると長文で時間がかかりすぎるため、
-        行単位で insert_text し、行の区切りだけ Enter キーで表現する。
+        以前は keyboard.insert_text() を行単位でまとめて流し込む実装だった。
+        画面上はテキストが表示され、document.titleにも反映されるため
+        一見成功しているように見えたが、実際にはnote側の文字数カウンタが
+        「0 文字」のままになり、内部状態には反映されていなかった
+        (「公開に進む」を押した際に「タイトル、本文を入力してください」という
+        検証ダイアログが出てしまう原因になっていた)。
+
+        insert_textは1つのinput イベントとしてまとめてテキストを差し込むため、
+        note側のリッチテキストエディタが本来のキー入力イベント列を前提に
+        内部状態を更新している場合、正しく検知されない可能性がある。
+        press_sequentially() は1文字ずつ実際のキー入力に近いイベント
+        (keydown/keypress/input/keyup)を発生させ、"\\n" は自動的にEnterキー
+        として扱われるため、この方式に切り替えた。長文では時間がかかるが、
+        正しさを優先する。
         """
         locator.click()
         locator.press("Control+A")
         locator.press("Backspace")
-        lines = text.split("\n")
-        for i, line in enumerate(lines):
-            if line:
-                page.keyboard.insert_text(line)
-            if i < len(lines) - 1:
-                page.keyboard.press("Enter")
+        locator.press_sequentially(text)
 
     def _assert_not_publish_action(self, locator: Locator) -> None:
         """クリック対象が誤って「公開」系のボタンになっていないか最終確認する。"""
@@ -586,6 +610,26 @@ class NotePoster:
         ]
         locator = self._resolve_locator(page, candidates, step_name="本文入力欄")
         self._set_multiline_text(page, locator, body)
+
+    def _assert_body_registered(self, page: Page) -> None:
+        """本文がnote側の内部状態(文字数カウンタ)にも反映されたことを確認する。
+
+        画面上は文字が表示されていても、note側の内部状態(文字数カウンタ等)に
+        反映されていないことがある(過去に「0 文字」のまま止まっていた実績あり)。
+        「公開に進む」へ進んでから検証ダイアログで気づくと原因の切り分けが
+        難しくなるため、本文入力の直後にこの時点で検知する。
+        """
+        try:
+            page.get_by_text("0 文字", exact=True).wait_for(state="visible", timeout=2000)
+            still_zero = True
+        except PlaywrightTimeoutError:
+            still_zero = False
+        if still_zero:
+            raise NotePosterError(
+                "本文を入力しましたが、文字数カウンタが「0 文字」のままです。"
+                "画面上は本文が表示されていても、noteエディタの内部状態に"
+                "反映されていない可能性があります(過去に発生した既知の問題)。"
+            )
 
     def _fill_tags(self, page: Page, tags: list[str]) -> None:
         """ハッシュタグ(タグ)を設定する。
