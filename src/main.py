@@ -92,7 +92,7 @@ def cmd_run(_args: argparse.Namespace) -> int:
 
     # Craft連携(Phase4)が未実装のうちは、note下書きが作れた時点でdraftとする。
     manager.mark_draft(article, note_url=note_url, craft_url="")
-    logger.info("完了: id=%s note_url=%s", article.id, note_url)
+    logger.info("draft_created: id=%s note_url=%s status=draft", article.id, note_url)
     return 0
 
 
