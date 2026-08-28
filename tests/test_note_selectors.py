@@ -272,3 +272,92 @@ def test_fill_tags_never_clicks_the_post_button(page):
     poster._fill_tags(page, ["テスト"])
 
     assert page.evaluate("window.__posted === true") is False
+
+
+# -- 自動保存完了待ち・「公開に進む」後の3状態判定 --------------------------
+
+
+def test_wait_for_autosave_idle_returns_immediately_when_not_saving(page):
+    page.set_content("<div>下書き保存</div>")  # 「保存中」という文言は含まない
+    poster = _bare_poster()
+
+    poster._wait_for_autosave_idle(page, timeout_ms=1000)  # 例外が出なければOK
+
+
+def test_wait_for_autosave_idle_waits_until_indicator_disappears(page):
+    # 「保存中」が最初は表示されているが、少し経つと消える(=保存完了)ケース。
+    page.set_content(
+        """
+        <span id="saving">保存中</span>
+        <script>
+          setTimeout(() => { document.getElementById('saving').remove(); }, 200);
+        </script>
+        """
+    )
+    poster = _bare_poster()
+
+    poster._wait_for_autosave_idle(page, timeout_ms=3000)  # 例外が出なければOK
+
+
+def test_wait_for_autosave_idle_raises_when_stuck_saving(page):
+    page.set_content('<span id="saving">保存中</span>')  # 消えないまま
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError, match="保存中"):
+        poster._wait_for_autosave_idle(page, timeout_ms=300)
+
+
+def test_classify_post_click_state_detects_opened_panel(page):
+    page.set_content('<h2 style="display:none" id="h">ハッシュタグ</h2>')
+    poster = _bare_poster()
+    page.evaluate(
+        "setTimeout(() => { document.getElementById('h').style.display = 'block'; }, 100)"
+    )
+
+    result = poster._classify_post_click_state(page, timeout_ms=2000, poll_interval_ms=50)
+
+    assert result == "opened"
+
+
+def test_classify_post_click_state_detects_dialog(page):
+    page.set_content('<div role="dialog" style="display:none" id="d">タイトル、本文を入力してください</div>')
+    poster = _bare_poster()
+    page.evaluate(
+        "setTimeout(() => { document.getElementById('d').style.display = 'block'; }, 100)"
+    )
+
+    result = poster._classify_post_click_state(page, timeout_ms=2000, poll_interval_ms=50)
+
+    assert result == "dialog"
+    assert "入力してください" in poster._extract_dialog_text(page)
+
+
+def test_classify_post_click_state_returns_unchanged_when_nothing_happens(page):
+    page.set_content("<div>編集画面のまま何も変わらない</div>")
+    poster = _bare_poster()
+
+    result = poster._classify_post_click_state(page, timeout_ms=500, poll_interval_ms=100)
+
+    assert result == "unchanged"
+
+
+def test_open_publish_settings_raises_with_dialog_text_when_dialog_appears_instead(page):
+    # 「公開に進む」を押しても公開設定パネルではなくダイアログが出るケース
+    # (今回実機で観測された状況の再現)。
+    page.set_content(
+        """
+        <button id="proceed">公開に進む</button>
+        <div role="dialog" id="dialog" style="display:none">
+          タイトル、本文を入力してください
+        </div>
+        <script>
+          document.getElementById('proceed').addEventListener('click', () => {
+            document.getElementById('dialog').style.display = 'block';
+          });
+        </script>
+        """
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError, match="入力してください"):
+        poster._open_publish_settings(page)

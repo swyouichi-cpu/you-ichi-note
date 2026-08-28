@@ -34,6 +34,16 @@ KEYWORDS に含まれる単語(「投稿する」「公開する」「予約投�
 (_assert_hashtags_present)。「投稿する」ボタンへのセレクタや
 クリック処理はコード中のどこにも存在しない。
 
+「公開に進む」は、本文の自動保存(「保存中」表示)が完了する前に押すと、
+公開設定パネルへ遷移せずダイアログが出ることが実機で確認された。
+そのため _open_publish_settings() は、クリックの前に必ず
+_wait_for_autosave_idle() で「保存中」の表示が消えるのを待つ(固定sleepでは
+なく、実際に表示が消えたことをポーリングで確認する)。クリックした後も
+結果を決め打ちせず、_classify_post_click_state() で
+「パネルへ遷移した」「ダイアログが出た」「編集画面のまま変化なし」の
+3状態を判定し、パネル遷移以外は診断データを残したうえで原因が分かる
+メッセージ付きで中断する。
+
 ★本文入力の内部状態反映について(既知の問題への対処)★
 以前は本文の入力に keyboard.insert_text() を行単位でまとめて流し込む
 実装を使っていた。画面上はテキストが表示され document.title にも
@@ -87,6 +97,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -663,8 +674,78 @@ class NotePoster:
         self._assert_hashtags_present(page, tags)
         self._close_publish_settings(page)
 
+    def _wait_for_autosave_idle(self, page: Page, timeout_ms: int = 15000) -> None:
+        """自動保存中(「保存中」の表示)が消えるまで待つ。
+
+        固定のsleepではなく、「保存中」の表示が実際に消える(非表示になる)
+        ことをPlaywrightのポーリング待機で確認する。「保存中」が最初から
+        表示されていなければ即座に完了扱いになる。実機で、自動保存が
+        完了する前に「公開に進む」を押すとパネルへ遷移せずダイアログが
+        出ることが確認されたため、その対策として追加した。
+        """
+        saving_indicator = page.get_by_text("保存中", exact=False)
+        try:
+            saving_indicator.wait_for(state="hidden", timeout=timeout_ms)
+        except PlaywrightTimeoutError as exc:
+            self._capture_failure(page, "自動保存完了待ち")
+            raise NotePosterError(
+                "「保存中」の表示が消えず、自動保存の完了を確認できませんでした。"
+            ) from exc
+
+    def _classify_post_click_state(
+        self, page: Page, timeout_ms: int = 8000, poll_interval_ms: int = 300
+    ) -> str:
+        """「公開に進む」クリック後の状態を3つに分類する(固定sleepではなく
+        実際の状態を短い間隔でポーリングして判定する)。
+
+        - "opened": 公開設定パネルへ遷移した(「ハッシュタグ」の出現で判定)
+        - "dialog": エラー/確認ダイアログ等が表示された(role=dialog/
+          alertdialogの出現で判定。noteのコンソールログに実際に"Dialog"
+          コンポーネントの使用を示す警告が出ていたことから採用した判定方法)
+        - "unchanged": どちらでもなく、タイムアウトまで編集画面のままだった
+        """
+        panel_candidates = [
+            page.get_by_role("heading", name="ハッシュタグ"),
+            page.get_by_text("ハッシュタグ", exact=True),
+        ]
+        dialog_candidates = [
+            page.get_by_role("dialog"),
+            page.get_by_role("alertdialog"),
+        ]
+
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            for locator in panel_candidates:
+                if locator.first.is_visible():
+                    return "opened"
+            for locator in dialog_candidates:
+                if locator.first.is_visible():
+                    return "dialog"
+            if time.monotonic() >= deadline:
+                return "unchanged"
+            page.wait_for_timeout(poll_interval_ms)
+
+    def _extract_dialog_text(self, page: Page) -> str:
+        for role in ("dialog", "alertdialog"):
+            locator = page.get_by_role(role).first
+            if locator.is_visible():
+                try:
+                    return (locator.inner_text() or "").strip()[:300]
+                except PlaywrightTimeoutError:
+                    return "(取得できませんでした)"
+        return "(取得できませんでした)"
+
     def _open_publish_settings(self, page: Page) -> None:
-        """「公開に進む」を押して公開設定パネルを開く(公開はしない)。"""
+        """「公開に進む」を押して公開設定パネルを開く(公開はしない)。
+
+        自動保存が完了する前にクリックすると、パネルへ遷移せず
+        ダイアログが出ることが実機で確認されたため、まず自動保存の
+        完了(「保存中」表示が消えること)を待ってからクリックする。
+        クリック後は「パネルが開いた」「ダイアログが出た」「何も変わらない」
+        の3状態を判定し、それぞれに応じたエラーメッセージを出す。
+        """
+        self._wait_for_autosave_idle(page)
+
         candidates = [
             ("role=button name=公開に進む", page.get_by_role("button", name="公開に進む")),
             ("text=公開に進む", page.get_by_text("公開に進む", exact=False)),
@@ -673,14 +754,21 @@ class NotePoster:
         self._assert_not_publish_action(proceed_button)
         proceed_button.click()
 
-        # パネルが実際に開いたことを確認する(「ハッシュタグ」の見出しの出現で判定)。
-        self._resolve_locator(
-            page,
-            [
-                ("role=heading name=ハッシュタグ", page.get_by_role("heading", name="ハッシュタグ")),
-                ("text=ハッシュタグ", page.get_by_text("ハッシュタグ", exact=True)),
-            ],
-            step_name="公開設定パネル表示確認",
+        state = self._classify_post_click_state(page)
+        if state == "opened":
+            return
+        if state == "dialog":
+            dialog_text = self._extract_dialog_text(page)
+            self._capture_failure(page, "公開設定パネル表示確認")
+            raise NotePosterError(
+                "「公開に進む」を押した後、公開設定パネルではなくダイアログが"
+                f"表示されました(内容: {dialog_text!r})。"
+            )
+        self._capture_failure(page, "公開設定パネル表示確認")
+        raise NotePosterError(
+            "「公開に進む」を押しましたが、公開設定パネルへの遷移もダイアログの"
+            "表示も確認できず、編集画面のままでした。クリックが正しく届いて"
+            "いない可能性があります。"
         )
 
     def _close_publish_settings(self, page: Page) -> None:
