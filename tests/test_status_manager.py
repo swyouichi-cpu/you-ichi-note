@@ -4,7 +4,11 @@ from __future__ import annotations
 import pytest
 
 from src.models import Article, Status
-from src.status_manager import DoubleProcessingGuard, StatusManager
+from src.status_manager import (
+    DoubleProcessingGuard,
+    DraftCreationVerificationError,
+    StatusManager,
+)
 
 
 class FakeSheetsClient:
@@ -19,9 +23,40 @@ class FakeSheetsClient:
     def find_stale_processing_articles(self) -> list[Article]:
         return [a for a in self._articles.values() if a.status == Status.PROCESSING]
 
+    def find_inconsistent_ready_with_note_url(self) -> list[Article]:
+        return [
+            a
+            for a in self._articles.values()
+            if a.status == Status.READY and a.note_url.strip()
+        ]
+
     def update_fields(self, article: Article, **fields: str) -> None:
         current = self._articles[article.id]
         for key, value in fields.items():
+            setattr(current, key, value)
+
+
+class FlakyStatusSheetsClient(FakeSheetsClient):
+    """statusフィールドの書き込みが最初の1回だけ反映されない状況を再現する。
+
+    実機テスト(GitHub Actions Content Pipeline #16)で、note_urlと
+    updated_atは反映されたのにstatusだけreadyのまま残るという不整合が
+    観測された。1回だけ意図的に無視することで、mark_draft_created()の
+    read-back検証がこれを検知できることと、その後のneeds_reviewへの
+    書き込みは正常に反映される(=検知後の自動復旧メッセージはきちんと
+    残せる)ことの両方をテストできるようにする。
+    """
+
+    def __init__(self, articles: list[Article]):
+        super().__init__(articles)
+        self._status_write_failures_remaining = 1
+
+    def update_fields(self, article: Article, **fields: str) -> None:
+        current = self._articles[article.id]
+        for key, value in fields.items():
+            if key == "status" and self._status_write_failures_remaining > 0:
+                self._status_write_failures_remaining -= 1
+                continue  # statusの書き込みを1回だけ無視する
             setattr(current, key, value)
 
 
@@ -116,6 +151,44 @@ def test_mark_draft_created_sets_urls_and_clears_error():
     assert updated.status == Status.DRAFT_CREATED.value
     assert updated.note_url == "https://note.com/x/n/abc"
     assert updated.error_message == ""
+
+
+def test_mark_draft_created_raises_when_status_write_is_not_reflected():
+    """実機で観測された不整合(note_urlは書けたがstatusだけreadyのまま)の再現。
+
+    書き込みAPI自体が例外を出さなくても、read-back検証で不一致を検知し、
+    needs_reviewへ倒したうえでDraftCreationVerificationErrorを送出する
+    (呼び出し側main.pyが「正常成功」として扱わないようにするため)。
+    """
+    article = make_article(status=Status.PROCESSING.value)
+    sheets = FlakyStatusSheetsClient([article])
+    manager = StatusManager(sheets)
+
+    with pytest.raises(DraftCreationVerificationError):
+        manager.mark_draft_created(article, note_url="https://note.com/x/n/abc", craft_url="")
+
+    updated = sheets.list_articles()[0]
+    # note_url自体は書き込めている(実機と同じ状況)が、statusはneeds_reviewへ倒れる。
+    assert updated.status == Status.NEEDS_REVIEW.value
+    assert updated.note_url == "https://note.com/x/n/abc"
+    assert "read-back" in updated.error_message or "反映" in updated.error_message
+
+
+def test_reconcile_inconsistent_ready_with_note_url_moves_to_needs_review():
+    inconsistent = make_article(
+        id="a1", status=Status.READY.value, note_url="https://note.com/x/n/abc"
+    )
+    clean_ready = make_article(id="a2", status=Status.READY.value, note_url="")
+    sheets = FakeSheetsClient([inconsistent, clean_ready])
+    manager = StatusManager(sheets)
+
+    result = manager.reconcile_inconsistent_ready_with_note_url()
+
+    assert {a.id for a in result} == {"a1"}
+    updated = {a.id: a for a in sheets.list_articles()}
+    assert updated["a1"].status == Status.NEEDS_REVIEW.value
+    assert updated["a1"].note_url == "https://note.com/x/n/abc"
+    assert updated["a2"].status == Status.READY.value  # 正常なreadyは変更しない
 
 
 def test_mark_error_records_stage_in_message():

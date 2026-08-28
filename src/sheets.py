@@ -151,11 +151,48 @@ class SheetsClient:
         """
         return [a for a in self.list_articles() if a.status == Status.PROCESSING]
 
+    def find_inconsistent_ready_with_note_url(self) -> list[Article]:
+        """status=ready なのに note_url が既に入っている不整合な行を返す。
+
+        本来 ready は「まだnote下書きを作成していない」状態のはずだが、
+        note下書き作成自体は成功して note_url の書き込みは反映された
+        ものの、続く status を draft_created へ更新する書き込みだけが
+        何らかの理由で反映されなかった場合にこの状態になりうる
+        (実機で実際に観測された不整合)。get_next_target_article() は
+        note_url が空の行しか対象にしないため、この状態の行は新規の
+        note下書きが誤って重複作成されることはないが、それ以上自動処理も
+        進まないまま放置され続けてしまう。この不整合を検出し、reconcile
+        処理の一環としてneeds_reviewへ倒すために使う。
+        """
+        return [
+            a
+            for a in self.list_articles()
+            if a.status == Status.READY and a.note_url.strip()
+        ]
+
     def update_fields(self, article: Article, **fields: str) -> None:
-        """指定した列だけを更新する(article.row_numberの行)。updated_atは自動更新。"""
+        """指定した列だけを更新する(article.row_numberの行)。updated_atは自動更新。
+
+        1フィールド=1回のAPI呼び出し(update_cell)で書き込む。実機で
+        「note_url と updated_at は反映されたのに status だけ反映され
+        なかった」という不整合が観測されたため、原因調査の手がかりとして
+        書き込み直前に列名・列番号・値をログに残す(値は記事本文などの
+        秘密情報ではなく、Sheetsの業務データそのものであるため記録して
+        問題ない)。呼び出し側(StatusManager)で書き込み後のread-back
+        検証を行う設計にしているため、ここでは書き込みリクエストの送信
+        までを担当する。
+        """
         ws = self._require_worksheet()
         fields = dict(fields)
         fields["updated_at"] = now_iso()
         for column_name, value in fields.items():
             col = self._col_index(column_name)
+            logger.info(
+                "Sheets書き込み: id=%s row=%d column=%s(col_index=%d) value=%r",
+                article.id,
+                article.row_number,
+                column_name,
+                col,
+                value,
+            )
             ws.update_cell(article.row_number, col, value)

@@ -21,6 +21,7 @@ from src.note import (  # noqa: E402
     NotePoster,
     NotePosterError,
     TagValidationError,
+    _normalize_whitespace,
     build_body_with_hashtags,
     normalize_tags,
 )
@@ -103,44 +104,6 @@ def test_set_multiline_text_on_contenteditable(page):
     assert "1行目" in text
     assert "2行目" in text
     assert "3行目" in text
-
-
-# 「本文は画面上に表示されているのに、noteの内部の文字数カウンタが
-# 「0 文字」のまま反映されない」という実機で確認された不具合の再現・検証用。
-_COUNTER_HTML = """
-<div contenteditable="true" class="editor"></div>
-<div id="counter">0 文字</div>
-<script>
-  document.querySelector('.editor').addEventListener('input', (e) => {
-    const len = e.target.innerText.replace(/\\n/g, '').length;
-    document.getElementById('counter').textContent = len + ' 文字';
-  });
-</script>
-"""
-
-
-def test_assert_body_registered_passes_when_counter_updates(page):
-    page.set_content(_COUNTER_HTML)
-    poster = _bare_poster()
-    editor = page.locator(".editor")
-
-    # press_sequentially() は実際のキー入力に近いイベントを発生させるため、
-    # ページ側のinputリスナー(=noteの内部状態更新を模したもの)が反応する。
-    poster._set_multiline_text(page, editor, "テスト本文です")
-
-    poster._assert_body_registered(page)  # 例外が出なければOK
-
-
-def test_assert_body_registered_raises_when_counter_stays_zero(page):
-    page.set_content(_COUNTER_HTML)
-    poster = _bare_poster()
-
-    # inputイベントを発生させずにDOMだけ書き換える(内部状態が更新されない
-    # 不具合を模した状態)。画面上は文字が見えても文字数カウンタは0のまま。
-    page.evaluate('document.querySelector(".editor").innerText = "テスト本文です"')
-
-    with pytest.raises(NotePosterError, match="0 文字"):
-        poster._assert_body_registered(page)
 
 
 def test_assert_not_publish_action_blocks_publish_labeled_button(page):
@@ -246,6 +209,215 @@ def test_wait_for_autosave_idle_raises_when_stuck_saving(page):
 
     with pytest.raises(NotePosterError, match="保存中"):
         poster._wait_for_autosave_idle(page, timeout_ms=300)
+
+
+# -- 本文入力欄の誤検出防止・read-back検証(実機の重大な不具合への対処) ------
+#
+# GitHub Actions Content Pipeline #16で、パイプライン自体は"success"で
+# 終了したにもかかわらず、実際のnote下書きの本文が完全に空になるという
+# 重大な不具合が発生した。原因は、本文editorの候補セレクタが全滅した際の
+# 「画面上に見えている最初のcontenteditableを無条件に使う」という位置
+# ベースのフォールバックが、本文editorではない別の要素(タイトル入力欄)を
+# 誤って掴んでしまったこと。以下はその再発防止(誤検出の禁止・read-back
+# 検証)を確認するテスト。
+
+
+def test_normalize_whitespace_removes_all_whitespace_including_newlines():
+    assert _normalize_whitespace("a\n\n\nb c\td\n") == "abcd"
+
+
+def test_same_element_true_for_identical_locator(page):
+    page.set_content('<div id="x" contenteditable="true"></div>')
+    poster = _bare_poster()
+    loc = page.locator("#x")
+
+    assert poster._same_element(page, loc, loc) is True
+
+
+def test_same_element_false_for_different_elements(page):
+    page.set_content(
+        '<div id="a" contenteditable="true"></div>'
+        '<div id="b" contenteditable="true"></div>'
+    )
+    poster = _bare_poster()
+
+    assert poster._same_element(page, page.locator("#a"), page.locator("#b")) is False
+
+
+def test_fill_title_returns_the_resolved_locator(page):
+    page.set_content('<textarea placeholder="タイトル"></textarea>')
+    poster = _bare_poster()
+
+    locator = poster._fill_title(page, "テストタイトル")
+
+    assert locator.input_value() == "テストタイトル"
+
+
+def test_fill_body_raises_when_no_body_editor_candidate_matches(page):
+    """本文editorであることに根拠のある候補(role=textbox name=本文、
+    class名にbody/editorを含むcontenteditable)がいずれも一致しない場合、
+    以前は位置ベースの最終手段(画面上の最初のcontenteditable)に
+    フォールバックしていたが、この挙動が実機での本文消失事故の原因と
+    なったため撤去した。候補が全滅した場合は入力せずNotePosterErrorで
+    中断する(呼び出し側でneeds_reviewに倒れる)。
+    """
+    page.set_content('<div id="unrelated" contenteditable="true"></div>')
+    poster = _bare_poster()
+    title_locator = page.locator("#unrelated")
+
+    with pytest.raises(NotePosterError):
+        poster._fill_body(page, "本文テキスト", title_locator=title_locator)
+
+
+def test_fill_body_raises_when_resolved_element_is_same_as_title(page):
+    """本文用の候補セレクタが、たまたまタイトル欄自身にも一致してしまう
+    (本文editorを正しく特定できていない)状況を再現する。
+    """
+    page.set_content(
+        '<div class="body-editor"><div id="title-and-body" contenteditable="true">'
+        "</div></div>"
+    )
+    poster = _bare_poster()
+    title_locator = page.locator("#title-and-body")
+
+    with pytest.raises(NotePosterError, match="タイトル入力欄と同一"):
+        poster._fill_body(page, "本文テキスト", title_locator=title_locator)
+
+
+def test_fill_body_succeeds_when_body_editor_is_distinct_from_title(page):
+    page.set_content(
+        '<div id="title" contenteditable="true"></div>'
+        '<div class="body-editor"><div id="body" contenteditable="true"></div></div>'
+    )
+    poster = _bare_poster()
+    title_locator = page.locator("#title")
+
+    body_locator = poster._fill_body(page, "本文テキスト", title_locator=title_locator)
+
+    assert body_locator.get_attribute("id") == "body"
+    assert "本文テキスト" in body_locator.inner_text()
+
+
+def test_fill_body_source_has_no_positional_fallback_candidates():
+    """本文editorであることを保証できない位置ベースのフォールバック
+    (「最初の/2番目のcontenteditable」)が復活していないことを確認する
+    回帰テスト。
+    """
+    import inspect
+
+    source = inspect.getsource(NotePoster._fill_body)
+    assert "nth(1)" not in source
+    assert "最終手段" not in source
+
+
+def test_assert_body_matches_passes_when_locator_contains_expected_text(page):
+    page.set_content('<div contenteditable="true" class="editor"></div>')
+    poster = _bare_poster()
+    editor = page.locator(".editor")
+    body = "本文の内容です。"
+    expected = build_body_with_hashtags(body, ["テスト", "自動投稿"])
+    poster._set_multiline_text(page, editor, expected)
+
+    poster._assert_body_matches(
+        page, editor, expected, "#テスト #自動投稿", stage="保存前"
+    )  # 例外が出なければOK
+
+
+def test_assert_body_matches_ignores_newline_representation_differences(page):
+    # 実際のcontenteditableは複数行の内容を<div>等で表現することがあり、
+    # inner_text()の改行の量が入力時の想定と厳密には一致しないことがある。
+    # 空白文字の表現差では不一致と判定しないことを確認する。
+    page.set_content(
+        '<div contenteditable="true" class="editor">'
+        "<div>本文</div><div>2行目</div>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    editor = page.locator(".editor")
+    expected = "本文\n\n\n2行目"  # 実際の改行量とは異なる期待値
+
+    poster._assert_body_matches(page, editor, expected, "", stage="保存前")  # 例外が出なければOK
+
+
+def test_assert_body_matches_raises_when_content_does_not_match(page):
+    page.set_content('<div contenteditable="true" class="editor"></div>')
+    poster = _bare_poster()
+    editor = page.locator(".editor")
+    poster._set_multiline_text(page, editor, "違う内容")
+
+    with pytest.raises(NotePosterError, match="一致しませんでした"):
+        poster._assert_body_matches(page, editor, "期待していた本文", "", stage="保存前")
+
+
+def test_assert_body_matches_error_reports_head_tail_hashtag_details(page):
+    page.set_content('<div contenteditable="true" class="editor"></div>')
+    poster = _bare_poster()
+    editor = page.locator(".editor")
+    # 先頭は入力されているが、末尾のタグ行が欠けている状況を再現する。
+    poster._set_multiline_text(page, editor, "期待した本文の先頭部分だけです")
+
+    expected_body = "期待した本文の先頭部分だけです" + ("\n" * 5) + "#テスト"
+    with pytest.raises(NotePosterError) as exc_info:
+        poster._assert_body_matches(page, editor, expected_body, "#テスト", stage="保存前")
+
+    message = str(exc_info.value)
+    assert "先頭一致=True" in message
+    assert "末尾一致=False" in message
+    assert "タグ行一致=False" in message
+
+
+def test_run_step_returns_actions_return_value(page):
+    poster = _bare_poster()
+
+    result = poster._run_step(page, "テストステップ", lambda: 42)
+
+    assert result == 42
+
+
+def test_full_body_flow_detects_content_loss_after_save_without_ever_publishing(page):
+    """本文editorの特定→入力→read-back→保存→保存後read-back、という
+    一連の流れを模したページに対するテスト。保存によって本文が失われる
+    状況(実機で観測された不具合の一種)を再現し、保存後のread-back検証で
+    正しく検知できること、また一連の流れの中で「投稿する」ボタンが
+    一度もクリックされないことを確認する。
+    """
+    page.set_content(
+        """
+        <textarea placeholder="タイトル"></textarea>
+        <div class="body-editor">
+          <div id="body" contenteditable="true"></div>
+        </div>
+        <button id="save">下書き保存</button>
+        <button id="post">投稿する</button>
+        <script>
+          window.__posted = false;
+          document.getElementById('post').addEventListener('click', () => {
+            window.__posted = true;
+          });
+          // 保存を押すと本文が失われる状況を再現する。
+          document.getElementById('save').addEventListener('click', () => {
+            document.getElementById('body').innerText = '';
+          });
+        </script>
+        """
+    )
+    poster = _bare_poster()
+
+    title_locator = poster._fill_title(page, "タイトル")
+    body_text = "本文" + ("\n" * 5) + "#テスト"
+    body_locator = poster._fill_body(page, body_text, title_locator=title_locator)
+
+    # 保存前のread-backは成功するはず。
+    poster._assert_body_matches(page, body_locator, body_text, "#テスト", stage="保存前")
+
+    page.get_by_role("button", name="下書き保存").click()
+
+    # 保存後のread-backでは、内容が失われたことを検知して例外になるはず。
+    with pytest.raises(NotePosterError, match="一致しませんでした"):
+        poster._assert_body_matches(page, body_locator, body_text, "#テスト", stage="保存後")
+
+    # この一連の流れで「投稿する」は一度もクリックされていない。
+    assert page.evaluate("window.__posted") is False
 
 
 # -- タグ正規化・本文末尾ハッシュタグ組み立て(ブラウザ不要の純粋なロジック) --

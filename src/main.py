@@ -14,7 +14,11 @@ import sys
 from src.config import Config
 from src.logger import get_logger
 from src.sheets import SheetsClient
-from src.status_manager import DoubleProcessingGuard, StatusManager
+from src.status_manager import (
+    DoubleProcessingGuard,
+    DraftCreationVerificationError,
+    StatusManager,
+)
 
 logger = get_logger()
 
@@ -30,12 +34,19 @@ def cmd_reconcile(_args: argparse.Namespace) -> int:
     sheets = _connect()
     manager = StatusManager(sheets)
     stale = manager.reconcile_stale_processing()
+    inconsistent = manager.reconcile_inconsistent_ready_with_note_url()
     if stale:
-        logger.info("needs_reviewにした件数: %d", len(stale))
+        logger.info("processing残留でneeds_reviewにした件数: %d", len(stale))
         for a in stale:
             logger.info("  id=%s title=%s", a.id, a.title[:30])
     else:
         logger.info("processingのまま残っている行はありませんでした")
+    if inconsistent:
+        logger.info("ready+note_url不整合でneeds_reviewにした件数: %d", len(inconsistent))
+        for a in inconsistent:
+            logger.info("  id=%s title=%s note_url=%s", a.id, a.title[:30], a.note_url)
+    else:
+        logger.info("ready+note_urlの不整合な行はありませんでした")
     return 0
 
 
@@ -43,6 +54,7 @@ def cmd_fetch(_args: argparse.Namespace) -> int:
     sheets = _connect()
     manager = StatusManager(sheets)
     manager.reconcile_stale_processing()
+    manager.reconcile_inconsistent_ready_with_note_url()
 
     article = sheets.get_next_target_article()
     if article is None:
@@ -61,6 +73,7 @@ def cmd_run(_args: argparse.Namespace) -> int:
     sheets = _connect()
     manager = StatusManager(sheets)
     manager.reconcile_stale_processing()
+    manager.reconcile_inconsistent_ready_with_note_url()
 
     article = sheets.get_next_target_article()
     if article is None:
@@ -87,12 +100,31 @@ def cmd_run(_args: argparse.Namespace) -> int:
             note_url = poster.create_draft(article)
     except Exception as exc:  # noqa: BLE001 - 想定外の失敗も必ずSheetsに記録する
         logger.exception("note下書き作成に失敗しました")
+        logger.error(
+            "最終結果: id=%s note_url=(未取得) final_status=needs_review", article.id
+        )
         manager.mark_needs_review(article, stage="note", message=str(exc))
         return 1
 
     # Craft連携(Phase4)が未実装のうちは、note下書きが作れた時点でdraft_createdとする。
-    manager.mark_draft_created(article, note_url=note_url, craft_url="")
-    logger.info("draft_created: id=%s note_url=%s status=draft_created", article.id, note_url)
+    # mark_draft_created() は書き込み後にSheetsを読み戻し、実際にstatusが
+    # draft_createdへ反映されたことを確認できた場合のみ正常終了する
+    # (書き込みAPIがエラーを出さなかっただけでは成功とみなさない)。
+    try:
+        manager.mark_draft_created(article, note_url=note_url, craft_url="")
+    except DraftCreationVerificationError as exc:
+        logger.error(
+            "最終結果: id=%s note_url=%s final_status=needs_review(read-back検証失敗) "
+            "detail=%s",
+            article.id,
+            note_url,
+            exc,
+        )
+        return 1
+
+    logger.info(
+        "最終結果: id=%s note_url=%s final_status=draft_created", article.id, note_url
+    )
     return 0
 
 

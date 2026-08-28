@@ -124,6 +124,18 @@ def test_find_stale_processing_articles():
     assert {a.id for a in stale} == {"a1", "a3"}
 
 
+def test_find_inconsistent_ready_with_note_url():
+    client, _ = make_client_with_rows([
+        row(id_="a1", status="ready", note_url="https://note.com/x"),
+        row(id_="a2", status="ready", note_url=""),
+        row(id_="a3", status="processing", note_url="https://note.com/y"),
+    ])
+
+    inconsistent = client.find_inconsistent_ready_with_note_url()
+
+    assert {a.id for a in inconsistent} == {"a1"}
+
+
 def test_update_fields_writes_correct_columns_and_updated_at():
     client, fake_ws = make_client_with_rows([row(id_="a1", status="ready")])
     article = client.list_articles()[0]

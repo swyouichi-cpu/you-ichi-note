@@ -63,9 +63,55 @@ _TAG_SEPARATOR = "\\n" * 5)。タグが1件も無い場合は区切り文字列�
 1回のinputイベントとしてまとめてテキストを差し込むため、noteのリッチ
 テキストエディタが実際のキー入力イベント列を前提に内部状態を更新して
 いる場合に検知されないと考えられる。そのため press_sequentially()
-(1文字ずつ実際のキー入力に近いイベントを発生させる)に変更し、
-本文入力の直後に文字数カウンタが「0 文字」のままでないかを確認する
-_assert_body_registered() を追加している。
+(1文字ずつ実際のキー入力に近いイベントを発生させる)に変更した。
+
+★本文入力欄の誤検出防止とread-back検証について(実機で発生した重大な
+不具合への対処)★
+実機テスト(GitHub Actions Content Pipeline #16)で、パイプライン自体は
+"success"で終了したにもかかわらず、実際のnote下書きの本文が完全に空
+(文字数カウンタ「0 文字」)になるという重大な不具合が発生した。ログを
+精査した結果、_fill_body() の候補セレクタが本命(role=textbox name=本文、
+class名にbody/editorを含むcontenteditable)含め全て一致せず、当時存在
+していた「画面上に見えている最初のcontenteditable要素を無条件に使う」
+という位置ベースの最終フォールバックが、本文editorではない別の要素
+(タイトル入力欄である可能性が高い)を誤って掴み、そこに本文全体を
+入力してしまっていたことが判明した。
+
+さらに旧 _assert_body_registered() は「ページ全体に“0 文字”という文字列が
+見えているか」という間接的なチェックだったため、本文editor自体には一度も
+フォーカスが当たらず本来の文字数カウンタが「0 文字」という正確な文字列と
+して描画されなかった結果、このチェックをすり抜けて「成功」と判定されて
+しまった。ページ全体を対象にした文字列探索は、正しい要素に入力した上で
+内部状態だけが更新されない場合(insert_textの旧不具合)には有効だが、
+「そもそも間違った要素に入力した」場合には無力であることが分かった。
+
+この教訓から、以下の2つの安全装置を追加した。「何かに入力できる」ことより
+「間違った場所に入力しない」ことを優先する設計方針である。
+
+  1. 位置ベースの無条件フォールバック(「最初の/2番目のcontenteditable」)
+     を _fill_body() の候補から完全に削除した。本文editorであることに
+     根拠のある候補(role=textbox name=本文、class名ベース)のみを試し、
+     いずれも一致しなければ本文への入力を一切行わずNotePosterErrorで
+     中断する(呼び出し側でneeds_reviewに倒れる)。
+  2. _same_element() で、本文入力欄として解決した要素がタイトル入力欄
+     (_fill_title()が解決した要素)と同一のDOM要素でないことを確認する。
+     同一だった場合は誤検出とみなし、入力せずに中断する。
+  3. _assert_body_matches() で、_fill_body()が実際に入力に使った
+     locatorそのものから inner_text() を読み戻し、期待した本文
+     (build_body_with_hashtags()の戻り値)と一致するかを確認する。
+     note側のcontenteditableは改行の表現(\\n / <br> / 空div等)が
+     実装により変わりうるため、比較前に空白文字を全て除去して正規化
+     する(期待値・実際値の両方に同じ正規化を適用するため、改行表現の
+     違いによる誤検知を避けつつ、実際の文字内容の差異は検出できる)。
+     不一致の場合は下書き保存へ進まずNotePosterErrorで中断する。
+     この検証は「下書き保存」ボタンを押す前と、押した後の両方で行う
+     (保存によって内容が失われていないかも確認するため)。
+
+read-back検証だけでは「間違った要素に入力してそのまま読み戻す」ケースは
+検知できない(自分が書いた場所を自分で読み返すだけなので一致してしまう)。
+そのため上記1・2の「そもそも正しい要素にしか入力しない」対策と、3の
+「入力した内容が実際に保持されているかの確認」を併用することで、今回の
+不具合の再発を防ぐ設計にしている。
 
 ★ログイン方式★
 メールアドレス・パスワードを直接入力させる方式は、note側のreCAPTCHA
@@ -149,6 +195,17 @@ def _strip_query(url: str) -> str:
     """URLからクエリ文字列を除去する(トークン等が紛れ込む可能性への念のための対策)。"""
     parts = urlsplit(url)
     return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
+def _normalize_whitespace(text: str) -> str:
+    """本文read-back比較用に、全ての空白文字(改行含む)を取り除く。
+
+    noteのcontenteditableは改行の表現(\\n / <br> / 空div等)が実装により
+    変わりうるため、比較前に期待値・実際値の両方へ同じ正規化を適用する。
+    これにより改行表現の違いでは不一致にならず、実際の文字内容(空白以外)
+    の差異だけを検出できる。
+    """
+    return re.sub(r"\s+", "", text)
 
 
 class NotePosterError(RuntimeError):
@@ -539,12 +596,14 @@ class NotePoster:
                 "HTTPステータス)を確認してください。"
             ) from exc
 
-    def _run_step(self, page: Page, step_name: str, action) -> None:
+    def _run_step(self, page: Page, step_name: str, action):
         """1ステップを実行し、どこで失敗しても診断データを残してから
         NotePosterError として送出し直す(呼び出し側での原因特定を助けるため)。
+        action の戻り値をそのまま返す(タイトル/本文のlocatorを後続の
+        ステップへ引き渡すために使う)。
         """
         try:
-            action()
+            return action()
         except NotePosterError:
             raise  # _resolve_locator側で既に診断データを残しているのでそのまま
         except PlaywrightTimeoutError as exc:
@@ -564,10 +623,18 @@ class NotePoster:
         (押さないのではなく、そのコードパス自体が存在しない)。タグは
         note公式ヘルプが案内する方式にならい、本文末尾に5行分の改行を
         挟んで「#タグ1 #タグ2」の形で追記してから本文入力欄へ入力する。
-        成功したら "draft_created" をログに残す。
+
+        本文入力欄は、タイトル入力欄と同一のDOM要素を誤って掴んでいない
+        ことを確認したうえで使用し(_same_element)、実際に入力に使った
+        locatorから読み戻した内容が期待した本文と一致することを、
+        「下書き保存」を押す前と押した後の両方で確認する
+        (_assert_body_matches)。いずれかに失敗した場合は下書き保存を
+        行わない、または最終的な成功とはみなさずにNotePosterErrorを
+        送出する。
         """
         tags = normalize_tags(article.tag_list())
         body_with_hashtags = build_body_with_hashtags(article.body, tags)
+        hashtag_line = " ".join(f"#{tag}" for tag in tags) if tags else ""
 
         assert self._context is not None, "with文の中で使ってください"
         page = self._context.new_page()
@@ -589,15 +656,27 @@ class NotePoster:
         self._assert_logged_in(page)
 
         logger.info("タイトルを入力")
-        self._run_step(page, "タイトル入力", lambda: self._fill_title(page, article.title))
+        title_locator = self._run_step(
+            page, "タイトル入力", lambda: self._fill_title(page, article.title)
+        )
         self._screenshot(page, "02_title_filled")
 
-        logger.info("本文(末尾にタグを追記済み)を入力")
-        self._run_step(page, "本文入力", lambda: self._fill_body(page, body_with_hashtags))
+        logger.info("本文入力欄を特定して入力(末尾にタグを追記済み)")
+        body_locator = self._run_step(
+            page,
+            "本文入力",
+            lambda: self._fill_body(page, body_with_hashtags, title_locator=title_locator),
+        )
         self._screenshot(page, "03_body_filled")
 
-        logger.info("本文がnote側に反映されたか確認")
-        self._run_step(page, "本文反映確認", lambda: self._assert_body_registered(page))
+        logger.info("本文入力欄からの読み戻しで内容を確認(下書き保存前)")
+        self._run_step(
+            page,
+            "本文read-back確認(保存前)",
+            lambda: self._assert_body_matches(
+                page, body_locator, body_with_hashtags, hashtag_line, stage="保存前"
+            ),
+        )
 
         logger.info("自動保存の完了を確認")
         self._run_step(page, "自動保存完了待ち", lambda: self._wait_for_autosave_idle(page))
@@ -606,9 +685,21 @@ class NotePoster:
         self._run_step(page, "下書き保存", lambda: self._save_draft(page))
         self._screenshot(page, "04_saved_draft")
 
+        logger.info("保存完了(自動保存表示の解消)を確認")
+        self._run_step(page, "保存完了確認", lambda: self._wait_for_autosave_idle(page))
+
+        logger.info("本文入力欄からの読み戻しで内容を再確認(下書き保存後)")
+        self._run_step(
+            page,
+            "本文read-back確認(保存後)",
+            lambda: self._assert_body_matches(
+                page, body_locator, body_with_hashtags, hashtag_line, stage="保存後"
+            ),
+        )
+
         note_url = page.url
         page.close()
-        logger.info("draft_created id=%s note_url=%s", article.id, note_url)
+        logger.info("note側の全確認が完了 id=%s note_url=%s", article.id, note_url)
         return note_url
 
     # -- 入力補助 -------------------------------------------------------------
@@ -660,9 +751,28 @@ class NotePoster:
                 f"意図しないボタンに一致している可能性があります。"
             )
 
+    def _same_element(self, page: Page, a: Locator, b: Locator) -> bool:
+        """2つのLocatorが画面上の同一のDOM要素を指しているかを確認する。
+
+        本文入力欄としてタイトル入力欄と同じ要素を誤って掴んでいないかを
+        確認するために使う(実機で、本文editorの候補セレクタが全滅し、
+        位置ベースの無条件フォールバックがタイトル欄らしき要素を誤って
+        掴んで本文全体を書き込んでしまった不具合への対処)。要素が取得
+        できない場合は「別要素」として扱う(入力を止める側に倒さない
+        ための安全側の判断ではなく、単に判定不能なため)。
+        """
+        try:
+            handle_a = a.element_handle()
+            handle_b = b.element_handle()
+        except PlaywrightTimeoutError:
+            return False
+        if handle_a is None or handle_b is None:
+            return False
+        return bool(page.evaluate("([x, y]) => x === y", [handle_a, handle_b]))
+
     # -- 各ステップの実装(note.comのUI変更に備えて複数候補を用意) -------------
 
-    def _fill_title(self, page: Page, title: str) -> None:
+    def _fill_title(self, page: Page, title: str) -> Locator:
         candidates = [
             ("role=textbox name=タイトル", page.get_by_role("textbox", name="タイトル")),
             ("placeholder=タイトル(完全一致)", page.get_by_placeholder("タイトル", exact=True)),
@@ -686,8 +796,25 @@ class NotePoster:
         ]
         locator = self._resolve_locator(page, candidates, step_name="タイトル入力欄")
         self._set_single_line_text(locator, title)
+        return locator
 
-    def _fill_body(self, page: Page, body: str) -> None:
+    def _fill_body(self, page: Page, body: str, *, title_locator: Locator) -> Locator:
+        """本文入力欄を特定して入力する。
+
+        実機テストで、本命の候補(role=textbox name=本文、class名に
+        body/editorを含むcontenteditable)がいずれも一致せず、当時存在
+        していた「画面上に見えている最初のcontenteditableを無条件に使う」
+        という位置ベースの最終フォールバックが、本文editorではない別の
+        要素(タイトル入力欄である可能性が高い)を誤って掴み、そこに
+        本文全体を書き込んでしまう不具合が発生した。その反省から、
+        本文editorだと確証できない位置ベースのフォールバックは一切
+        用意しない。候補が全滅した場合は入力を行わずNotePosterErrorで
+        中断する(呼び出し側でneeds_reviewに倒れる)。
+
+        候補が一致した場合も、念のためタイトル入力欄(title_locator)と
+        同一のDOM要素でないことを_same_element()で確認し、同一だった
+        場合も入力せずに中断する。
+        """
         candidates = [
             ("role=textbox name=本文", page.get_by_role("textbox", name=re.compile("本文"))),
             (
@@ -698,37 +825,73 @@ class NotePoster:
                     '[class*="editor" i] [contenteditable="true"]'
                 ),
             ),
-            (
-                "最終手段: 2番目のcontenteditable(1番目はタイトルの可能性)",
-                page.locator('[contenteditable="true"]').nth(1),
-            ),
-            (
-                "最終手段: 最初のcontenteditable",
-                page.locator('[contenteditable="true"]').first,
-            ),
         ]
         locator = self._resolve_locator(page, candidates, step_name="本文入力欄")
+        if self._same_element(page, locator, title_locator):
+            self._capture_failure(page, "本文入力欄誤検出")
+            raise NotePosterError(
+                "本文入力欄として検出した要素が、タイトル入力欄と同一のDOM要素"
+                "でした。本文editorを正しく特定できていない可能性が高いため、"
+                "誤った要素への入力を避けて処理を中断します。"
+            )
         self._set_multiline_text(page, locator, body)
+        return locator
 
-    def _assert_body_registered(self, page: Page) -> None:
-        """本文がnote側の内部状態(文字数カウンタ)にも反映されたことを確認する。
+    def _assert_body_matches(
+        self,
+        page: Page,
+        locator: Locator,
+        expected_body: str,
+        hashtag_line: str,
+        *,
+        stage: str,
+    ) -> None:
+        """本文入力欄からその場で読み戻し、期待した本文と一致するかを確認する。
 
-        画面上は文字が表示されていても、note側の内部状態(文字数カウンタ等)に
-        反映されていないことがある(過去に「0 文字」のまま止まっていた実績あり)。
-        「公開に進む」へ進んでから検証ダイアログで気づくと原因の切り分けが
-        難しくなるため、本文入力の直後にこの時点で検知する。
+        ページ全体から特定の文字列(旧実装の「0 文字」探索)を探すのではなく、
+        実際に入力した本文入力欄そのもの(locator)の中身を読み、期待値と
+        比較する。「本文editorではない別要素に入力してしまう」ケースは
+        自分が書いた場所を自分で読み返すだけなので原理的に検知できない
+        (それは_fill_body側の_same_element等で防ぐ役割)。ここで検知したい
+        のは「正しい要素に入力したのに、内部状態への反映や保存によって
+        内容が失われていないか」である。
+
+        note側のcontenteditableは改行の表現(\\n / <br> / 空div等)が
+        実装により変わりうるため、比較前に空白文字を全て取り除いて正規化
+        する(期待値・実際値の両方に同じ正規化を適用するため、改行表現の
+        違いでは不一致にならず、実際の文字内容の差異だけを検出できる)。
+
+        全体が一致しない場合は、原因の切り分けのため本文の先頭・末尾・
+        ハッシュタグ行それぞれが含まれているかを個別に確認し、エラー
+        メッセージに含める。stageは"保存前"/"保存後"など呼び出し位置を
+        表す(エラーメッセージ・診断ファイル名に使う)。
         """
         try:
-            page.get_by_text("0 文字", exact=True).wait_for(state="visible", timeout=2000)
-            still_zero = True
+            actual = locator.inner_text()
         except PlaywrightTimeoutError:
-            still_zero = False
-        if still_zero:
-            raise NotePosterError(
-                "本文を入力しましたが、文字数カウンタが「0 文字」のままです。"
-                "画面上は本文が表示されていても、noteエディタの内部状態に"
-                "反映されていない可能性があります(過去に発生した既知の問題)。"
-            )
+            actual = ""
+
+        normalized_actual = _normalize_whitespace(actual)
+        normalized_expected = _normalize_whitespace(expected_body)
+
+        if normalized_actual == normalized_expected:
+            return
+
+        head = expected_body[:20]
+        tail = expected_body[-20:] if expected_body else ""
+        head_ok = bool(head) and _normalize_whitespace(head) in normalized_actual
+        tail_ok = bool(tail) and _normalize_whitespace(tail) in normalized_actual
+        hashtag_ok = (not hashtag_line) or (
+            _normalize_whitespace(hashtag_line) in normalized_actual
+        )
+
+        self._capture_failure(page, f"本文read-back確認_{stage}")
+        raise NotePosterError(
+            f"本文入力欄の内容を読み戻したところ({stage})、入力しようとした"
+            f"本文と一致しませんでした。先頭一致={head_ok} 末尾一致={tail_ok} "
+            f"タグ行一致={hashtag_ok} 実際の文字数(概算)={len(actual)} "
+            f"期待した文字数(概算)={len(expected_body)}"
+        )
 
     def _wait_for_autosave_idle(self, page: Page, timeout_ms: int = 15000) -> None:
         """自動保存中(「保存中」の表示)が消えるまで待つ。
