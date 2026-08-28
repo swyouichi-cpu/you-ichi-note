@@ -13,11 +13,26 @@ note.com へ直接アクセスして画面を確認することができませ�
 (スクリーンショット・HTMLダンプ)を頼りに次の修正を行う設計にしています。
 
 ★安全設計(絶対に守ること)★
-このファイルには「公開する」ボタンを押すコードを一切含めない。
-実装できるのは「下書き保存」までであり、公開操作を自動化する
-コードパスを追加する場合は、必ず別途ユーザーの明示的な合意を得ること。
-念のため、保存ボタンをクリックする直前にボタンの文言を確認し、
-「公開」系の単語が含まれていたら処理を中断する安全装置も入れている。
+このファイルには、記事を実際に公開/投稿/予約投稿してしまうボタン
+(noteの実機確認により文言は「投稿する」)を押すコードを一切含めない。
+実装できるのは「下書き保存」までであり、公開操作を自動化するコードパスを
+追加する場合は、必ず別途ユーザーの明示的な合意を得ること。
+念のため、危険な可能性のあるボタンをクリックする直前には必ず
+_assert_not_publish_action() でボタンの文言を確認し、_FORBIDDEN_PUBLISH_
+KEYWORDS に含まれる単語(「投稿する」「公開する」「予約投稿」等)が
+含まれていたら処理を中断する安全装置を入れている。
+
+タグ(ハッシュタグ)はnoteの現在のエディタでは本文編集画面には無く、
+「公開に進む」ボタンの先にある「公開設定」パネルの中にしかない
+(ユーザーが実機で確認済み)。「公開に進む」はこのパネルを開くだけの
+画面遷移であり、それ自体は公開しない。パネル内の右上にある「投稿する」
+ボタンを押して初めて公開される。このパネルの左上「キャンセル」で
+公開せずに編集画面へ戻れることも確認済みだが、「キャンセルでタグが
+保持されるか」は事前に確認できなかったため、_fill_tags() は
+キャンセル後にもう一度パネルを開き直してタグが実際に残っているかを
+実行時に確認し、確認できない場合は成功したと見なさずに中断する
+(_assert_hashtags_present)。「投稿する」ボタンへのセレクタや
+クリック処理はコード中のどこにも存在しない。
 
 ★ログイン方式★
 メールアドレス・パスワードを直接入力させる方式は、note側のreCAPTCHA
@@ -78,10 +93,15 @@ logger = get_logger()
 
 NOTE_NEW_NOTE_URL = "https://note.com/notes/new"
 
-# 保存ボタンをクリックする直前、ボタンの文言にこれらの単語が含まれていたら
-# 「公開」系のボタンだと判断して中断する(誤ってセレクタが公開ボタンに
+# クリック直前、ボタンの文言にこれらの単語が含まれていたら「実際に公開/投稿
+# してしまう」ボタンだと判断して中断する(誤ってセレクタが該当ボタンに
 # マッチしてしまった場合の保険)。
-_FORBIDDEN_PUBLISH_KEYWORDS = ["公開に進む", "公開する", "予約投稿", "投稿する", "Publish"]
+#
+# 「公開に進む」はユーザーが実機で確認済みの通り、公開設定パネルを開くだけの
+# 画面遷移であり、それ自体は公開しない(パネル内の「投稿する」を押すまでは
+# 公開されない)。そのためこのリストには含めない。実際に含めているのは、
+# 押した瞬間に記事が公開/予約される可能性がある文言のみ。
+_FORBIDDEN_PUBLISH_KEYWORDS = ["投稿する", "公開する", "予約投稿", "Publish"]
 
 # デバッグ用にスクリーンショット/HTMLダンプを保存したい場合、環境変数で有効化する。
 _SCREENSHOT_DIR = os.environ.get("NOTE_DEBUG_SCREENSHOT_DIR", "").strip()
@@ -568,20 +588,113 @@ class NotePoster:
         self._set_multiline_text(page, locator, body)
 
     def _fill_tags(self, page: Page, tags: list[str]) -> None:
+        """ハッシュタグ(タグ)を設定する。
+
+        ユーザーが実機で確認した結果、noteの現在のエディタではタグ入力欄は
+        本文編集画面には無く、「公開に進む」ボタンの先にある「公開設定」
+        パネル(ハッシュタグ / 記事タイプ / 記事の追加 / クーポン / 詳細設定)
+        の中にしかない。このパネルの右上には実際に投稿してしまう
+        「投稿する」ボタンがあるが、パネルを開くだけでは公開されず、
+        左上の「キャンセル」で編集画面に戻れることも確認済み。
+
+        ただし「キャンセルで戻ったときにタグが保持されるか」は未確認だった
+        ため、ここでは以下の手順で「保持されていることを実行時に確認して
+        から先に進む」設計にする。保持が確認できない場合は下書き保存を
+        試みず、原因不明のまま処理を進めないようにする。
+
+          1. 「公開に進む」を押してパネルを開く(投稿するボタンには触れない)
+          2. ハッシュタグを1件ずつ入力し、その都度チップとして確定した
+             ことを画面上で確認する
+          3. 「キャンセル」で編集画面へ戻る
+          4. もう一度「公開に進む」を押してパネルを開き直し、
+             先ほど入力したタグがすべてチップとして残っているか確認する
+          5. (確認できたら)「キャンセル」でパネルを閉じ、編集画面へ戻る
+        """
+        self._open_publish_settings(page)
+        self._enter_hashtags(page, tags)
+        self._close_publish_settings(page)
+
+        logger.info("タグがキャンセル後も保持されているか再確認")
+        self._open_publish_settings(page)
+        self._assert_hashtags_present(page, tags)
+        self._close_publish_settings(page)
+
+    def _open_publish_settings(self, page: Page) -> None:
+        """「公開に進む」を押して公開設定パネルを開く(公開はしない)。"""
         candidates = [
-            ("role=textbox name=タグ", page.get_by_role("textbox", name=re.compile("タグ"))),
-            ("placeholder*=タグ", page.get_by_placeholder(re.compile("タグ"))),
-            ("css input[placeholder*=タグ]", page.locator('input[placeholder*="タグ"]')),
-            (
-                "css [class*=tag] 系のinput",
-                page.locator('[class*="tag" i] input, [class*="Tag" i] input'),
-            ),
+            ("role=button name=公開に進む", page.get_by_role("button", name="公開に進む")),
+            ("text=公開に進む", page.get_by_text("公開に進む", exact=False)),
         ]
-        tag_input = self._resolve_locator(page, candidates, step_name="タグ入力欄")
+        proceed_button = self._resolve_locator(page, candidates, step_name="公開設定を開くボタン")
+        self._assert_not_publish_action(proceed_button)
+        proceed_button.click()
+
+        # パネルが実際に開いたことを確認する(「ハッシュタグ」の見出しの出現で判定)。
+        self._resolve_locator(
+            page,
+            [
+                ("role=heading name=ハッシュタグ", page.get_by_role("heading", name="ハッシュタグ")),
+                ("text=ハッシュタグ", page.get_by_text("ハッシュタグ", exact=True)),
+            ],
+            step_name="公開設定パネル表示確認",
+        )
+
+    def _close_publish_settings(self, page: Page) -> None:
+        """公開設定パネルの「キャンセル」を押して編集画面へ戻る(投稿しない)。"""
+        candidates = [
+            ("role=button name=キャンセル", page.get_by_role("button", name="キャンセル")),
+            ("text=キャンセル", page.get_by_text("キャンセル", exact=True)),
+        ]
+        cancel_button = self._resolve_locator(page, candidates, step_name="公開設定キャンセルボタン")
+        self._assert_not_publish_action(cancel_button)
+        cancel_button.click()
+
+    def _hashtag_input_candidates(self, page: Page) -> list[tuple[str, Locator]]:
+        return [
+            ("placeholder=ハッシュタグを追加する", page.get_by_placeholder("ハッシュタグを追加する")),
+            ("placeholder*=ハッシュタグ", page.get_by_placeholder(re.compile("ハッシュタグ"))),
+            ("css input[placeholder*=ハッシュタグ]", page.locator('input[placeholder*="ハッシュタグ"]')),
+        ]
+
+    def _hashtag_chip_candidates(self, page: Page, tag: str) -> list[tuple[str, Locator]]:
+        return [
+            (f"text=#{tag}", page.get_by_text(f"#{tag}", exact=False)),
+            (f"text={tag}", page.get_by_text(tag, exact=False)),
+        ]
+
+    def _enter_hashtags(self, page: Page, tags: list[str]) -> None:
+        tag_input = self._resolve_locator(
+            page, self._hashtag_input_candidates(page), step_name="ハッシュタグ入力欄"
+        )
         for tag in tags:
             tag_input.click()
             tag_input.press_sequentially(tag, delay=10)
             page.keyboard.press("Enter")
+            # 入力したタグがチップとして確定表示されるまで確認する
+            # (確定していなければ次のタグの入力に進まない)。
+            self._resolve_locator(
+                page,
+                self._hashtag_chip_candidates(page, tag),
+                step_name=f"ハッシュタグ確定確認({tag})",
+                timeout_ms=3000,
+            )
+
+    def _assert_hashtags_present(self, page: Page, tags: list[str]) -> None:
+        for tag in tags:
+            try:
+                self._resolve_locator(
+                    page,
+                    self._hashtag_chip_candidates(page, tag),
+                    step_name=f"ハッシュタグ保持確認({tag})",
+                    timeout_ms=3000,
+                )
+            except NotePosterError as exc:
+                raise NotePosterError(
+                    f"タグ '{tag}' が「キャンセル」で編集画面に戻った後に"
+                    "見当たりませんでした。「公開に進む→タグ入力→キャンセル」"
+                    "では下書きにタグが反映されないことが確認できたため、"
+                    "この経路でのタグ設定は安全に行えません。処理を中断します。"
+                ) from exc
 
     def _save_draft(self, page: Page) -> None:
         candidates = [

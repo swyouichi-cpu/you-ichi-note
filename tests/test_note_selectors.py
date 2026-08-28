@@ -95,11 +95,21 @@ def test_set_multiline_text_on_contenteditable(page):
 
 
 def test_assert_not_publish_action_blocks_publish_labeled_button(page):
-    page.set_content("<button>公開に進む</button>")
+    # 「投稿する」は実機確認済みの、実際に記事を公開してしまうボタンの文言。
+    page.set_content("<button>投稿する</button>")
     poster = _bare_poster()
 
     with pytest.raises(NotePosterError):
         poster._assert_not_publish_action(page.get_by_role("button"))
+
+
+def test_assert_not_publish_action_allows_proceed_to_publish_settings_button(page):
+    # 「公開に進む」は公開設定パネルを開くだけの画面遷移であり、
+    # それ自体は公開しないことを実機で確認済み(投稿するボタンは別)。
+    page.set_content("<button>公開に進む</button>")
+    poster = _bare_poster()
+
+    poster._assert_not_publish_action(page.get_by_role("button"))  # 例外が出なければOK
 
 
 def test_assert_not_publish_action_allows_draft_save_button(page):
@@ -151,3 +161,76 @@ def test_diagnostics_text_reports_cors_headers_for_api_responses(page):
 
     assert "403 https://note.com/api/v1/text_notes" in text
     assert "access-control-allow-origin=(なし)" in text
+
+
+# -- 「公開設定パネル」経由のタグ入力(実機確認済みのUI構造を模したページ) --
+#
+# 実際のnoteのHTML構造そのものではなく、ユーザーが実機で確認した要素
+# (「公開に進む」「ハッシュタグ」見出し・入力欄・「キャンセル」・「投稿する」)
+# を最小限のダミーページとして再現し、_fill_tagsのロジック(開く→入力→
+# チップ確定確認→キャンセル→再度開いて保持確認)そのものを検証する。
+_PUBLISH_SETTINGS_HTML_TEMPLATE = """
+<button id="proceed">公開に進む</button>
+<div id="panel" style="display:none">
+  <h2>ハッシュタグ</h2>
+  <input id="tag-input" placeholder="ハッシュタグを追加する" />
+  <div id="chips"></div>
+  <button id="cancel">キャンセル</button>
+  <button id="post">投稿する</button>
+</div>
+<script>
+  document.getElementById('proceed').addEventListener('click', () => {{
+    document.getElementById('panel').style.display = 'block';
+  }});
+  document.getElementById('tag-input').addEventListener('keydown', (e) => {{
+    if (e.key === 'Enter') {{
+      const span = document.createElement('span');
+      span.textContent = '#' + e.target.value;
+      document.getElementById('chips').appendChild(span);
+      e.target.value = '';
+    }}
+  }});
+  document.getElementById('cancel').addEventListener('click', () => {{
+    document.getElementById('panel').style.display = 'none';
+    {clear_chips_js}
+  }});
+</script>
+"""
+
+
+def test_fill_tags_succeeds_when_hashtags_persist_after_cancel(page):
+    page.set_content(_PUBLISH_SETTINGS_HTML_TEMPLATE.format(clear_chips_js=""))
+    poster = _bare_poster()
+
+    poster._fill_tags(page, ["テスト", "サンプル"])
+
+    chips_text = page.locator("#chips").inner_text()
+    assert "#テスト" in chips_text
+    assert "#サンプル" in chips_text
+
+
+def test_fill_tags_raises_when_hashtags_are_discarded_by_cancel(page):
+    # 「キャンセル」でタグが失われてしまうケース(未確認だった懸念)を再現。
+    page.set_content(
+        _PUBLISH_SETTINGS_HTML_TEMPLATE.format(
+            clear_chips_js="document.getElementById('chips').innerHTML = '';"
+        )
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError, match="見当たりませんでした"):
+        poster._fill_tags(page, ["テスト"])
+
+
+def test_fill_tags_never_clicks_the_post_button(page):
+    """安全設計の確認: タグ入力の一連の流れで「投稿する」ボタンは一度も押さない。"""
+    page.set_content(_PUBLISH_SETTINGS_HTML_TEMPLATE.format(clear_chips_js=""))
+    page.evaluate(
+        "document.getElementById('post').addEventListener('click', "
+        "() => { window.__posted = true; })"
+    )
+    poster = _bare_poster()
+
+    poster._fill_tags(page, ["テスト"])
+
+    assert page.evaluate("window.__posted === true") is False
