@@ -314,19 +314,23 @@ def test_classify_post_click_state_detects_opened_panel(page):
         "setTimeout(() => { document.getElementById('h').style.display = 'block'; }, 100)"
     )
 
-    result = poster._classify_post_click_state(page, timeout_ms=2000, poll_interval_ms=50)
+    result = poster._classify_post_click_state(
+        page, dialog_was_visible_before=False, timeout_ms=2000, poll_interval_ms=50
+    )
 
     assert result == "opened"
 
 
-def test_classify_post_click_state_detects_dialog(page):
+def test_classify_post_click_state_detects_new_dialog(page):
     page.set_content('<div role="dialog" style="display:none" id="d">タイトル、本文を入力してください</div>')
     poster = _bare_poster()
     page.evaluate(
         "setTimeout(() => { document.getElementById('d').style.display = 'block'; }, 100)"
     )
 
-    result = poster._classify_post_click_state(page, timeout_ms=2000, poll_interval_ms=50)
+    result = poster._classify_post_click_state(
+        page, dialog_was_visible_before=False, timeout_ms=2000, poll_interval_ms=50
+    )
 
     assert result == "dialog"
     assert "入力してください" in poster._extract_dialog_text(page)
@@ -336,7 +340,23 @@ def test_classify_post_click_state_returns_unchanged_when_nothing_happens(page):
     page.set_content("<div>編集画面のまま何も変わらない</div>")
     poster = _bare_poster()
 
-    result = poster._classify_post_click_state(page, timeout_ms=500, poll_interval_ms=100)
+    result = poster._classify_post_click_state(
+        page, dialog_was_visible_before=False, timeout_ms=500, poll_interval_ms=100
+    )
+
+    assert result == "unchanged"
+
+
+def test_classify_post_click_state_ignores_dialog_already_visible_before_click(page):
+    # 実機で発生した誤検知の再現: 「AIと構成づくりや推敲を一緒に進められます」
+    # のような、クリックとは無関係に最初から表示されているダイアログ(ツール
+    # チップ等)を、クリックが引き起こしたエラーダイアログと誤判定しないこと。
+    page.set_content('<div role="dialog">AIと構成づくりや推敲を一緒に進められます</div>')
+    poster = _bare_poster()
+
+    result = poster._classify_post_click_state(
+        page, dialog_was_visible_before=True, timeout_ms=500, poll_interval_ms=100
+    )
 
     assert result == "unchanged"
 
@@ -360,4 +380,26 @@ def test_open_publish_settings_raises_with_dialog_text_when_dialog_appears_inste
     poster = _bare_poster()
 
     with pytest.raises(NotePosterError, match="入力してください"):
+        poster._open_publish_settings(page)
+
+
+def test_open_publish_settings_not_fooled_by_preexisting_ai_tooltip_dialog(page):
+    # 実機で発生した誤検知の再現・回帰テスト: 「公開に進む」を押しても
+    # 公開設定パネルへ遷移せず、かつ新しいダイアログも出ない(クリック前から
+    # 表示されているAIアシスタントの案内ツールチップがそのまま残っているだけ)
+    # 場合、それを「新しいダイアログが出た」と誤判定しない。
+    page.set_content(
+        """
+        <div role="dialog">AIと構成づくりや推敲を一緒に進められます</div>
+        <button id="proceed">公開に進む</button>
+        <script>
+          // クリックしても何も起きない(パネルへの遷移も新しいダイアログも無い)
+        </script>
+        """
+    )
+    poster = _bare_poster()
+
+    # 「新しいダイアログが表示されました」ではなく、「変化なし」側の
+    # メッセージ(編集画面のままでした)になることを確認する。
+    with pytest.raises(NotePosterError, match="編集画面のままでした"):
         poster._open_publish_settings(page)

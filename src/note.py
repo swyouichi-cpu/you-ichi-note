@@ -40,9 +40,17 @@ KEYWORDS に含まれる単語(「投稿する」「公開する」「予約投�
 _wait_for_autosave_idle() で「保存中」の表示が消えるのを待つ(固定sleepでは
 なく、実際に表示が消えたことをポーリングで確認する)。クリックした後も
 結果を決め打ちせず、_classify_post_click_state() で
-「パネルへ遷移した」「ダイアログが出た」「編集画面のまま変化なし」の
-3状態を判定し、パネル遷移以外は診断データを残したうえで原因が分かる
-メッセージ付きで中断する。
+「パネルへ遷移した」「(クリック前には無かった)ダイアログが新たに出た」
+「編集画面のまま変化なし」の3状態を判定し、パネル遷移以外は診断データを
+残したうえで原因が分かるメッセージ付きで中断する。
+
+note.comのエディタには「AIと構成づくりや推敲を一緒に進められます」という
+AIアシスタントの案内ツールチップが常時 role="dialog" として表示されており、
+これを「公開に進む」クリックが引き起こしたエラーダイアログと誤判定して
+しまう不具合が実機テストで発生した。そのため dialog判定は、クリック直前に
+既に表示されていたダイアログの有無を記録しておき、クリック後に「それまで
+無かったダイアログが新たに現れたか」だけを見るようにしている
+(_visible_dialog_locator / dialog_was_visible_before)。
 
 ★本文入力の内部状態反映について(既知の問題への対処)★
 以前は本文の入力に keyboard.insert_text() を行単位でまとめて流し込む
@@ -692,25 +700,44 @@ class NotePoster:
                 "「保存中」の表示が消えず、自動保存の完了を確認できませんでした。"
             ) from exc
 
+    def _visible_dialog_locator(self, page: Page) -> Locator | None:
+        """現在画面に表示されているダイアログ(role=dialog/alertdialog)があれば返す。
+
+        note.comのエディタには「AIと構成づくりや推敲を一緒に進められます」という
+        AIアシスタントの案内ツールチップが常時(role=dialogとして)表示されており、
+        「公開に進む」クリックとは無関係にこれが検出されてしまう実害が実機で
+        確認された。そのためこのメソッド単体では「新しく出たダイアログ」までは
+        判定できない。呼び出し側でクリック前後の状態を比較すること。
+        """
+        for role in ("dialog", "alertdialog"):
+            locator = page.get_by_role(role).first
+            if locator.is_visible():
+                return locator
+        return None
+
     def _classify_post_click_state(
-        self, page: Page, timeout_ms: int = 8000, poll_interval_ms: int = 300
+        self,
+        page: Page,
+        dialog_was_visible_before: bool,
+        timeout_ms: int = 8000,
+        poll_interval_ms: int = 300,
     ) -> str:
         """「公開に進む」クリック後の状態を3つに分類する(固定sleepではなく
         実際の状態を短い間隔でポーリングして判定する)。
 
         - "opened": 公開設定パネルへ遷移した(「ハッシュタグ」の出現で判定)
-        - "dialog": エラー/確認ダイアログ等が表示された(role=dialog/
-          alertdialogの出現で判定。noteのコンソールログに実際に"Dialog"
-          コンポーネントの使用を示す警告が出ていたことから採用した判定方法)
+        - "dialog": クリックの結果として新たにダイアログが表示された
+          (dialog_was_visible_beforeがFalseで、かつ現在role=dialog/
+          alertdialogが表示されている場合のみ。クリック前から表示されている
+          ダイアログ(AIアシスタントの案内ツールチップ等)は無関係なので
+          この状態には含めない)
         - "unchanged": どちらでもなく、タイムアウトまで編集画面のままだった
+          (クリック前から表示されているダイアログがそのまま残っている
+          だけの場合もここに含まれる)
         """
         panel_candidates = [
             page.get_by_role("heading", name="ハッシュタグ"),
             page.get_by_text("ハッシュタグ", exact=True),
-        ]
-        dialog_candidates = [
-            page.get_by_role("dialog"),
-            page.get_by_role("alertdialog"),
         ]
 
         deadline = time.monotonic() + timeout_ms / 1000
@@ -718,22 +745,20 @@ class NotePoster:
             for locator in panel_candidates:
                 if locator.first.is_visible():
                     return "opened"
-            for locator in dialog_candidates:
-                if locator.first.is_visible():
-                    return "dialog"
+            if not dialog_was_visible_before and self._visible_dialog_locator(page) is not None:
+                return "dialog"
             if time.monotonic() >= deadline:
                 return "unchanged"
             page.wait_for_timeout(poll_interval_ms)
 
     def _extract_dialog_text(self, page: Page) -> str:
-        for role in ("dialog", "alertdialog"):
-            locator = page.get_by_role(role).first
-            if locator.is_visible():
-                try:
-                    return (locator.inner_text() or "").strip()[:300]
-                except PlaywrightTimeoutError:
-                    return "(取得できませんでした)"
-        return "(取得できませんでした)"
+        locator = self._visible_dialog_locator(page)
+        if locator is None:
+            return "(取得できませんでした)"
+        try:
+            return (locator.inner_text() or "").strip()[:300]
+        except PlaywrightTimeoutError:
+            return "(取得できませんでした)"
 
     def _open_publish_settings(self, page: Page) -> None:
         """「公開に進む」を押して公開設定パネルを開く(公開はしない)。
@@ -741,8 +766,9 @@ class NotePoster:
         自動保存が完了する前にクリックすると、パネルへ遷移せず
         ダイアログが出ることが実機で確認されたため、まず自動保存の
         完了(「保存中」表示が消えること)を待ってからクリックする。
-        クリック後は「パネルが開いた」「ダイアログが出た」「何も変わらない」
-        の3状態を判定し、それぞれに応じたエラーメッセージを出す。
+        クリック後は「パネルが開いた」「(クリック前には無かった)ダイアログが
+        新たに出た」「何も変わらない」の3状態を判定し、それぞれに応じた
+        エラーメッセージを出す。
         """
         self._wait_for_autosave_idle(page)
 
@@ -752,23 +778,27 @@ class NotePoster:
         ]
         proceed_button = self._resolve_locator(page, candidates, step_name="公開設定を開くボタン")
         self._assert_not_publish_action(proceed_button)
+
+        # クリック前から表示されているダイアログ(AIアシスタントの案内など、
+        # 公開フローとは無関係なもの)を、クリック後の判定から除外するための基準。
+        dialog_was_visible_before = self._visible_dialog_locator(page) is not None
         proceed_button.click()
 
-        state = self._classify_post_click_state(page)
+        state = self._classify_post_click_state(page, dialog_was_visible_before)
         if state == "opened":
             return
         if state == "dialog":
             dialog_text = self._extract_dialog_text(page)
             self._capture_failure(page, "公開設定パネル表示確認")
             raise NotePosterError(
-                "「公開に進む」を押した後、公開設定パネルではなくダイアログが"
+                "「公開に進む」を押した後、公開設定パネルではなく新しいダイアログが"
                 f"表示されました(内容: {dialog_text!r})。"
             )
         self._capture_failure(page, "公開設定パネル表示確認")
         raise NotePosterError(
-            "「公開に進む」を押しましたが、公開設定パネルへの遷移もダイアログの"
-            "表示も確認できず、編集画面のままでした。クリックが正しく届いて"
-            "いない可能性があります。"
+            "「公開に進む」を押しましたが、公開設定パネルへの遷移も新しい"
+            "ダイアログの表示も確認できず、編集画面のままでした。クリックが"
+            "正しく届いていない可能性があります。"
         )
 
     def _close_publish_settings(self, page: Page) -> None:
