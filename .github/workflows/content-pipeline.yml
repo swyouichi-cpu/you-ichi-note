@@ -58,7 +58,11 @@ jobs:
         run: python -m src.main "${{ github.event.inputs.mode || 'run' }}"
 
       - name: Upload debug screenshots
-        if: ${{ github.event.inputs.debug_screenshots == 'true' }}
+        # always(): 直前の Run pipeline ステップが失敗していてもこのステップを
+        # 実行する。if条件にsuccess()/failure()等の状態確認関数を含めない場合、
+        # GitHub Actionsは暗黙的にsuccess()をANDしてしまうため、失敗時に
+        # Artifactsが作られない(スキップされる)問題があった。
+        if: ${{ always() && github.event.inputs.debug_screenshots == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: note-debug-screenshots
