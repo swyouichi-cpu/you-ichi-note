@@ -29,10 +29,18 @@ note.com へ直接アクセスして画面を確認することができませ�
 
 ★失敗時の診断データ★
 NOTE_DEBUG_SCREENSHOT_DIR が設定されている場合、各ステップの成功時に加え、
-失敗した瞬間にもスクリーンショットとpage.content()のHTMLダンプを保存する。
-これらはDOM(見た目と構造)だけを含み、Cookie・セッション情報・
-GitHub Secretsの中身は一切含まれない。ただし記事本文などあなたの
-コンテンツそのものは写り得るため、共有前に中身を確認すること。
+失敗した瞬間にもスクリーンショット・page.content()のHTMLダンプ・
+テキスト診断ファイル(_diag.txt)を保存する。_diag.txtには以下を含める。
+  - 失敗時点の page.url() / document.title / document.readyState
+  - JSコンソールに出力されたログ・エラー(ブラウザ内のJS実行状況を見るため)
+  - 読み込みに失敗したリクエスト(requestfailed)
+  - HTTPステータスが2xx/3xx以外だったレスポンスの一覧
+これらはいずれもDOM・ネットワークの状態を見るための情報であり、
+Cookie・セッション情報・GitHub Secretsの中身は一切含まれない
+(レスポンスのヘッダ・ボディそのものは記録しない。URL・メソッド・
+ステータスコードのみを記録し、URLのクエリ文字列も念のため除去する)。
+ただし記事本文などあなたのコンテンツそのものは画面/ページ内テキストとして
+写り得るため、共有前に中身を確認すること。
 """
 from __future__ import annotations
 
@@ -40,6 +48,7 @@ import json
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from playwright.sync_api import (
     Browser,
@@ -68,6 +77,15 @@ _SCREENSHOT_DIR = os.environ.get("NOTE_DEBUG_SCREENSHOT_DIR", "").strip()
 
 _DEFAULT_CANDIDATE_TIMEOUT_MS = 4000
 
+# 診断データが際限なく増えないよう、記録件数の上限を設ける。
+_MAX_DIAG_ENTRIES = 300
+
+
+def _strip_query(url: str) -> str:
+    """URLからクエリ文字列を除去する(トークン等が紛れ込む可能性への念のための対策)。"""
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
 
 class NotePosterError(RuntimeError):
     """note操作中の失敗。呼び出し側でneeds_review/errorに振り分けるための例外。"""
@@ -80,6 +98,11 @@ class NotePoster:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._step_count = 0
+        # ページの読み込み状況を診断するための記録(秘密情報は含めない)。
+        self._console_messages: list[str] = []
+        self._page_errors: list[str] = []
+        self._failed_requests: list[str] = []
+        self._responses: list[tuple[str, int]] = []
 
     def __enter__(self) -> "NotePoster":
         self._playwright = sync_playwright().start()
@@ -104,6 +127,91 @@ class NotePoster:
             self._playwright.stop()
 
     # -- 診断データ(秘密情報は含まない) --------------------------------------
+
+    def _attach_diagnostics(self, page: Page) -> None:
+        """ページのJS実行状況・ネットワーク状況を記録するリスナーを登録する。
+
+        「読み込みが完了しない」原因(JSエラー、APIの401/403、リクエスト失敗など)
+        を後から追えるようにするための仕組み。ここで記録するのはURL・メソッド・
+        ステータスコード・コンソールのテキストのみで、Cookie・認証ヘッダ・
+        レスポンス本文は一切記録しない。
+        """
+
+        def _on_console(msg) -> None:
+            if len(self._console_messages) < _MAX_DIAG_ENTRIES:
+                text = msg.text[:500] if msg.text else ""
+                self._console_messages.append(f"[{msg.type}] {text}")
+
+        def _on_pageerror(exc) -> None:
+            if len(self._page_errors) < _MAX_DIAG_ENTRIES:
+                self._page_errors.append(str(exc)[:500])
+
+        def _on_requestfailed(request) -> None:
+            if len(self._failed_requests) < _MAX_DIAG_ENTRIES:
+                failure = request.failure or "(不明)"
+                self._failed_requests.append(
+                    f"{request.method} {_strip_query(request.url)} -> {failure}"
+                )
+
+        def _on_response(response) -> None:
+            if len(self._responses) < _MAX_DIAG_ENTRIES:
+                self._responses.append((_strip_query(response.url), response.status))
+
+        page.on("console", _on_console)
+        page.on("pageerror", _on_pageerror)
+        page.on("requestfailed", _on_requestfailed)
+        page.on("response", _on_response)
+
+    def _diagnostics_text(self, page: Page, step_name: str) -> str:
+        """失敗時点の状況をまとめたテキストを組み立てる(秘密情報を含まない)。"""
+        try:
+            url = page.url
+        except Exception:  # noqa: BLE001
+            url = "(取得失敗)"
+        try:
+            title = page.title()
+        except Exception:  # noqa: BLE001
+            title = "(取得失敗)"
+        try:
+            ready_state = page.evaluate("document.readyState")
+        except Exception:  # noqa: BLE001
+            ready_state = "(取得失敗)"
+        try:
+            body_snippet = page.evaluate(
+                "(document.body && document.body.innerText || '').trim().slice(0, 300)"
+            )
+        except Exception:  # noqa: BLE001
+            body_snippet = "(取得失敗)"
+
+        error_responses = [
+            f"{status} {url_}" for url_, status in self._responses if status >= 400
+        ]
+        status_counts: dict[int, int] = {}
+        for _url, status in self._responses:
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+        lines = [
+            f"failed_step: {step_name}",
+            f"page.url(): {url}",
+            f"document.title: {title}",
+            f"document.readyState: {ready_state}",
+            "",
+            f"body innerText(先頭300文字): {body_snippet!r}",
+            "",
+            f"console messages ({len(self._console_messages)}件、末尾20件を表示):",
+            *[f"  {m}" for m in self._console_messages[-20:]],
+            "",
+            f"pageerror ({len(self._page_errors)}件):",
+            *[f"  {m}" for m in self._page_errors],
+            "",
+            f"requestfailed ({len(self._failed_requests)}件):",
+            *[f"  {m}" for m in self._failed_requests],
+            "",
+            f"response status件数: {status_counts}",
+            f"4xx/5xxのレスポンス ({len(error_responses)}件):",
+            *[f"  {m}" for m in error_responses],
+        ]
+        return "\n".join(lines)
 
     def _debug_dir(self) -> Path | None:
         if not _SCREENSHOT_DIR:
@@ -133,6 +241,36 @@ class NotePoster:
     def _capture_failure(self, page: Page, step_name: str) -> None:
         self._screenshot(page, f"FAILED_{step_name}")
         self._dump_html(page, f"FAILED_{step_name}")
+
+        diag_text = self._diagnostics_text(page, step_name)
+        out_dir = self._debug_dir()
+        if out_dir is not None:
+            diag_path = out_dir / f"{self._step_count:02d}_FAILED_{step_name}_diag.txt"
+            diag_path.write_text(diag_text, encoding="utf-8")
+            logger.info("診断テキスト保存: %s", diag_path)
+
+        # ログには全文ではなく要約だけを出す(GitHub Actionsのログが
+        # 肥大化しすぎないようにするため。詳細はArtifactのdiag.txtを見る)。
+        try:
+            url = page.url
+        except Exception:  # noqa: BLE001
+            url = "(取得失敗)"
+        try:
+            title = page.title()
+        except Exception:  # noqa: BLE001
+            title = "(取得失敗)"
+        error_response_count = sum(1 for _u, status in self._responses if status >= 400)
+        logger.warning(
+            "診断サマリ [%s]: url=%s title=%r console=%d件 pageerror=%d件 "
+            "requestfailed=%d件 4xx/5xx応答=%d件",
+            step_name,
+            url,
+            title,
+            len(self._console_messages),
+            len(self._page_errors),
+            len(self._failed_requests),
+            error_response_count,
+        )
 
     # -- 複数候補セレクタから最初に見つかったものを使う仕組み -------------------
 
@@ -183,6 +321,40 @@ class NotePoster:
                 "NOTE_STORAGE_STATE を更新してください。"
             )
 
+    def _wait_for_editor_mounted(self, page: Page, timeout_ms: int = 15000) -> None:
+        """SPAの画面がローディング状態のまま止まっていないかを確認する。
+
+        タイトル欄などの個別セレクタを探す前に、まず「アプリ自体が
+        何かしら描画されているか」を広めの条件でチェックする。ここで
+        失敗した場合は、個別のセレクタが変わったのではなく、
+        JSの実行やAPI呼び出し自体が失敗している可能性が高いと判断できる。
+        """
+        try:
+            page.wait_for_function(
+                """
+                () => {
+                  // ローディングスピナーそのものもDOM上は「子要素」として存在するため、
+                  // 単に子要素の有無だけでは判定しない。実際に入力可能なフォーム要素、
+                  // または一定量の可視テキストが現れたかどうかで判定する。
+                  const hasFormFields =
+                    document.querySelectorAll('textarea, [contenteditable="true"]').length > 0;
+                  const hasVisibleText =
+                    (document.body && document.body.innerText || '').trim().length > 50;
+                  return hasFormFields || hasVisibleText;
+                }
+                """,
+                timeout=timeout_ms,
+            )
+        except PlaywrightTimeoutError as exc:
+            self._capture_failure(page, "エディタ読み込み確認")
+            raise NotePosterError(
+                "note編集画面のアプリ本体が読み込まれた形跡が確認できませんでした"
+                "(ローディング状態のまま止まっている可能性があります)。"
+                "セレクタの問題ではなく、JSの実行やAPI呼び出し自体が失敗している"
+                "可能性があります。診断データ(コンソールログ・失敗したリクエスト・"
+                "HTTPステータス)を確認してください。"
+            ) from exc
+
     def _run_step(self, page: Page, step_name: str, action) -> None:
         """1ステップを実行し、どこで失敗しても診断データを残してから
         NotePosterError として送出し直す(呼び出し側での原因特定を助けるため)。
@@ -208,12 +380,21 @@ class NotePoster:
         """
         assert self._context is not None, "with文の中で使ってください"
         page = self._context.new_page()
+        self._attach_diagnostics(page)
 
         logger.info("noteの新規作成画面へアクセス")
         self._run_step(
             page, "画面アクセス", lambda: page.goto(NOTE_NEW_NOTE_URL, wait_until="networkidle")
         )
+        logger.info("画面アクセス直後: url=%s title=%r", page.url, page.title())
         self._screenshot(page, "01_opened_new_note")
+        self._assert_logged_in(page)
+
+        logger.info("エディタの読み込み完了を確認")
+        self._run_step(page, "エディタ読み込み確認", lambda: self._wait_for_editor_mounted(page))
+        logger.info("エディタ読み込み確認OK: url=%s title=%r", page.url, page.title())
+        # SPAはJS側で非同期にログイン状態を確認してから /login へ遷移することが
+        # あるため、goto直後だけでなくここでも再確認する。
         self._assert_logged_in(page)
 
         logger.info("タイトルを入力")

@@ -41,7 +41,13 @@ def page():
 
 def _bare_poster() -> NotePoster:
     """__init__(NOTE_STORAGE_STATEの読み込み)を経由せず、内部メソッドだけ使う。"""
-    return NotePoster.__new__(NotePoster)
+    poster = NotePoster.__new__(NotePoster)
+    poster._step_count = 0
+    poster._console_messages = []
+    poster._page_errors = []
+    poster._failed_requests = []
+    poster._responses = []
+    return poster
 
 
 def test_resolve_locator_finds_title_via_placeholder_fallback(page):
@@ -100,3 +106,32 @@ def test_assert_not_publish_action_allows_draft_save_button(page):
     poster = _bare_poster()
 
     poster._assert_not_publish_action(page.get_by_role("button"))  # 例外が出なければOK
+
+
+def test_wait_for_editor_mounted_succeeds_when_form_fields_present(page):
+    page.set_content('<div id="__next"><textarea></textarea></div>')
+    poster = _bare_poster()
+
+    poster._wait_for_editor_mounted(page, timeout_ms=1000)  # 例外が出なければOK
+
+
+def test_wait_for_editor_mounted_raises_when_stuck_on_loading_spinner(page):
+    # ローディングスピナーだけが表示され続けている(今回GitHub Actionsで
+    # 実際に発生した状況)を模したページ。
+    page.set_content('<div id="__next"><div class="spinner"></div></div>')
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError, match="読み込まれた形跡が確認できません"):
+        poster._wait_for_editor_mounted(page, timeout_ms=300)
+
+
+def test_diagnostics_text_includes_url_title_and_readystate(page):
+    page.set_content("<title>診断テスト</title><div>本文サンプル</div>")
+    poster = _bare_poster()
+
+    text = poster._diagnostics_text(page, step_name="テストステップ")
+
+    assert "failed_step: テストステップ" in text
+    assert "page.url()" in text
+    assert "document.readyState" in text
+    assert "本文サンプル" in text
