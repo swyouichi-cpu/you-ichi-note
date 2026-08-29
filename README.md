@@ -654,6 +654,45 @@ to_appear()`で出現・可視化を待ってから、改めて`count()`を取�
 引き続き一切使いません。次回の実機テストでこの観測データを取得したのち、
 URL確定の完了確認・後続処理を本実装する想定です。
 
+**URL入力〜read-back区間の診断強化(2026年8月29日)**: 上記の第4段階を
+実機実行したところ、ある回はURL入力・read-back一致・「適用」ボタン
+クリックまで成功した一方、**コード(commit)を一切変更していない**別の
+実機実行では、「→ 商品を見る」の選択・リンクボタンのクリック・URL入力欄
+の出現・URLの入力までは成功回と同じように進んだにもかかわらず、
+read-backの直前でURL入力欄が消失し(`input_value()`の結果が`None`相当に
+なり)、失敗時のArtifactではURL入力欄のtextarea自体がDOMから無くなって
+おり、active toolbarも`data-active="false"`に戻っていた。同一commitが
+成功・失敗の両方を示したことから、原因はコードの回帰ではなく、note側の
+実行タイミングに依存する何らかの状態(非同期処理・バリデーション・
+再レンダリング等)にあると考えられる。
+
+次回の実機実行1回でできるだけ原因を切り分けられるよう、`press_
+sequentially()`自体や「適用」ボタン以降の処理は変更せず、URL入力欄の
+一意特定からread-backまでの区間にのみ以下の診断強化・最小修正を追加した:
+
+- `_log_url_input_diagnostics()`: URL入力欄・active toolbarの`count()`/
+  `is_visible()`/`input_value()`(1件のときのみ)/`bounding_box()`、
+  `document.activeElement`のtagName/name/placeholder/aria-label、
+  `window.scrollX`/`scrollY`を読み取り専用で記録する(クリック・
+  フォーカス・blur等の操作は一切行わない)。URL入力直前(A)・クリック
+  直後(B)・文字入力の前後(C/D)・read-back直前(E)・消失検知時(F)・
+  read-back成功後(G)の各段階でこの関数を呼び、状態を`logger.info()`に
+  記録する。
+- `press_sequentially(link.url, delay=10)`完了直後、read-backを試みる前に
+  同じセレクタで`count()`を再確認する。1件でなければ「read-backした値が
+  `None`だった」という曖昧な扱いはせず、専用の`UrlInputDisappeared
+  ObservationStop`を送出して安全停止する(呼び出し側で`needs_review`へ
+  倒れる)。この場合もHTML/スクリーンショット/診断データを保存する。
+- `input_value()`自体の呼び出し中に例外が発生した場合(直前の`count()`
+  再確認では1件だったにもかかわらず、その直後に消失したケース)は、
+  上記の消失検知とは区別し、通常の`NotePosterError`として例外の内容を
+  含めて報告する。つまり「locatorの消失(事前チェックで検知)」「read-
+  back呼び出し中のPlaywright例外」「read-back値の不一致」の3つを、
+  1つの曖昧な`None`比較へ握りつぶさず、それぞれ別のエラーとして報告する。
+- URL入力欄が正常であれば(消失も例外も起きなければ)、read-back一致
+  確認から「適用」ボタンのクリックまで、1回の呼び出しの中でこれまで
+  通り自動的に到達する(このパスは今回変更していない)。
+
 **検証方法(本文テキストとリンクの分離)**: `_assert_body_matches()`は
 引き続き「見えているテキスト」だけを検証します(商品リンク導入後も本文に
 生URLは一切含まれないため、この検証で商品カード化が起きていないことも
@@ -734,6 +773,15 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
     由来と見られる`:r16:`のような値)はセレクタに使わない。クリック後は
     `_assert_links_match()`や下書き保存へは進まず、`UrlApplyObservation
     Stop`で安全停止する
+19. 商品リンクのURL入力後、`press_sequentially()`完了直後に同じセレクタ
+    で`count()`を再確認する。1件でなければ(URL入力欄が消失・増減した
+    可能性があるため)read-backを続行せず、`UrlInputDisappeared
+    ObservationStop`で安全停止し、HTML/スクリーンショット/診断データを
+    保存する。`input_value()`自体の呼び出し中に例外が発生した場合は、
+    この消失検知とは別の通常の`NotePosterError`として区別して報告し、
+    「read-backした値が`None`だった」という曖昧な扱いはしない。この
+    区間の診断ログ取得(`_log_url_input_diagnostics()`)自体も、クリック・
+    フォーカス・blur等の操作を一切行わない読み取り専用とする
 
 ## 12. Phase 1 実機検証記録
 
@@ -749,6 +797,7 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
 | `TEST-004`(URL入力欄の観測) | リンクボタンクリック後のURL入力UIの実DOM確認 | `needs_review`(URL入力欄のセレクタを確認し、URL入力→read-back確認までの観測専用実装・第2段階を追加。対応不要) |
 | `TEST-004`(リンクボタンクリック失敗) | ツールバーボタンクリック時のviewport外エラーの解析 | `needs_review`(クリックがviewport外で30秒timeoutすることが判明。クリック前のviewport確認・安全停止を追加。対応不要) |
 | `TEST-004`(URL入力・適用ボタン到達) | viewport確認追加後の実機実行、URL入力・read-back一致・「適用」ボタンの実DOM確認 | `needs_review`(`UrlInputObservationStop`まで到達を確認。「適用」ボタンクリックまでの観測専用実装・第4段階を追加。対応不要) |
+| `TEST-004`(URL入力欄消失・同一commitでの再現性差異) | 第4段階と同一commitでの再実行、URL入力後read-back直前でのURL入力欄消失の解析 | `needs_review`(同一commitで成功/失敗の両方を確認。コード回帰ではないと判断し、診断強化と消失検知の安全停止を追加。対応不要) |
 
 `TEST-003`(2026年8月28日)での確認事項:
 GitHub Actions=Success / Sheets status=`draft_created` / note_url正常記録 /
@@ -873,6 +922,31 @@ pytestでの確認のみで、まだ実際のGitHub Actions実行では検証し
 までは確認できている」段階を明示する診断用の例外として残している。この
 変更もローカルpytestでの確認のみで、まだ実際のGitHub Actions実行では
 検証していない。
+
+`TEST-004`(URL入力欄消失・同一commitでの再現性差異)で判明した事項:
+「適用」ボタンクリックまでの観測専用実装・第4段階(commit`5e18de7`)を
+実機で再実行したところ、`git log`で確認する限りコードを一切変更して
+いないにもかかわらず、ある回はURL入力・read-back一致・「適用」ボタン
+クリックまで成功した一方、別の回では「→ 商品を見る」の選択・リンク
+ボタンのクリック・URL入力欄の出現・URLの入力までは成功回と同じように
+進んだのに、read-backの直前でURL入力欄が消失し(`input_value()`の結果が
+`None`相当になり)、失敗時のArtifactではURL入力欄のtextarea自体がDOMから
+無くなっており、active toolbarも`data-active="false"`に戻っていた。
+2回の実機実行の間でcommitは同一であるため、この差異はコードの回帰では
+なく、note側の実行タイミングに依存する何らかの状態(非同期処理・
+バリデーション・再レンダリング等)によるものと判断した。これを受けて、
+URL入力欄の一意特定からread-backまでの区間に`_log_url_input_
+diagnostics()`による複数時点(入力直前・クリック直後・文字入力の前後・
+read-back直前・消失検知時・read-back成功後)の読み取り専用の状態記録を
+追加し、`press_sequentially()`完了直後の`count()`再確認で消失を検知した
+場合は専用の`UrlInputDisappearedObservationStop`で安全停止するように
+した(詳細は「10. 商品リンク」)。`input_value()`自体の呼び出し中の例外は
+この消失検知とは別の通常の`NotePosterError`として区別して報告する。
+`press_sequentially()`自体や「適用」ボタン以降の処理は変更していない。
+URL入力欄が正常であれば、これまで通り1回の呼び出しの中で「適用」ボタン
+クリック(`UrlApplyObservationStop`)まで自動的に到達する。この変更も
+ローカルpytestでの確認のみで、まだ実際のGitHub Actions実行では検証して
+いない。
 
 `ARTICLE-001`は人間が確認するまで`status`を`ready`に戻さない
 (対応済み・変更していない)。

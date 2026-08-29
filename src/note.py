@@ -597,6 +597,29 @@ class UrlApplyObservationStop(NotePosterError):
     """
 
 
+class UrlInputDisappearedObservationStop(NotePosterError):
+    """URLをtextareaへ入力した直後、同じURL入力欄セレクタで`count()`を
+    再取得したところ、期待した1件ではなかった(典型的には0件=消失)場合に
+    送出する(2026年8月29日)。
+
+    実機のGitHub Actions実行(TEST-004)で、ある回では「→ 商品を見る」の
+    選択・リンクボタンのクリック・URL入力欄の出現・URL入力までは前回と
+    同じように進んだにもかかわらず、read-backの直前でURL入力欄が消失し
+    (`input_value()`の結果が`None`相当になり)、失敗時のArtifactでは
+    URL入力欄のtextarea自体がDOMから無くなっており、active toolbarも
+    `data-active="false"`に戻っていた、という事象が発生した。
+
+    これを受けて、`press_sequentially()`でURLを入力した直後に、
+    read-backを試みる前にまず同じセレクタで`count()`を再確認するように
+    した。1件でなければ「read-backした値がNoneだった」という曖昧な扱いは
+    せず、この専用例外を送出して安全停止する(呼び出し側でneeds_review
+    に倒れる)。`input_value()`自体の呼び出し中に例外が発生した場合
+    (count()の再確認では1件だったにもかかわらず、その直後に消失した
+    ケース)は、この例外ではなく通常のNotePosterErrorを送出して区別する
+    (`_set_link_on_text_occurrence()`のdocstringを参照)。
+    """
+
+
 class LinkButtonOutOfViewportError(NotePosterError):
     """リンクボタンをクリックする前に、現在のviewport(表示領域)内に
     収まっていることを確認できなかった場合に送出する(2026年8月29日)。
@@ -1823,6 +1846,103 @@ class NotePoster:
                 "状態を確認できないため処理を中断します。"
             )
 
+    def _log_url_input_diagnostics(self, page: Page, url_input: Locator, *, stage: str) -> None:
+        """商品導線URL入力の各時点の状態を診断ログに記録する。
+
+        実機のGitHub Actions実行(TEST-004)で、ある回はURL入力から
+        read-backまで成功したのに、別の回ではURL入力後にURL入力欄が
+        消失し、read-backが`None`になるという事象が発生した。原因を
+        1回の実機実行でできるだけ切り分けられるよう、URL入力欄の一意
+        特定からread-backまでの区間の複数時点(入力直前・クリック直後・
+        文字入力の前後・read-back直前・消失検知時・read-back成功後)で
+        この関数を呼び、状態を記録する。
+
+        読み取るのはURL入力欄・active toolbarの`count()`/`is_visible()`/
+        `input_value()`(1件のときのみ)/`bounding_box()`、
+        `document.activeElement`のtagName/name/placeholder/aria-label、
+        `window.scrollX`/`scrollY`のみであり、フォーカスを奪う操作や
+        別要素をクリックする操作は一切行わない。取得できない項目があって
+        もこの関数自体は例外を送出せず、取得できた範囲だけをログに残す
+        (診断のための計測が本処理を止めてしまわないようにするため)。
+        """
+        try:
+            url_input_count = url_input.count()
+        except PlaywrightError:
+            url_input_count = None
+        try:
+            url_input_visible = url_input.is_visible()
+        except PlaywrightError:
+            url_input_visible = None
+        url_input_value: str | None = None
+        url_input_box = None
+        if url_input_count == 1:
+            try:
+                url_input_value = url_input.input_value()
+            except PlaywrightError:
+                url_input_value = "(取得失敗)"
+            try:
+                url_input_box = url_input.bounding_box()
+            except PlaywrightError:
+                url_input_box = None
+
+        toolbar = page.locator(_ACTIVE_TOOLBAR_SELECTOR)
+        try:
+            toolbar_count = toolbar.count()
+        except PlaywrightError:
+            toolbar_count = None
+        toolbar_data_active = None
+        toolbar_box = None
+        if toolbar_count == 1:
+            try:
+                toolbar_data_active = toolbar.get_attribute("data-active")
+            except PlaywrightError:
+                toolbar_data_active = None
+            try:
+                toolbar_box = toolbar.bounding_box()
+            except PlaywrightError:
+                toolbar_box = None
+
+        try:
+            active_element = page.evaluate(
+                """
+                () => {
+                    const el = document.activeElement;
+                    if (!el) return null;
+                    return {
+                        tagName: el.tagName,
+                        name: el.getAttribute('name'),
+                        placeholder: el.getAttribute('placeholder'),
+                        ariaLabel: el.getAttribute('aria-label'),
+                    };
+                }
+                """
+            )
+        except PlaywrightError:
+            active_element = None
+
+        try:
+            scroll_position = page.evaluate(
+                "() => ({x: window.scrollX, y: window.scrollY})"
+            )
+        except PlaywrightError:
+            scroll_position = None
+
+        logger.info(
+            "商品導線URL入力 診断[%s]: url_input(count=%s visible=%s "
+            "value=%r bbox=%s) toolbar(count=%s data-active=%s bbox=%s) "
+            "activeElement=%s scroll=%s",
+            stage,
+            url_input_count,
+            url_input_visible,
+            url_input_value,
+            url_input_box,
+            toolbar_count,
+            toolbar_data_active,
+            toolbar_box,
+            active_element,
+            scroll_position,
+        )
+
     def _find_url_input_textarea(
         self, page: Page, timeout_ms: int = _URL_INPUT_APPEAR_TIMEOUT_MS
     ) -> Locator:
@@ -2037,6 +2157,31 @@ class NotePoster:
         まだ実機で確認できていないため、`_assert_links_match()`や下書き
         保存へはまだ進まない。次回の実機テストでこの観測データを取得した
         のち、URL確定の完了確認・後続処理を本実装する想定である。
+
+        ★URL入力〜read-back区間の診断強化・第5段階(2026年8月29日時点、
+        TEST-004の追加実機実行を踏まえた修正)★
+        上記の第4段階を実機で実行したところ、ある回はURL入力・read-back
+        一致まで成功したが、別の回では「→ 商品を見る」の選択・リンク
+        ボタンのクリック・URL入力欄の出現・URL入力までは成功と同じように
+        進んだにもかかわらず、read-backの直前でURL入力欄が消失し
+        (`input_value()`の結果が`None`相当になり)、失敗時のArtifactでは
+        URL入力欄のtextarea自体がDOMから無くなっており、active toolbarも
+        `data-active="false"`に戻っていた。この2回の実機実行の間でコード
+        (commit)は変更していない(=コードの回帰ではない)ため、原因は
+        note側の実行タイミングに依存する何らかの状態(非同期処理・
+        バリデーション・再レンダリング等)にあると考えられる。次回の実機
+        実行1回でできるだけ原因を切り分けられるよう、URL入力欄の一意
+        特定からread-backまでの区間に`_log_url_input_diagnostics()`による
+        複数時点(入力直前・クリック直後・文字入力の前後・read-back直前・
+        read-back成功後)の状態記録を追加した。また、`press_sequentially()`
+        完了直後に同じセレクタで`count()`を再確認し、1件でなければ
+        (=消失または増減していれば)read-backを無理に続行せず、専用の
+        `UrlInputDisappearedObservationStop`を送出して安全停止するように
+        した。`input_value()`自体の呼び出し中に例外が発生した場合は、この
+        消失検知(事前の`count()`チェック)とは区別し、通常のNotePoster
+        Errorとして例外の内容を含めて報告する(「read-backした値が
+        `None`だった」という曖昧な扱いはしない)。`press_sequentially()`
+        自体や「適用」ボタン以降の処理は変更していない。
         """
         self._select_product_link_text_in_block(page, block)
 
@@ -2066,13 +2211,42 @@ class NotePoster:
             ) from exc
 
         url_input = self._find_url_input_textarea(page)
+        self._log_url_input_diagnostics(page, url_input, stage="A_URL入力直前")
+
         url_input.click()
+        self._log_url_input_diagnostics(page, url_input, stage="B_click直後")
+
+        self._log_url_input_diagnostics(page, url_input, stage="C_press_sequentially開始直前")
         url_input.press_sequentially(link.url, delay=10)
+        self._log_url_input_diagnostics(page, url_input, stage="D_press_sequentially完了直後")
 
         try:
+            post_type_count = url_input.count()
+        except PlaywrightError:
+            post_type_count = 0
+        if post_type_count != 1:
+            self._log_url_input_diagnostics(page, url_input, stage="F_textarea消失検知")
+            self._capture_failure(page, "商品導線URL入力後textarea消失")
+            raise UrlInputDisappearedObservationStop(
+                f"『{link.label}』のURLをtextareaへ入力した直後、同じ"
+                f"セレクタ({_URL_INPUT_SELECTOR})でcount()を再取得した"
+                f"ところ{post_type_count}件でした(期待: 1件)。URL入力欄が"
+                "消失または予期せず増減した可能性があるため、read-backを"
+                "続行せず処理を中断します。"
+            )
+
+        self._log_url_input_diagnostics(page, url_input, stage="E_read-back直前")
+        try:
             actual_value = url_input.input_value()
-        except PlaywrightTimeoutError:
-            actual_value = None
+        except PlaywrightError as exc:
+            self._capture_failure(page, "商品導線URL入力read-back例外")
+            raise NotePosterError(
+                f"『{link.label}』のURL入力欄のread-back(input_value())"
+                f"実行中に例外が発生しました: {exc}。直前のcount()の"
+                "再確認では1件だったにもかかわらず例外が発生したため、"
+                "値の不一致とは区別して報告します。安全のため処理を"
+                "中断します。"
+            ) from exc
 
         if actual_value != link.url:
             self._capture_failure(page, "商品導線URL入力read-back不一致")
@@ -2081,6 +2255,8 @@ class NotePoster:
                 f"入力しましたが、read-backした値が{actual_value!r}でした。"
                 "安全のため処理を中断します。"
             )
+
+        self._log_url_input_diagnostics(page, url_input, stage="G_read-back成功後")
 
         apply_button = self._find_url_apply_button(page)
         self._ensure_link_button_in_viewport(page, apply_button)

@@ -15,6 +15,8 @@ import pytest
 
 pytest.importorskip("playwright")
 
+from playwright.sync_api import Error as PlaywrightError  # noqa: E402
+from playwright.sync_api import Locator as PlaywrightLocator  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 from src.models import Article
@@ -27,6 +29,7 @@ from src.note import (  # noqa: E402
     ProductLinkValidationError,
     TagValidationError,
     UrlApplyObservationStop,
+    UrlInputDisappearedObservationStop,
     UrlInputObservationStop,
     _bounding_box_within_viewport,
     _normalize_whitespace,
@@ -948,6 +951,34 @@ def test_apply_product_links_clicks_toolbar_button_and_inputs_url_then_stops_for
     assert page.evaluate("() => document.activeElement.tagName") == "BUTTON"
 
 
+def test_apply_product_links_logs_url_input_stage_diagnostics_through_healthy_flow(page, caplog):
+    # URL入力欄が消失せず正常に進む場合、_log_url_input_diagnostics()による
+    # 各段階(A〜E, G)のログが1回の呼び出しの中ですべて記録され、消失検知
+    # 段階(F)のログは出力されないことを確認する(2026年8月29日、実機で
+    # 同一commitが成功/失敗の両方を示した後に追加した診断強化)。
+    page.set_content(_LINK_TOOLBAR_HTML)
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+    links = [
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    ]
+
+    with caplog.at_level("INFO"):
+        with pytest.raises(UrlApplyObservationStop):
+            poster._apply_product_links(page, body_locator, links)
+
+    for stage in (
+        "A_URL入力直前",
+        "B_click直後",
+        "C_press_sequentially開始直前",
+        "D_press_sequentially完了直後",
+        "E_read-back直前",
+        "G_read-back成功後",
+    ):
+        assert f"診断[{stage}]" in caplog.text
+    assert "診断[F_textarea消失検知]" not in caplog.text
+
+
 def test_apply_product_links_is_noop_when_no_links():
     poster = _bare_poster()
     # ページを用意せずとも、product_links が空なら何もせず正常終了するはず。
@@ -1567,6 +1598,7 @@ def test_ensure_link_button_in_viewport_does_not_use_force_or_javascript_click()
     for func in (
         NotePoster._ensure_link_button_in_viewport,
         NotePoster._set_link_on_text_occurrence,
+        NotePoster._log_url_input_diagnostics,
     ):
         source = inspect.getsource(func)
         # docstring本文(説明文中の "force=True" 等の言及)を除いた、実際の
@@ -1873,6 +1905,194 @@ def test_set_link_on_text_occurrence_logs_diagnostics_on_readback_mismatch(page,
             poster._set_link_on_text_occurrence(page, block, link)
 
     assert "商品導線URL入力read-back不一致" in caplog.text
+
+
+_DISAPPEARING_URL_INPUT_TARGET_URL = "https://example.com/vanish"
+
+_LINK_TOOLBAR_HTML_WITH_DISAPPEARING_URL_INPUT = """
+<div class="editor" contenteditable="true">
+  <p>本文</p>
+  <p>この記事に出てきた商品</p>
+  <p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>
+</div>
+<div data-active="true" role="toolbar" id="desktop-toolbar">
+  <button aria-label="リンク">リンク</button>
+</div>
+<script>
+  document.querySelector('#desktop-toolbar button[aria-label="リンク"]')
+    .addEventListener('click', () => {
+      const toolbar = document.getElementById('desktop-toolbar');
+      const textarea = document.createElement('textarea');
+      textarea.setAttribute('inputmode', 'text');
+      textarea.setAttribute('name', 'alt');
+      textarea.setAttribute('placeholder', 'https://');
+      // 実機(TEST-004)で観測された「URL入力完了後にURL入力欄自体が
+      // DOMから消失し、active toolbarのdata-activeもfalseに戻る」事象を
+      // ローカルで再現する。
+      textarea.addEventListener('input', () => {
+        if (textarea.value === '__TARGET_URL__') {
+          textarea.remove();
+          toolbar.setAttribute('data-active', 'false');
+        }
+      });
+      toolbar.appendChild(textarea);
+    });
+</script>
+""".replace("__TARGET_URL__", _DISAPPEARING_URL_INPUT_TARGET_URL)
+
+
+def test_set_link_on_text_occurrence_raises_dedicated_stop_when_url_input_disappears(page):
+    # press_sequentially()完了直後にcount()を再確認し、URL入力欄が消失して
+    # いた場合はread-backを試みず、専用のUrlInputDisappearedObservationStop
+    # で安全停止することを確認する(2026年8月29日、実機で同一commitが
+    # 成功/失敗の両方を示した後に追加)。
+    page.set_content(_LINK_TOOLBAR_HTML_WITH_DISAPPEARING_URL_INPUT)
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(2)
+    link = ProductLink(
+        label="TOY JAM 瀬戸内レモン", url=_DISAPPEARING_URL_INPUT_TARGET_URL
+    )
+
+    with pytest.raises(UrlInputDisappearedObservationStop):
+        poster._set_link_on_text_occurrence(page, block, link)
+
+
+def test_set_link_on_text_occurrence_disappearance_stop_is_distinct_error_type(page):
+    # 消失検知(UrlInputDisappearedObservationStop)は、read-back不一致の
+    # 通常のNotePosterErrorや、観測専用停止のUrlInputObservationStop・
+    # UrlApplyObservationStopとは異なる、専用の例外型であることを確認する。
+    page.set_content(_LINK_TOOLBAR_HTML_WITH_DISAPPEARING_URL_INPUT)
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(2)
+    link = ProductLink(
+        label="TOY JAM 瀬戸内レモン", url=_DISAPPEARING_URL_INPUT_TARGET_URL
+    )
+
+    with pytest.raises(UrlInputDisappearedObservationStop) as exc_info:
+        poster._set_link_on_text_occurrence(page, block, link)
+
+    assert type(exc_info.value) is UrlInputDisappearedObservationStop
+    assert not isinstance(exc_info.value, UrlInputObservationStop)
+    assert not isinstance(exc_info.value, UrlApplyObservationStop)
+    # 消失検知も、呼び出し側(main.py)がneeds_reviewへ倒す既存の共通
+    # 例外処理に乗る、NotePosterErrorのサブクラスであること。
+    assert isinstance(exc_info.value, NotePosterError)
+
+
+def test_set_link_on_text_occurrence_saves_failure_artifact_when_url_input_disappears(
+    page, caplog
+):
+    # URL入力欄の消失を検知した場合も、_capture_failure()経由でArtifact
+    # (診断サマリログ)が保存されていることを確認する。
+    page.set_content(_LINK_TOOLBAR_HTML_WITH_DISAPPEARING_URL_INPUT)
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(2)
+    link = ProductLink(
+        label="TOY JAM 瀬戸内レモン", url=_DISAPPEARING_URL_INPUT_TARGET_URL
+    )
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(UrlInputDisappearedObservationStop):
+            poster._set_link_on_text_occurrence(page, block, link)
+
+    assert "商品導線URL入力後textarea消失" in caplog.text
+
+
+def test_set_link_on_text_occurrence_logs_stage_f_only_when_url_input_disappears(
+    page, caplog
+):
+    # 消失検知段階(F)のログは、実際に消失したときだけ出力され、その前段の
+    # A〜Dのログは(消失前なので)出力されていることを確認する。
+    page.set_content(_LINK_TOOLBAR_HTML_WITH_DISAPPEARING_URL_INPUT)
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(2)
+    link = ProductLink(
+        label="TOY JAM 瀬戸内レモン", url=_DISAPPEARING_URL_INPUT_TARGET_URL
+    )
+
+    with caplog.at_level("INFO"):
+        with pytest.raises(UrlInputDisappearedObservationStop):
+            poster._set_link_on_text_occurrence(page, block, link)
+
+    for stage in (
+        "A_URL入力直前",
+        "B_click直後",
+        "C_press_sequentially開始直前",
+        "D_press_sequentially完了直後",
+        "F_textarea消失検知",
+    ):
+        assert f"診断[{stage}]" in caplog.text
+    # 消失後なのでread-back直前(E)・成功後(G)には到達していない。
+    assert "診断[E_read-back直前]" not in caplog.text
+    assert "診断[G_read-back成功後]" not in caplog.text
+
+
+def test_set_link_on_text_occurrence_distinguishes_readback_exception_from_disappearance(
+    page, monkeypatch
+):
+    # count()の再確認では1件だったにもかかわらず、input_value()自体の
+    # 呼び出し中に例外が発生した場合は、消失検知(事前チェックで検知する
+    # UrlInputDisappearedObservationStop)とは異なる、通常のNotePosterError
+    # として例外内容を含めて報告されることを確認する(read-backした値が
+    # `None`だったという曖昧な扱いに握りつぶされないことの確認)。
+    page.set_content(_LINK_TOOLBAR_HTML)
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+    links = [
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    ]
+
+    def _boom(self, *args, **kwargs):
+        raise PlaywrightError("boom: simulated mid-call failure during input_value()")
+
+    monkeypatch.setattr(PlaywrightLocator, "input_value", _boom, raising=True)
+
+    with pytest.raises(NotePosterError) as exc_info:
+        poster._apply_product_links(page, body_locator, links)
+
+    assert not isinstance(exc_info.value, UrlInputDisappearedObservationStop)
+    assert not isinstance(exc_info.value, UrlApplyObservationStop)
+    assert not isinstance(exc_info.value, UrlInputObservationStop)
+    assert "boom" in str(exc_info.value)
+    assert "直前のcount()の再確認では1件だった" in str(exc_info.value)
+
+
+def test_log_url_input_diagnostics_never_raises_when_elements_are_absent(page):
+    # 診断用ログ関数自体は、URL入力欄やactive toolbarが存在しない状態でも
+    # 例外を送出せず、取得できる範囲だけを記録することを確認する。
+    page.set_content("<div>本文だけ</div>")
+    poster = _bare_poster()
+    url_input = page.locator(_URL_INPUT_SELECTOR_FOR_TESTS)
+
+    poster._log_url_input_diagnostics(page, url_input, stage="テスト")  # 例外が出なければOK
+
+
+def test_log_url_input_diagnostics_does_not_steal_focus(page):
+    # 診断用ログ関数が、フォーカス済みの要素からフォーカスを奪わない
+    # (click/focus/blurのいずれも行わない)ことを実際のDOM上で確認する。
+    page.set_content(
+        _LINK_TOOLBAR_HTML.replace(
+            "</div>\n<script>",
+            '</div>\n<input id="already-focused">\n<script>',
+        )
+    )
+    page.locator("#already-focused").click()
+    assert page.evaluate("() => document.activeElement.id") == "already-focused"
+
+    poster = _bare_poster()
+    url_input = page.locator(_URL_INPUT_SELECTOR_FOR_TESTS)
+    poster._log_url_input_diagnostics(page, url_input, stage="フォーカス確認")
+
+    assert page.evaluate("() => document.activeElement.id") == "already-focused"
+
+
+def test_set_link_on_text_occurrence_source_press_sequentially_call_is_unchanged():
+    # 今回の診断強化ラウンドで、press_sequentially()自体の呼び出し(引数・
+    # delay)は変更していないことをソースから確認する。
+    import inspect
+
+    source = inspect.getsource(NotePoster._set_link_on_text_occurrence)
+    assert "url_input.press_sequentially(link.url, delay=10)" in source
 
 
 def test_set_link_on_text_occurrence_applies_publish_action_guard_before_click(page):
