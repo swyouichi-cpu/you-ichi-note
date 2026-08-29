@@ -220,36 +220,66 @@ Selection/Range API(`document.createRange()` / `window.getSelection()`)
 だが、念のためここでも一致するテキストノードの件数を数え、ちょうど
 1件でなければ推測で選択せず安全停止する。
 
-★リンク設定操作: note公式ショートカット(Control+K / Meta+K)★
-当初はフローティングツールバーのリンクボタンをrole/aria属性(推測ベースの
-best-effort候補)で探してクリックする方式を実装していたが、そのボタンが
-アイコンのみでアクセシブルな名前を持たない場合に候補が一つも一致しない
-リスクがあった。その後、note公式の「エディタのガイド」にリンク挿入の
-ショートカットとしてMac: ⌘+K が明記されていることを人間が確認し
-(実機で「→ 商品を見る」を選択してこのショートカットを使うと、URL入力欄が
-表示されてインラインリンクを設定でき、商品カード化されないことも確認済み)、
-DOM構造の推測に頼らないこの公式ショートカット方式に変更した
-(_set_link_on_text_occurrence() / _open_link_input_via_shortcut())。
-GitHub Actionsのheadless ChromiumはLinux上で動作するため、noteが
-navigator.platformに応じてMeta/Ctrlいずれかのキーを見ている可能性がある。
-実機ではどちらが効くかまだ確認できていないため、Control+K→Meta+Kの順に
-試し、実際にURL入力欄が現れた方を採用する(これも位置ベースフォールバック
-ではなく、公式ショートカットの2つのプラットフォーム変種を順に試すだけ)。
-_select_product_link_text_in_block()での選択直後には、実際の選択内容
-(`window.getSelection().toString()`)が意図した文字列と一致することも
-確認してからショートカットを送る。
+★リンク設定操作の変遷: (1)推測ボタン→(2)ショートカット→(3)実機確認済み
+ボタン(観測専用実装)★
 
-★リンクURL入力欄のセレクタについて(未確定・要実機検証)★
-本文editorのセレクタ(ProseMirror)とは異なり、ショートカット送信後に現れる
-リンクURL入力欄の正確なDOM構造は、まだ実機のHTMLダンプで確認できていない
-(人間による目視確認のみ)。そのため_open_link_input_via_shortcut()の
-候補セレクタは、一般的なリッチテキストエディタのURL入力欄で使われがちな
-role/aria属性に基づく複数候補であり、_fill_body()のProseMirror候補ほど
-確度が高いとは言えない。候補が一致しない場合は位置ベースの推測に頼らず
-NotePosterErrorで安全停止する(needs_reviewに倒れる)。実機で候補が
-一致しなかった場合は、_fill_body()のときと同様、失敗時の診断データ
-(スクリーンショット・HTMLダンプ)を元に、実際のDOM構造に基づいてセレクタ
-を更新する想定である。
+(1) 当初はフローティングツールバーのリンクボタンをrole/aria属性(推測
+ベースのbest-effort候補)で探してクリックする方式を実装していたが、
+そのボタンがアイコンのみでアクセシブルな名前を持たない場合に候補が
+一つも一致しないリスクがあった。
+
+(2) その後、note公式の「エディタのガイド」にリンク挿入のショートカット
+としてMac: ⌘+K が明記されていると人間が手動確認し(実機で「→ 商品を
+見る」を選択してこのショートカットを使うと、URL入力欄が表示されて
+インラインリンクを設定でき、商品カード化されないことも確認済み)、
+DOM構造の推測に頼らない公式ショートカット方式(Control+K→Meta+Kの順に
+試す)に変更した。しかし実機のGitHub Actions実行(TEST-004)では
+Control+K・Meta+Kとも無反応だった。追加で取得した実機Artifact
+(04/05/06のHTML・スクリーンショット・診断データ)で、noteの
+「エディタのガイド」パネルを実際にパースした結果、**リンク挿入は
+ツールバーの「ボタン」一覧には存在するが、「キーボードショートカット」
+一覧には存在しない**ことが判明した(登録されているショートカットは
+元に戻す/やり直し/下書き保存/太字/取り消し線/引用/本文/見出し/小見出し/
+コード/中央寄せ/左寄せ/右寄せ/箇条書きリストのみで、リンクは無い)。
+つまりControl+K/Meta+Kが無反応だったのは偶然の失敗ではなく、そもそも
+note側にリンク挿入のキーボードショートカットが実装されていないためで
+あり、ショートカット方式は撤回した(_open_link_input_via_shortcut()を
+完全に削除し、フォールバックとしても残していない)。
+
+(3) 同じ実機Artifactから、フローティング編集ツールバー自体の実DOM構造
+が判明した。
+
+  <div data-active="true" role="toolbar" id="desktop-toolbar" ...>
+    ...
+    <button tabindex="0" aria-label="リンク" aria-pressed="false" ...>
+    ...
+  </div>
+
+`role="toolbar"`かつ`data-active="true"`の要素はページ内に常にちょうど
+1件、その内部の`aria-label="リンク"`ボタンもちょうど1件であることを
+04/05/06すべてのArtifactで確認した。`_find_active_link_toolbar_button()`
+が、この2段階の一意性(`div[role="toolbar"][data-active="true"]`が
+ちょうど1件→その内部の`button[aria-label="リンク"]`がちょうど1件)を
+確認したうえでボタンを返す(style属性内のclass名、`sc-xxxx`のような
+styled-components由来のハッシュには一切依存しない)。いずれかが1件で
+なければ`.first()`/`.nth()`等の推測に頼らずNotePosterErrorで安全停止
+する。
+
+★観測専用実装であることについて(2026年8月29日時点)★
+ボタンをクリックした後に実際にどのようなURL入力UI(ポップオーバーか
+モーダルか、`input`要素か`contenteditable`か等)が出現するかは、まだ
+一度も実機で観測できていない。この状態でURL入力欄のセレクタを推測実装
+すると、ショートカット方式のときと同じ「未確認のDOM構造を前提にした
+実装」を繰り返すことになる。そのため`_set_link_on_text_occurrence()`は
+意図的に、リンクボタンをクリックした直後にHTML/スクリーンショット/
+診断データを保存したうえで、`LinkButtonObservationStop`(NotePosterError
+のサブクラス。通常の「リンク設定に失敗した」という意味の例外とログ上で
+明確に区別するための専用クラス)を送出して処理を止める。URL入力欄を
+探す・URLを入力する・Enterを押す・確定ボタンを押す、という操作は一切
+行わない。次回の実機テストでこの観測データを取得したのち、URL入力UIの
+自動化を本実装する想定である。呼び出し側(main.py)では他のNotePoster
+Errorと同様にneeds_reviewへ倒れ、下書き保存やSheetsのdraft_created化は
+一切行われない。
 
 ★本文テキスト検証とリンク検証の分離★
 _assert_body_matches()は引き続き「見えているテキスト」だけを検証する
@@ -386,6 +416,21 @@ class ProductLinkValidationError(NotePosterError):
     TagValidationErrorと同じ思想: 不正なJSON・必須フィールド欠落・
     不正なURL形式などを推測で「直す」ことは絶対にせず、
     呼び出し側(main.py)でneeds_reviewに振り分けられる。
+    """
+
+
+class LinkButtonObservationStop(NotePosterError):
+    """商品導線リンクのツールバーボタンをクリックした直後、意図的に
+    処理を安全停止する際に送出する(観測専用実装、2026年8月29日)。
+
+    ボタンクリック後に出現するURL入力UIのDOM構造がまだ実機で確認できて
+    いないため、URL入力・確定操作へは進まず、HTML/スクリーンショット/
+    診断データを保存したうえでここで停止する。これは「リンク設定に失敗
+    した」という通常のNotePosterErrorとは意味が異なり、次の実装のための
+    意図的な観測停止であることをログ・診断データ・呼び出し側の分岐
+    (呼び出し側ではNotePosterErrorのサブクラスとして他と同様に
+    needs_reviewへ倒れる)から明確に区別できるよう、専用のサブクラスに
+    している。
     """
 
 
@@ -903,12 +948,20 @@ class NotePoster:
         商品リンク(product_links)が指定されている場合、タグ行の手前に
         「この記事に出てきた商品」という商品導線セクションを追記する。
         ECの生URLは本文の文字列としては一切登場させず(自動カード化を
-        誘発するため)、「→ 商品を見る」という固定文言だけに、note公式の
-        リンク挿入ショートカット(Control+K / Meta+K)経由でインライン
-        リンクを設定する(_apply_product_links)。商品名と「→ 商品を見る」は
-        実機DOM上では同一のブロック要素内に<br>を挟んで存在するため、
-        本文editor(body_locator)にスコープを絞ったブロック単位の特定
-        (_find_product_link_block)を経由してリンク対象を選択する。
+        誘発するため)、「→ 商品を見る」という固定文言だけに、noteの
+        フローティング編集ツールバーの「リンク」ボタン経由でインライン
+        リンクを設定しようとする(_apply_product_links)。商品名と「→ 商品を
+        見る」は実機DOM上では同一のブロック要素内に<br>を挟んで存在する
+        ため、本文editor(body_locator)にスコープを絞ったブロック単位の
+        特定(_find_product_link_block)を経由してリンク対象を選択する。
+
+        ★現時点では観測専用実装であることに注意★
+        リンクボタンをクリックした直後に出現するURL入力UIの構造がまだ
+        実機で確認できていないため、_apply_product_links はボタンを
+        クリックした時点で意図的に LinkButtonObservationStop を送出して
+        処理を中断する(URL入力・確定操作は行わない)。したがって
+        product_links が指定された記事は、現時点では必ず needs_review へ
+        安全停止し、draft_created にはならない。
 
         本文入力欄は、タイトル入力欄と同一のDOM要素を誤って掴んでいない
         ことを確認したうえで使用し(_same_element)、実際に入力に使った
@@ -1368,33 +1421,93 @@ class NotePoster:
                 "ため、推測で選択せず処理を中断します。"
             )
 
+    def _find_active_link_toolbar_button(self, page: Page) -> Locator:
+        """選択中のテキストに対して表示される、noteのフローティング編集
+        ツールバー内の「リンク」ボタンを一意に特定する。
+
+        実機のGitHub Actions実行(TEST-004の追加観測、04/05/06のHTML
+        ダンプ)で、noteのフローティング編集ツールバーは
+
+          <div data-active="true" role="toolbar" id="desktop-toolbar" ...>
+
+        という単一のDOM要素として存在し、その内部に
+
+          <button tabindex="0" aria-label="リンク" aria-pressed="false" ...>
+
+        という、アイコンのみだが`aria-label`を持つ単純クリック型のボタンが
+        ちょうど1件存在することが判明した。style属性内のclass名(`sc-xxxx`
+        のようなstyled-components由来のハッシュ)には一切依存せず、
+        `role`/`id`/`data-active`/`aria-label`という意味のある属性だけで
+        スコープする。
+
+        以下のいずれかが成立しない場合は、位置ベースの推測(`.first()`/
+        `.nth()`等)に頼らず、NotePosterErrorを送出して安全停止する
+        (呼び出し側でneeds_reviewに倒れる)。
+          - `div[role="toolbar"][data-active="true"]` がページ内にちょうど
+            1件だけ存在する(選択中のツールバーを一意に特定できること)
+          - そのツールバー内に `button[aria-label="リンク"]` がちょうど
+            1件だけ存在する(ツールバーの外にある同名要素は対象にしない)
+        """
+        toolbar = page.locator('div[role="toolbar"][data-active="true"]')
+        try:
+            toolbar_count = toolbar.count()
+        except PlaywrightTimeoutError:
+            toolbar_count = 0
+        if toolbar_count != 1:
+            self._capture_failure(page, "商品導線リンクツールバー特定")
+            raise NotePosterError(
+                "選択中のフローティング編集ツールバー"
+                '(div[role="toolbar"][data-active="true"])が'
+                f"{toolbar_count}件見つかりました(期待: 1件)。ツールバーを"
+                "安全に特定できないため処理を中断します。"
+            )
+
+        link_button = toolbar.locator('button[aria-label="リンク"]')
+        try:
+            link_button_count = link_button.count()
+        except PlaywrightTimeoutError:
+            link_button_count = 0
+        if link_button_count != 1:
+            self._capture_failure(page, "商品導線リンクボタン特定")
+            raise NotePosterError(
+                "ツールバー内の「リンク」ボタン"
+                '(button[aria-label="リンク"])が'
+                f"{link_button_count}件見つかりました(期待: 1件)。ボタンを"
+                "安全に特定できないため処理を中断します。"
+            )
+        return link_button
+
     def _set_link_on_text_occurrence(
         self, page: Page, block: Locator, link: ProductLink
     ) -> None:
-        """指定したブロック内の「→ 商品を見る」だけを選択し、noteの公式
-        リンク挿入ショートカットでリンクを設定する。
+        """指定したブロック内の「→ 商品を見る」だけを選択し、noteのフロー
+        ティング編集ツールバーの「リンク」ボタンをクリックする。
 
-        note公式の「エディタのガイド」に、リンク挿入のショートカットとして
-        Mac: ⌘+K が明記されており、実機で人間が「→ 商品を見る」を選択して
-        このショートカットを使うと、URL入力欄が表示されてインラインリンクを
-        設定でき、商品カードへは変換されないことを確認済み(2026年8月29日)。
+        ★観測専用実装(2026年8月29日時点、TEST-004の追加観測を踏まえた
+        修正)★
+        実機のGitHub Actions実行(TEST-004)で、note公式の「エディタの
+        ガイド」パネルを実際にパースした結果、リンク挿入はツールバーの
+        「ボタン」一覧には存在するものの、「キーボードショートカット」
+        一覧には存在しないことが判明した。つまりControl+K/Meta+Kが実機で
+        無反応だったのは偶然の失敗ではなく、そもそもnote側にそのような
+        ショートカットが実装されていないためだった。これを受けてショート
+        カット方式(旧`_open_link_input_via_shortcut`)を完全に撤去し、
+        フォールバックとしても残さず、実機で構造を確認できたツールバーの
+        ボタンをクリックする方式(`_find_active_link_toolbar_button`)に
+        切り替えた。
 
-        以前はフローティングツールバーのリンクボタンをrole/aria属性で
-        探してクリックしていたが、そのボタンがアイコンのみでアクセシブル
-        な名前を持たない可能性があり(実機DOM未確認のbest-effortだった)、
-        公式ショートカットの方がnoteの公開ドキュメントに明記された安定
-        した操作契約であるため、こちらを優先する。GitHub Actionsの
-        headless ChromiumはLinux上で動作するため、note側がnavigator.platform
-        に応じてMeta/Ctrlいずれかのキーを見ている可能性がある。実機では
-        まだどちらが効くか確認できていないため、Control+K→Meta+Kの順に
-        試し、実際にURL入力欄が現れた方を採用する(DOM構造の推測ではなく、
-        公式ショートカットのプラットフォーム変種を順に試すだけであり、
-        位置ベースフォールバックとは異なる)。
-
-        選択操作(_select_product_link_text_in_block)の直後、実際の選択
-        内容が意図した文字列と一致することを確認してからショートカットを
-        送る(意図しない範囲を選択したままリンクを設定してしまう事故を
-        防ぐため)。
+        ただし、ボタンをクリックした後に実際にどのようなURL入力UI
+        (ポップオーバーかモーダルか、`input`要素か`contenteditable`か等)
+        が出現するかは、まだ一度も実機で観測できていない。この状態で
+        URL入力欄のセレクタを推測実装すると、ショートカット方式のときと
+        同じ「未確認のDOM構造を前提にした実装」を繰り返すことになる。
+        そのため今回は意図的に、リンクボタンをクリックした直後にHTML/
+        スクリーンショット/診断データを保存したうえで
+        `LinkButtonObservationStop`(観測専用の安全停止、通常の
+        NotePosterErrorとログ上で区別できるサブクラス)を送出して処理を
+        止める。URL入力欄を探す・URLを入力する・Enterを押す・確定ボタンを
+        押す、という操作は一切行わない。次回の実機テストでこの観測データを
+        取得したのち、URL入力UIの自動化を本実装する想定である。
         """
         self._select_product_link_text_in_block(page, block)
 
@@ -1412,49 +1525,17 @@ class NotePoster:
                 "処理を中断します。"
             )
 
-        url_input = self._open_link_input_via_shortcut(page)
+        link_button = self._find_active_link_toolbar_button(page)
+        self._assert_not_publish_action(link_button)
+        link_button.click()
 
-        url_input.click()
-        url_input.press_sequentially(link.url, delay=10)
-        url_input.press("Enter")
-        try:
-            url_input.wait_for(state="hidden", timeout=3000)
-        except PlaywrightTimeoutError:
-            # 閉じたことを確認できなくても、成否は後続のread-back検証
-            # (_assert_links_match)で判断するため、ここでは中断しない。
-            pass
-
-    def _open_link_input_via_shortcut(self, page: Page) -> Locator:
-        """note公式のリンク挿入ショートカット(Control+K / Meta+K)を送信し、
-        URL入力欄が現れるのを待つ。
-
-        URL入力欄自体のセレクタは、本文editor(ProseMirror)ほど確度の高い
-        実機DOM確認ができていないbest-effortな候補のままである点は変わらない。
-        """
-        url_input_candidates = [
-            ("css input[type=url]", page.locator('input[type="url"]')),
-            ("placeholder*=URL", page.get_by_placeholder(re.compile("URL", re.IGNORECASE))),
-            (
-                "role=textbox name=URL/リンク",
-                page.get_by_role("textbox", name=re.compile("URL|リンク", re.IGNORECASE)),
-            ),
-        ]
-        for modifier in ("Control+K", "Meta+K"):
-            page.keyboard.press(modifier)
-            try:
-                return self._resolve_locator(
-                    page,
-                    url_input_candidates,
-                    step_name=f"リンクURL入力欄(ショートカット{modifier})",
-                    timeout_ms=2000,
-                )
-            except NotePosterError:
-                continue
-
-        self._capture_failure(page, "リンク挿入ショートカット")
-        raise NotePosterError(
-            "note公式のリンク挿入ショートカット(Control+K / Meta+K)を送信しましたが、"
-            "URL入力欄の表示を確認できませんでした。処理を中断します。"
+        self._capture_failure(page, "商品導線リンクボタンクリック後の観測")
+        raise LinkButtonObservationStop(
+            f"『{link.label}』の「{_PRODUCT_LINK_TEXT}」に対してツールバーの"
+            "「リンク」ボタンをクリックしました。ボタンクリック後に出現する"
+            "URL入力UIの構造がまだ実機で確認できていないため、URL入力・確定"
+            "操作は行わず、観測のために意図的にここで処理を停止します"
+            "(HTML/スクリーンショット/診断データは保存済みです)。"
         )
 
     def _assert_links_match(

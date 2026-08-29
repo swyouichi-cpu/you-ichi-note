@@ -19,6 +19,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 from src.models import Article
 from src.note import (  # noqa: E402
+    LinkButtonObservationStop,
     NotePoster,
     NotePosterError,
     ProductLink,
@@ -826,80 +827,71 @@ def test_publish_related_labels_are_never_used_as_click_selectors():
                 )
 
 
-# -- 商品導線リンクの設定・検証(note公式ショートカット Control+K/Meta+K方式) --
+# -- 商品導線リンクの設定・検証(実機Artifact確認済みのツールバーボタン方式、
+#    観測専用実装) -------------------------------------------------------
 #
-# 人間が実機で、note公式の「エディタのガイド」に明記されたリンク挿入
-# ショートカット(Mac: ⌘+K)を使って「→ 商品を見る」だけを選択した状態から
-# リンクを設定すると、商品カードへ変換されずインラインリンクになることを
-# 確認した。以下はそのショートカット操作をローカルの疑似ページで再現した
-# テスト。URL入力欄自体の正確なDOM構造は実機のHTMLダンプではまだ確認
-# できていないため、ここでの疑似UIは「input[type=url]」という、
-# _open_link_input_via_shortcut が実際に試す候補の1つを模したものであり、
-# 実機と完全に一致する保証はない。
+# 実機のGitHub Actions実行(TEST-004)で、note公式の「エディタのガイド」を
+# パースした結果、リンク挿入はツールバーの「ボタン」一覧には存在するが、
+# 「キーボードショートカット」一覧には存在しないことが判明した
+# (Control+K/Meta+Kは実機で無反応だった)。そのためショートカット方式は
+# 撤去し、追加で取得した実機Artifact(04/05/06のHTMLダンプ)で確認できた
+# 以下のフローティング編集ツールバーのDOM構造を使う方式に切り替えた。
+#
+#   <div data-active="true" role="toolbar" id="desktop-toolbar">
+#     ...
+#     <button aria-label="リンク">...</button>
+#     ...
+#   </div>
+#
+# ただし、このリンクボタンをクリックした後に実際にどのようなURL入力UIが
+# 出現するかはまだ実機で観測できていないため、今回は「クリックした直後に
+# 意図的に安全停止する」観測専用の実装になっている
+# (_set_link_on_text_occurrence / LinkButtonObservationStop)。
 #
 # 商品名(label)と「→ 商品を見る」のHTML構造は、実機のGitHub Actions実行
 # (TEST-004)で、noteのエディタが別々の<p>要素にはせず、同一の<p>要素内に
 # <br>を挟んで描画すること(<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>)が
 # 判明したため、以下のフィクスチャはすべてこの実機DOM構造を再現している。
 
-_LINK_SHORTCUT_HTML = """
+_LINK_TOOLBAR_HTML = """
 <div class="editor" contenteditable="true">
   <p>本文</p>
   <p>この記事に出てきた商品</p>
   <p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>
-  <p>TOY JAM 瀬戸内レモン月桂樹<br>→ 商品を見る</p>
 </div>
-<input type="url" id="url-input" style="display:none">
+<div data-active="true" role="toolbar" id="desktop-toolbar">
+  <button aria-label="AIアシスタント">AI</button>
+  <button aria-label="太字">B</button>
+  <button aria-label="リンク">リンク</button>
+  <button aria-label="引用">引用</button>
+</div>
 <script>
-  document.addEventListener('keydown', (e) => {
-    if (e.key.toLowerCase() === 'k' && (e.ctrlKey || e.metaKey)) {
-      const sel = window.getSelection();
-      if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
-        window.__savedRange = sel.getRangeAt(0).cloneRange();
-        const input = document.getElementById('url-input');
-        input.style.display = 'block';
-        input.focus();
-      }
-    }
-  });
-  document.getElementById('url-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      const range = window.__savedRange;
-      const a = document.createElement('a');
-      a.href = document.getElementById('url-input').value;
-      a.textContent = range.toString();
-      range.deleteContents();
-      range.insertNode(a);
-      document.getElementById('url-input').style.display = 'none';
-      document.getElementById('url-input').value = '';
-    }
-  });
+  document.querySelector('#desktop-toolbar button[aria-label="リンク"]')
+    .addEventListener('click', (e) => {
+      e.target.setAttribute('data-clicked', 'true');
+    });
 </script>
 """
 
 
-def test_apply_product_links_sets_correct_href_on_each_occurrence(page):
-    page.set_content(_LINK_SHORTCUT_HTML)
+def test_apply_product_links_clicks_toolbar_button_then_stops_for_observation(page):
+    # クリック後のURL入力UIはまだ実機で確認できていないため、意図的に
+    # LinkButtonObservationStopで安全停止する(観測専用実装)。それでも
+    # 実際に「リンク」ボタンがクリックされたこと、URL入力・確定操作を
+    # 一切行っていない(<a>要素が作られていない)ことは確認する。
+    page.set_content(_LINK_TOOLBAR_HTML)
     poster = _bare_poster()
     body_locator = page.locator(".editor")
     links = [
         ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
-        ProductLink(label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"),
     ]
 
-    poster._apply_product_links(page, body_locator, links)
+    with pytest.raises(LinkButtonObservationStop):
+        poster._apply_product_links(page, body_locator, links)
 
-    editor_paragraphs = body_locator.locator("p")
-    block_a = editor_paragraphs.nth(2)
-    block_b = editor_paragraphs.nth(3)
-    # それぞれのブロックにちょうど1件の<a>要素があり、リンクテキストは
-    # 「→ 商品を見る」だけ(商品名は選択・リンクに含まれていない)。
-    assert block_a.locator("a").count() == 1
-    assert block_a.locator("a").first.inner_text().strip() == "→ 商品を見る"
-    assert block_a.locator("a").first.get_attribute("href") == links[0].url
-    assert block_b.locator("a").count() == 1
-    assert block_b.locator("a").first.inner_text().strip() == "→ 商品を見る"
-    assert block_b.locator("a").first.get_attribute("href") == links[1].url
+    button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
+    assert button.get_attribute("data-clicked") == "true"
+    assert body_locator.locator("a").count() == 0
 
 
 def test_apply_product_links_is_noop_when_no_links():
@@ -1089,58 +1081,108 @@ def test_select_product_link_text_in_block_raises_when_link_text_appears_twice(p
         poster._select_product_link_text_in_block(page, block)
 
 
-# -- _open_link_input_via_shortcut(Control+K / Meta+Kの2変種を順に試す) ------
+# -- _find_active_link_toolbar_button(実機Artifactで確認したツールバー構造) --
+#
+# TEST-004の追加観測(実機のGitHub Actions実行で取得したHTMLダンプ04/05/06)
+# で、noteのフローティング編集ツールバーは
+#   <div data-active="true" role="toolbar" id="desktop-toolbar">
+# という単一のDOM要素として存在し、その内部に
+#   <button aria-label="リンク">
+# がちょうど1件だけ存在することが判明した(class名等の推測ベースの属性には
+# 依存しない)。以下はこの実機DOM構造をローカルの疑似ページで再現したテスト。
 
 
-def test_open_link_input_via_shortcut_succeeds_with_control_k(page):
-    page.set_content(_LINK_SHORTCUT_HTML)
+def test_find_active_link_toolbar_button_finds_the_button(page):
+    page.set_content(_LINK_TOOLBAR_HTML)
     poster = _bare_poster()
-    block = page.locator(".editor p").nth(2)
-    poster._select_product_link_text_in_block(page, block)
 
-    url_input = poster._open_link_input_via_shortcut(page)
+    button = poster._find_active_link_toolbar_button(page)
 
-    assert url_input.is_visible()
+    assert button.get_attribute("aria-label") == "リンク"
 
 
-def test_open_link_input_via_shortcut_falls_back_to_meta_k_when_control_k_does_nothing(page):
-    # note側がMac用のMeta+Kしか listen していない状況を模す
-    # (Control+Kでは何も起きず、Meta+Kでのみ入力欄が現れる)。
+def test_find_active_link_toolbar_button_raises_when_no_active_toolbar(page):
+    page.set_content('<div class="editor" contenteditable="true"><p>本文</p></div>')
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_active_link_toolbar_button(page)
+
+
+def test_find_active_link_toolbar_button_raises_when_multiple_active_toolbars(page):
     page.set_content(
         """
-        <div class="editor" contenteditable="true"><p>→ 商品を見る</p></div>
-        <input type="url" id="url-input" style="display:none">
-        <script>
-          document.addEventListener('keydown', (e) => {
-            if (e.key.toLowerCase() === 'k' && e.metaKey && !e.ctrlKey) {
-              document.getElementById('url-input').style.display = 'block';
-            }
-          });
-        </script>
+        <div class="editor" contenteditable="true"><p>本文</p></div>
+        <div data-active="true" role="toolbar" id="desktop-toolbar">
+          <button aria-label="リンク">リンク</button>
+        </div>
+        <div data-active="true" role="toolbar" id="mobile-toolbar">
+          <button aria-label="リンク">リンク</button>
+        </div>
         """
     )
     poster = _bare_poster()
-    target = page.get_by_text("→ 商品を見る", exact=True).first
-    target.select_text()
-
-    url_input = poster._open_link_input_via_shortcut(page)
-
-    assert url_input.is_visible()
-
-
-def test_open_link_input_via_shortcut_raises_when_neither_modifier_works(page):
-    page.set_content('<div class="editor" contenteditable="true"><p>→ 商品を見る</p></div>')
-    poster = _bare_poster()
-    target = page.get_by_text("→ 商品を見る", exact=True).first
-    target.select_text()
 
     with pytest.raises(NotePosterError):
-        poster._open_link_input_via_shortcut(page)
+        poster._find_active_link_toolbar_button(page)
+
+
+def test_find_active_link_toolbar_button_ignores_inactive_toolbar(page):
+    # data-active="false"のツールバー(非表示中)は対象にしない。
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true"><p>本文</p></div>
+        <div data-active="false" role="toolbar" id="desktop-toolbar">
+          <button aria-label="リンク">リンク</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_active_link_toolbar_button(page)
+
+
+def test_find_active_link_toolbar_button_ignores_link_labeled_button_outside_toolbar(page):
+    # ツールバーの外にある同名のaria-label要素を誤って拾わないことを確認する
+    # (ページ全体ではなくactive toolbar内だけをスコープにしていることの確認)。
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true"><p>本文</p></div>
+        <button aria-label="リンク">ツールバー外のリンクボタン</button>
+        <div data-active="true" role="toolbar" id="desktop-toolbar">
+          <button aria-label="太字">B</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_active_link_toolbar_button(page)
+
+
+def test_find_active_link_toolbar_button_raises_when_button_duplicated_inside_toolbar(page):
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true"><p>本文</p></div>
+        <div data-active="true" role="toolbar" id="desktop-toolbar">
+          <button aria-label="リンク">リンク1</button>
+          <button aria-label="リンク">リンク2</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_active_link_toolbar_button(page)
+
+
+# -- _set_link_on_text_occurrence(観測専用実装: クリック後は必ず安全停止) -----
 
 
 def test_set_link_on_text_occurrence_raises_when_block_has_no_matching_text_node(page):
     # ブロック内に「→ 商品を見る」と完全一致する直接の子テキストノードが
-    # 無い(構造の想定違い)場合は安全停止する。
+    # 無い(構造の想定違い)場合は安全停止する。ツールバーへは到達しない。
     page.set_content('<div class="editor" contenteditable="true"><p>違う文言</p></div>')
     poster = _bare_poster()
     block = page.locator(".editor p").first
@@ -1151,6 +1193,48 @@ def test_set_link_on_text_occurrence_raises_when_block_has_no_matching_text_node
         )
 
 
+def test_set_link_on_text_occurrence_clicks_button_then_raises_observation_stop(page):
+    page.set_content(_LINK_TOOLBAR_HTML)
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(2)
+
+    with pytest.raises(LinkButtonObservationStop):
+        poster._set_link_on_text_occurrence(
+            page,
+            block,
+            ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a"),
+        )
+
+    button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
+    assert button.get_attribute("data-clicked") == "true"
+    # URL入力・確定操作は行っていないため、<a>要素はまだ作られていない。
+    assert page.locator(".editor a").count() == 0
+
+
+def test_set_link_on_text_occurrence_applies_publish_action_guard_before_click(page):
+    # クリック対象のボタンの表示テキストに公開系キーワードが含まれている
+    # (想定外の誤検出)場合は、_assert_not_publish_action()でクリック前に
+    # 安全停止する。観測専用停止(LinkButtonObservationStop)とは区別される
+    # べき、通常の安全装置によるNotePosterErrorであることを確認する。
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true"><p>商品A<br>→ 商品を見る</p></div>
+        <div data-active="true" role="toolbar" id="desktop-toolbar">
+          <button aria-label="リンク">投稿する</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").first
+
+    with pytest.raises(NotePosterError) as exc_info:
+        poster._set_link_on_text_occurrence(
+            page, block, ProductLink(label="商品A", url="https://example.com/a")
+        )
+
+    assert not isinstance(exc_info.value, LinkButtonObservationStop)
+
+
 def test_set_link_on_text_occurrence_source_has_no_positional_fallback_candidates():
     """リンク設定関連の候補セレクタに、位置ベースの無条件フォールバック
     (「最初の/2番目の」等)が使われていないことを確認する。
@@ -1159,7 +1243,7 @@ def test_set_link_on_text_occurrence_source_has_no_positional_fallback_candidate
 
     for func in (
         NotePoster._set_link_on_text_occurrence,
-        NotePoster._open_link_input_via_shortcut,
+        NotePoster._find_active_link_toolbar_button,
         NotePoster._find_product_link_block,
         NotePoster._select_product_link_text_in_block,
     ):
