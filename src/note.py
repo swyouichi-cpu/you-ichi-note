@@ -440,6 +440,20 @@ _URL_INPUT_APPEAR_TIMEOUT_MS = 3000
 # する。
 _URL_INPUT_SELECTOR = 'textarea[placeholder="https://"][inputmode="text"][name="alt"]'
 
+# noteのフローティング編集ツールバーのセレクタ(_find_active_link_toolbar_
+# button()とクリック前のviewport確認診断の両方で使うため定数化している)。
+_ACTIVE_TOOLBAR_SELECTOR = 'div[role="toolbar"][data-active="true"]'
+
+# リンクボタンをクリックする際のタイムアウト上限。TEST-004の実機実行で、
+# ボタン自体は一意に特定できていたにもかかわらずclick()がPlaywright既定の
+# 30秒タイムアウトいっぱいまで「element is outside of the viewport」の
+# 再試行を繰り返して失敗する事象が発生した。ボタンがviewport内に収まって
+# いることをクリック前に確認する設計に変更したため、この確認を通過した
+# 状態でclick()が長時間ブロックする状況は本来起きないはずであり、既定の
+# 30秒よりも十分短い上限に絞ることで、想定外の場合でも早期にneeds_review
+# へ倒す。
+_LINK_BUTTON_CLICK_TIMEOUT_MS = 5000
+
 # 診断データが際限なく増えないよう、記録件数の上限を設ける。
 _MAX_DIAG_ENTRIES = 300
 
@@ -459,6 +473,23 @@ def _normalize_whitespace(text: str) -> str:
     の差異だけを検出できる。
     """
     return re.sub(r"\s+", "", text)
+
+
+def _bounding_box_within_viewport(box: dict, viewport: dict) -> bool:
+    """`bounding_box()`の矩形が、`viewport_size`の範囲に完全に収まって
+    いるかを判定する。
+
+    `_ensure_link_button_in_viewport()`から使う純粋関数として切り出し、
+    座標計算そのものの正しさを実際のブラウザ描画に依存せずテストできる
+    ようにしている。境界(矩形の右端・下端がviewportの右端・下端と
+    ちょうど一致する場合)は「収まっている」とみなす。
+    """
+    return (
+        box["x"] >= 0
+        and box["y"] >= 0
+        and (box["x"] + box["width"]) <= viewport["width"]
+        and (box["y"] + box["height"]) <= viewport["height"]
+    )
 
 
 class NotePosterError(RuntimeError):
@@ -512,6 +543,30 @@ class UrlInputObservationStop(NotePosterError):
     分かる)。read-backが不一致だった場合はこの例外ではなく、通常の
     NotePosterErrorを送出する(観測が成功した上での意図的な停止ではなく、
     実際に問題が起きたことを示すため)。
+    """
+
+
+class LinkButtonOutOfViewportError(NotePosterError):
+    """リンクボタンをクリックする前に、現在のviewport(表示領域)内に
+    収まっていることを確認できなかった場合に送出する(2026年8月29日)。
+
+    実機のGitHub Actions実行(TEST-004)で、リンクボタン自体は一意に特定
+    できていたにもかかわらず、Playwrightの`click()`が「element is
+    outside of the viewport」を繰り返し、既定の30秒タイムアウトいっぱい
+    まで失敗し続ける事象が発生した。設定済みのviewport高さ(800px)に対し、
+    ツールバーの実測`top`値(847px/871px)がこれを超えていたことから、
+    クリック対象が実際には現在のviewportに描画されていなかった可能性が
+    高いと判断した。
+
+    そのため、クリックする前に`scroll_into_view_if_needed()`を試みたうえ
+    で改めて`bounding_box()`を取得し、viewportの範囲に完全に収まっている
+    ことを確認するようにした。収まっていない場合は、`force=True`や
+    JavaScriptによる直接の`element.click()`のような、Playwrightの
+    actionability check(表示中か・安定しているか・viewport内かなど)を
+    迂回する手段には頼らず、推測でクリックせずにこの例外を送出して
+    needs_reviewへ安全停止する。通常のNotePosterErrorではなく専用の
+    サブクラスにしているのは、「リンクボタンがviewport外にあったために
+    クリックしなかった」ことをログから明確に区別できるようにするため。
     """
 
 
@@ -1582,7 +1637,7 @@ class NotePoster:
             出現待ちの後)ちょうど1件だけ存在する(ツールバーの外にある
             同名要素は対象にしない)
         """
-        toolbar = page.locator('div[role="toolbar"][data-active="true"]')
+        toolbar = page.locator(_ACTIVE_TOOLBAR_SELECTOR)
         self._wait_for_locator_to_appear(toolbar, timeout_ms)
         try:
             toolbar_count = toolbar.count()
@@ -1591,8 +1646,7 @@ class NotePoster:
         if toolbar_count != 1:
             self._capture_failure(page, "商品導線リンクツールバー特定")
             raise NotePosterError(
-                "選択中のフローティング編集ツールバー"
-                '(div[role="toolbar"][data-active="true"])が'
+                f"選択中のフローティング編集ツールバー({_ACTIVE_TOOLBAR_SELECTOR})が"
                 f"{timeout_ms}ms待っても{toolbar_count}件"
                 "でした(期待: 1件)。ツールバーを安全に特定できないため"
                 "処理を中断します。"
@@ -1614,6 +1668,109 @@ class NotePoster:
                 "特定できないため処理を中断します。"
             )
         return link_button
+
+    def _ensure_link_button_in_viewport(
+        self,
+        page: Page,
+        link_button: Locator,
+        timeout_ms: int = _LINK_BUTTON_CLICK_TIMEOUT_MS,
+    ) -> None:
+        """リンクボタンをクリックする前に、実際に現在のviewport(表示
+        領域)内に収まっていることを確認する。
+
+        timeout_ms はテストで待機時間を短縮するために公開している引数
+        であり、実際の呼び出し(_set_link_on_text_occurrence)では常に
+        デフォルト値(_LINK_BUTTON_CLICK_TIMEOUT_MS)を使う。
+
+        実機のGitHub Actions実行(TEST-004)で、`_find_active_link_toolbar_
+        button()`でボタン自体は一意に特定できていたにもかかわらず、
+        `click()`が「element is outside of the viewport」を繰り返し、
+        既定の30秒タイムアウトいっぱいまで失敗し続ける事象が発生した。
+        設定済みのviewport高さ(800px)に対し、ツールバーの実測`top`値
+        (847px/871px)がこれを超えていたことから、クリック対象が実際には
+        現在のviewportに描画されていなかった可能性が高いと判断した
+        (`viewport={"width": 1280, "height": 800}`という設定自体は今回
+        変更しない)。
+
+        以下を行う。
+          1. viewport・現在のスクロール位置・ツールバーとボタンの
+             `bounding_box()`を診断ログに記録する(原因切り分けのため)。
+          2. `link_button.scroll_into_view_if_needed()`を試みる
+             (固定`time.sleep()`は使わない。実行結果にかかわらず、
+             成否の判定は次のステップの実測値で行う)。
+          3. scroll後に改めて`bounding_box()`を取得し、ボタンの矩形が
+             viewportの範囲(`0 <= x`、`0 <= y`、`x + width <= viewport
+             幅`、`y + height <= viewport高さ`)に完全に収まっているかを
+             検証する。
+
+        `bounding_box()`が取得できない場合、またはviewportに完全には
+        収まっていない場合は、`force=True`やJavaScriptによる直接の
+        `element.click()`のような、Playwrightのactionability checkを
+        迂回する手段には頼らず、推測でクリックせずに`_capture_failure()`
+        でHTML/スクリーンショット/診断データを保存したうえで
+        `LinkButtonOutOfViewportError`を送出して安全停止する(呼び出し側
+        でneeds_reviewに倒れる)。
+        """
+        try:
+            viewport_size = page.viewport_size
+        except PlaywrightError:
+            viewport_size = None
+        try:
+            scroll_position = page.evaluate(
+                "() => ({x: window.scrollX, y: window.scrollY})"
+            )
+        except PlaywrightError:
+            scroll_position = None
+        try:
+            toolbar_box = page.locator(_ACTIVE_TOOLBAR_SELECTOR).bounding_box()
+        except PlaywrightError:
+            toolbar_box = None
+        try:
+            button_box_before = link_button.bounding_box()
+        except PlaywrightError:
+            button_box_before = None
+        logger.info(
+            "商品導線リンクボタン クリック前診断: viewport=%s scroll=%s "
+            "toolbar_bbox=%s button_bbox(scroll前)=%s",
+            viewport_size,
+            scroll_position,
+            toolbar_box,
+            button_box_before,
+        )
+
+        try:
+            link_button.scroll_into_view_if_needed(timeout=timeout_ms)
+        except PlaywrightError:
+            # scroll自体が失敗・timeoutしても、この後の実測bounding_box()
+            # で最終的にviewport内に収まったかどうかを判定するため、
+            # ここでは中断しない。
+            pass
+
+        try:
+            button_box_after = link_button.bounding_box()
+        except PlaywrightError:
+            button_box_after = None
+
+        if button_box_after is None or viewport_size is None:
+            self._capture_failure(page, "商品導線リンクボタンviewport確認")
+            raise LinkButtonOutOfViewportError(
+                "リンクボタンの位置(bounding_box)またはviewportサイズを"
+                f"取得できませんでした(button_bbox={button_box_after!r}, "
+                f"viewport={viewport_size!r})。安全にクリック可能な状態を"
+                "確認できないため処理を中断します。"
+            )
+
+        if not _bounding_box_within_viewport(button_box_after, viewport_size):
+            self._capture_failure(page, "商品導線リンクボタンviewport確認")
+            raise LinkButtonOutOfViewportError(
+                "リンクボタンをscroll_into_view_if_needed()した後も、"
+                f"表示範囲(viewport {viewport_size['width']}x"
+                f"{viewport_size['height']})に完全には収まっていません"
+                f"(bounding_box(scroll後)={button_box_after!r}、"
+                f"bounding_box(scroll前)={button_box_before!r}、"
+                f"スクロール位置={scroll_position!r})。安全にクリックできる"
+                "状態を確認できないため処理を中断します。"
+            )
 
     def _find_url_input_textarea(
         self, page: Page, timeout_ms: int = _URL_INPUT_APPEAR_TIMEOUT_MS
@@ -1705,6 +1862,24 @@ class NotePoster:
         `<a href>`が実際に生成されたかの確認や`_assert_links_match()`には
         まだ進まない。次回の実機テストでこの観測データを取得したのち、
         URLの確定方法を本実装する想定である。
+
+        ★リンクボタンクリック前のviewport確認・第3段階(2026年8月29日
+        時点、TEST-004の追加実機実行を踏まえた修正)★
+        上記の第2段階を実機で実行したところ、URL入力欄には到達せず、
+        リンクボタン自体のクリックが「element is outside of the
+        viewport」を繰り返して既定の30秒タイムアウトで失敗した。ボタン
+        自体は`_find_active_link_toolbar_button()`で一意に特定できていた
+        ため、原因はセレクタではなく、クリック対象が実際には現在の
+        viewport(1280x800)の外に描画されていたことだと判断した。これを
+        受けて、クリックの前に`_ensure_link_button_in_viewport()`で
+        `scroll_into_view_if_needed()`を試みたうえでボタンの`bounding_
+        box()`を実測し、viewportに完全に収まっていることを確認してから
+        でなければクリックしない設計に変更した。収まっていなければ
+        `force=True`やJavaScriptによる直接の`element.click()`のような
+        actionability checkを迂回する手段には頼らず、
+        `LinkButtonOutOfViewportError`で安全停止する。クリック自体の
+        タイムアウトも、既定の30秒ではなく短い上限
+        (`_LINK_BUTTON_CLICK_TIMEOUT_MS`)に変更した。
         """
         self._select_product_link_text_in_block(page, block)
 
@@ -1723,8 +1898,15 @@ class NotePoster:
             )
 
         link_button = self._find_active_link_toolbar_button(page)
+        self._ensure_link_button_in_viewport(page, link_button)
         self._assert_not_publish_action(link_button)
-        link_button.click()
+        try:
+            link_button.click(timeout=_LINK_BUTTON_CLICK_TIMEOUT_MS)
+        except PlaywrightError as exc:
+            self._capture_failure(page, "商品導線リンクボタンクリック失敗")
+            raise NotePosterError(
+                f"『{link.label}』のリンクボタンのクリックに失敗しました: {exc}"
+            ) from exc
 
         url_input = self._find_url_input_textarea(page)
         url_input.click()

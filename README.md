@@ -456,6 +456,44 @@ strict mode違反として例外(`playwright.sync_api.Error`。`TimeoutError`も
 扱い、位置ベースで1件を選んで先に進むことはしません(`count()`を改めて
 取り直してから安全停止します)。
 
+**クリック前のviewport確認**: この方式を実際にGitHub Actionsで実行した
+ところ、リンクボタン自体は`_find_active_link_toolbar_button()`で一意に
+特定できていたにもかかわらず、`click()`が「element is outside of the
+viewport」を繰り返し、既定の30秒タイムアウトいっぱいまで失敗し続ける
+事象が発生しました。設定済みのviewport高さ(`viewport={"width": 1280,
+"height": 800}`、この設定自体は変更していません)に対し、ツールバーの
+実測`top`値(847px/871px)がこれを超えていたことから、クリック対象が
+実際には現在のviewportに描画されていなかった可能性が高いと判断しました。
+
+そこで`_ensure_link_button_in_viewport()`を新設し、クリックの前に
+以下を行うようにしました。
+
+1. viewport・現在のスクロール位置・ツールバーとボタンの`bounding_box()`
+   を診断ログに記録する(原因切り分けのため)
+2. `link_button.scroll_into_view_if_needed()`を試みる(固定`time.sleep()`
+   は使いません)
+3. scroll後に改めて`bounding_box()`を取得し、ボタンの矩形がviewportの
+   範囲に完全に収まっているかを検証する(`_bounding_box_within_viewport()`
+   という純粋関数に切り出し、座標計算だけを実機DOMなしにテストできる
+   ようにしています)
+
+`bounding_box()`が取得できない場合、またはviewportに完全には収まって
+いない場合は、`force=True`(Playwrightのactionability check全体を無効化
+する)やJavaScriptによる直接の`element.click()`(ブラウザの実際の
+ポインタイベント処理・被覆判定を経由しない)のような、実際にユーザーが
+クリックできる状態かどうかの保証を失う手段には一切頼らず、推測でクリック
+せずに`LinkButtonOutOfViewportError`を送出して安全停止します
+(`needs_review`に倒れます)。この2つの手段は「曖昧・不安定なら推測せず
+needs_review」という設計方針と正面から矛盾するため、今回も今後も採用
+しません。
+
+viewport内に収まっていることを確認できた場合のみ、`_assert_not_publish_
+action()`を適用したうえで`click()`します。このクリック自体のタイムアウト
+も、既定の30秒(Playwrightの既定値)ではなく、短い上限
+(`_LINK_BUTTON_CLICK_TIMEOUT_MS`、既定5000ms)に変更しました。viewport
+確認を通過した状態でclick()が長時間ブロックする状況は本来起きないはずで
+あり、想定外の場合でも早期に`needs_review`へ倒すためです。
+
 クリックの前には、`_select_product_link_text_in_block()`で対象の
 「→ 商品を見る」だけを選択し、`window.getSelection().toString()`を
 読み取って選択内容が期待通り「→ 商品を見る」そのものであることを確認する
@@ -642,6 +680,14 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
     (`_capture_failure()`)自体もURL入力欄のフォーカスを奪う操作を含まない
     ことを確認済みである。この制約は、次回の実機テストで取得した観測
     データを元にURL確定方法の本実装を行うまで維持する
+17. 商品リンクのリンクボタンをクリックする前には、`bounding_box()`を実測
+    してviewportの範囲に完全に収まっていることを確認する
+    (`_ensure_link_button_in_viewport()`)。収まっていない場合は
+    `force=True`(actionability checkの無効化)やJavaScriptによる直接の
+    `element.click()`のような、実際にクリック可能かどうかの保証を失う
+    手段には頼らず、`LinkButtonOutOfViewportError`で安全停止する。
+    クリック自体のタイムアウトも既定の30秒ではなく短い上限
+    (`_LINK_BUTTON_CLICK_TIMEOUT_MS`)にする
 
 ## 12. Phase 1 実機検証記録
 
@@ -655,6 +701,7 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
 | `TEST-004`(追加観測) | ショートカット無反応時のツールバー実DOM確認(04/05/06のArtifact) | `needs_review`(ショートカット方式を撤去し、ツールバーボタン方式の観測専用実装へ変更。対応不要) |
 | `TEST-004`(ツールバーボタン方式・再実行) | ツールバーボタン方式の実機実行 | `needs_review`(「0件」判定が出現タイミングの非同期遅延によるものと判明。待機処理を追加。対応不要) |
 | `TEST-004`(URL入力欄の観測) | リンクボタンクリック後のURL入力UIの実DOM確認 | `needs_review`(URL入力欄のセレクタを確認し、URL入力→read-back確認までの観測専用実装・第2段階を追加。対応不要) |
+| `TEST-004`(リンクボタンクリック失敗) | ツールバーボタンクリック時のviewport外エラーの解析 | `needs_review`(クリックがviewport外で30秒timeoutすることが判明。クリック前のviewport確認・安全停止を追加。対応不要) |
 
 `TEST-003`(2026年8月28日)での確認事項:
 GitHub Actions=Success / Sheets status=`draft_created` / note_url正常記録 /
@@ -743,6 +790,27 @@ Stop`とはログ上で区別可能)、不一致時は通常の`NotePosterError`
 クリックのいずれも)はまだ実装していない。この観測専用実装・第2段階は
 ローカルpytestでの確認のみで、まだ実際のGitHub Actions実行では検証して
 いない。
+
+`TEST-004`(リンクボタンクリック失敗)で判明した事項: 上記の観測専用
+実装・第2段階を実機で実行したところ、URL入力欄には到達せず、リンク
+ボタン自体のクリックが「element is outside of the viewport」を繰り返し、
+既定の30秒タイムアウトで失敗した。ボタン自体は`_find_active_link_
+toolbar_button()`で一意に特定できていたため、原因はセレクタではなく、
+設定済みのviewport高さ(800px)に対しツールバーの実測`top`値(847px/
+871px)がこれを超えており、クリック対象が実際には現在のviewportに
+描画されていなかったことだと判断した。これを受けて`_ensure_link_
+button_in_viewport()`を新設し、クリック前に`scroll_into_view_if_
+needed()`を試みたうえで`bounding_box()`を実測し、viewportに完全に
+収まっていることを確認してからでなければクリックしない設計に変更した
+(詳細は「10. 商品リンク」)。`force=True`やJavaScriptによる直接の
+`element.click()`のような、Playwrightのactionability checkを迂回する
+手段は採用せず、収まっていない場合は`LinkButtonOutOfViewportError`で
+安全停止する。クリック自体のタイムアウトも既定の30秒から短い上限
+(`_LINK_BUTTON_CLICK_TIMEOUT_MS`、既定5000ms)に変更した。viewportの
+設定(1280x800)自体、および「エディタのガイド」パネルを閉じる操作は、
+今回は変更していない(まずscroll_into_view_if_needed()とbounding_box()
+検証だけで問題が解消するかを単独で確認するため)。この変更もローカル
+pytestでの確認のみで、まだ実際のGitHub Actions実行では検証していない。
 
 `ARTICLE-001`は人間が確認するまで`status`を`ready`に戻さない
 (対応済み・変更していない)。

@@ -20,12 +20,14 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 from src.models import Article
 from src.note import (  # noqa: E402
     LinkButtonObservationStop,
+    LinkButtonOutOfViewportError,
     NotePoster,
     NotePosterError,
     ProductLink,
     ProductLinkValidationError,
     TagValidationError,
     UrlInputObservationStop,
+    _bounding_box_within_viewport,
     _normalize_whitespace,
     build_body_with_hashtags,
     build_product_links_trailer,
@@ -888,6 +890,7 @@ _LINK_TOOLBAR_HTML = """
 """
 
 _URL_INPUT_SELECTOR_FOR_TESTS = 'textarea[placeholder="https://"][inputmode="text"][name="alt"]'
+_ACTIVE_TOOLBAR_SELECTOR_FOR_TESTS = 'div[role="toolbar"][data-active="true"]'
 
 
 def test_apply_product_links_clicks_toolbar_button_and_inputs_url_then_stops_for_observation(page):
@@ -1416,6 +1419,162 @@ def test_set_link_on_text_occurrence_inputs_url_then_raises_url_input_observatio
     assert url_input.input_value() == link.url
     # URL確定操作は行っていないため、<a>要素はまだ作られていない。
     assert page.locator(".editor a").count() == 0
+
+
+# -- _bounding_box_within_viewport(viewport境界判定の純粋関数) -------------
+#
+# _ensure_link_button_in_viewport() から座標計算部分だけを切り出した純粋
+# 関数。実際のブラウザ描画に依存せず、境界値を含めて判定の正しさを直接
+# 確認できる。
+
+
+def test_bounding_box_within_viewport_accepts_box_touching_the_edges():
+    viewport = {"width": 1280, "height": 800}
+    # 右端・下端がちょうどviewportの右端・下端と一致する場合は「収まって
+    # いる」とみなす。
+    assert _bounding_box_within_viewport(
+        {"x": 0, "y": 0, "width": 1280, "height": 800}, viewport
+    )
+    assert _bounding_box_within_viewport(
+        {"x": 1270, "y": 790, "width": 10, "height": 10}, viewport
+    )
+
+
+def test_bounding_box_within_viewport_rejects_box_outside_each_edge():
+    viewport = {"width": 1280, "height": 800}
+    assert not _bounding_box_within_viewport(
+        {"x": -1, "y": 0, "width": 10, "height": 10}, viewport
+    )
+    assert not _bounding_box_within_viewport(
+        {"x": 0, "y": -1, "width": 10, "height": 10}, viewport
+    )
+    assert not _bounding_box_within_viewport(
+        {"x": 1271, "y": 0, "width": 10, "height": 10}, viewport
+    )
+    assert not _bounding_box_within_viewport(
+        {"x": 0, "y": 791, "width": 10, "height": 10}, viewport
+    )
+
+
+# -- _ensure_link_button_in_viewport(クリック前のviewport確認・安全停止) --
+#
+# 実機のGitHub Actions実行(TEST-004)で、リンクボタン自体は一意に特定
+# できていたにもかかわらず、click()が「element is outside of the
+# viewport」を繰り返して既定の30秒タイムアウトで失敗する事象が発生した。
+# 以下はこの状況をローカルの疑似ページで再現し、force=True・JavaScript
+# clickのような迂回手段を使わずに安全停止できることを確認するテスト。
+
+
+def test_ensure_link_button_in_viewport_succeeds_after_scrolling_into_view(page):
+    # ページ読み込み直後はviewport外(はるか下)にあるボタンでも、
+    # scroll_into_view_if_needed()によって実際にviewport内へ入れば
+    # 例外を送出せず先に進めることを確認する(通常の書類順の要素なので、
+    # 本物のスクロールで到達可能なケース)。
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        """
+        <div style="height: 2000px;"></div>
+        <div data-active="true" role="toolbar" id="desktop-toolbar">
+          <button aria-label="リンク" style="width: 40px; height: 40px;">リンク</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+    link_button = page.locator(f'{_ACTIVE_TOOLBAR_SELECTOR_FOR_TESTS} button[aria-label="リンク"]')
+
+    poster._ensure_link_button_in_viewport(page, link_button)  # 例外が出なければOK
+
+    box = link_button.bounding_box()
+    assert box is not None
+    assert box["y"] + box["height"] <= 600
+
+
+def test_ensure_link_button_in_viewport_raises_when_still_out_of_viewport_after_scroll(page):
+    # position: fixedでviewportの高さを超えるtopを持つ要素は、window単位の
+    # スクロールでは絶対にviewport内へ入らない(実機で観測されたのと同じ
+    # 状況を再現)。scroll_into_view_if_needed()を試みても解決しないため、
+    # 推測でクリックせず安全停止することを確認する。
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        """
+        <div data-active="true" role="toolbar" id="desktop-toolbar"
+             style="position: fixed; top: 900px; left: 10px;">
+          <button aria-label="リンク">リンク</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+    link_button = page.locator(f'{_ACTIVE_TOOLBAR_SELECTOR_FOR_TESTS} button[aria-label="リンク"]')
+
+    with pytest.raises(LinkButtonOutOfViewportError):
+        poster._ensure_link_button_in_viewport(page, link_button, timeout_ms=500)
+
+
+def test_ensure_link_button_in_viewport_raises_when_bounding_box_is_none(page):
+    # bounding_box()がNone(非表示等で取得できない)の場合も、推測せず
+    # 安全停止することを確認する。
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        """
+        <div data-active="true" role="toolbar" id="desktop-toolbar">
+          <button aria-label="リンク" style="display:none;">リンク</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+    link_button = page.locator(f'{_ACTIVE_TOOLBAR_SELECTOR_FOR_TESTS} button[aria-label="リンク"]')
+
+    with pytest.raises(LinkButtonOutOfViewportError):
+        poster._ensure_link_button_in_viewport(page, link_button, timeout_ms=300)
+
+
+def test_ensure_link_button_in_viewport_does_not_use_force_or_javascript_click():
+    """クリック前のviewport確認処理が、force=Trueによるactionability
+    check迂回や、JavaScript経由の直接クリック(el.click()等)を一切
+    使っていないことをソースから確認する回帰テスト。
+    """
+    import inspect
+
+    for func in (
+        NotePoster._ensure_link_button_in_viewport,
+        NotePoster._set_link_on_text_occurrence,
+    ):
+        source = inspect.getsource(func)
+        # docstring本文(説明文中の "force=True" 等の言及)を除いた、実際の
+        # コード部分だけを検査対象にする。
+        code_only = source.replace(func.__doc__ or "", "")
+        assert "force=True" not in code_only
+        assert "force = True" not in code_only
+        assert ".click()\"" not in code_only
+        assert "el.click(" not in code_only
+        assert "el => el.click" not in code_only
+
+
+def test_link_button_click_timeout_is_much_shorter_than_playwright_default():
+    from src import note as note_module
+
+    # Playwright既定の30秒(30000ms)より十分短い上限になっていることを
+    # 確認する(既定のまま長時間の再試行に頼らない設計であることの確認)。
+    assert 0 < note_module._LINK_BUTTON_CLICK_TIMEOUT_MS < 30000
+
+
+def test_set_link_on_text_occurrence_source_uses_short_click_timeout():
+    import inspect
+
+    source = inspect.getsource(NotePoster._set_link_on_text_occurrence)
+    assert "link_button.click(timeout=_LINK_BUTTON_CLICK_TIMEOUT_MS)" in source
+
+
+def test_viewport_size_is_still_1280x800():
+    """今回はviewportサイズを変更していないことを確認する回帰テスト
+    (1280x800のまま)。
+    """
+    import inspect
+
+    from src.note import NotePoster as _NP
+
+    source = inspect.getsource(_NP.__enter__)
+    assert 'viewport={"width": 1280, "height": 800}' in source
 
 
 # -- _find_url_input_textarea(実機Artifactで確認したURL入力欄構造) --------
