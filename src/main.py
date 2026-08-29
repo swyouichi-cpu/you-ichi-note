@@ -67,6 +67,7 @@ def cmd_fetch(_args: argparse.Namespace) -> int:
     logger.info("  tags=%s", article.tags)
     logger.info("  content_type=%s", article.content_type)
     logger.info("  本文の文字数=%d", len(article.body))
+    logger.info("  product_links列の文字数=%d", len(article.product_links))
     return 0
 
 

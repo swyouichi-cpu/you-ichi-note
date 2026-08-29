@@ -141,6 +141,79 @@ name=本文・class名に body/editor を含むcontenteditable、という候補
 残しているが、位置ベースの無条件フォールバックは引き続き用意しない
 (全滅時はneeds_reviewへ倒れる)。
 
+★商品リンク(本文末尾のテキストリンク方式)について★
+実機テストで、本文中にECサイトの生URLを置いたところ、noteのエディタが
+URLを自動的に商品カード(画像・商品名・価格・説明・購入導線を含む大きな
+埋め込み)へ変換してしまい、_assert_body_matches()のread-back検証が
+(正しく)不一致を検出してneeds_reviewへ安全停止する事象が発生した。
+この安全停止は正しい挙動であり、文字数差の許容や比較の緩和、read-back
+の無効化では対応しない。
+
+根本対策として、本文に生URLを一切含めない方式に変更した。人間が実機で
+確認した結果、noteのProseMirrorエディタでは、本文中の任意の文字列を
+選択すると選択範囲に応じたフローティングツールバーが表示され、その中の
+リンク(鎖アイコン)からURLを設定すると、その文字列だけがインラインリンク
+になり、商品カードへは変換されないことが確認された(2026年8月29日、人間の
+手動確認)。この方式をPlaywrightで自動化する。
+
+具体的には、Google Sheetsに新設した`product_links`列(JSON配列。
+`[{"label": "商品名", "url": "https://..."}, ...]`)から、本文末尾に
+
+  この記事に出てきた商品
+
+  {label1}
+  → 商品を見る
+
+  {label2}
+  → 商品を見る
+
+というプレーンテキストの導線セクションを組み立てて本文に追記し
+(build_product_links_trailer())、その後で「→ 商品を見る」という
+固定文言(_PRODUCT_LINK_TEXT)だけをN番目の出現ごとに選択してリンクを
+設定する(_apply_product_links())。ECの生URLは本文の文字列としては
+一切登場せず、href属性としてのみ設定される。`product_links`が空または
+`[]`の場合は導線セクション自体を追加しない(タグ0件時の設計と同じ)。
+不正なJSON・必須フィールド欠落・不正なURL形式は、タグの内部空白と同じ
+思想で自動修正せずProductLinkValidationErrorを送出してneeds_reviewへ
+倒す(ARTICLE-001に限らず、どの記事にも同じロジックが適用される)。
+
+★選択操作は位置ベースフォールバックではない★
+「→ 商品を見る」というテキストは複数の商品がある場合、本文中に複数回
+出現する。これをN番目の出現として`page.get_by_text(...).nth(N)`で
+選択するが、これは _fill_body() で撤去した「画面上に見えるN番目の
+contenteditable要素」のような構造推測とは性質が異なる。ここでのNは、
+noteのDOM構造を推測しているのではなく、**このコード自身が直前に生成した
+既知のテキスト**の出現順序を、内容(テキスト一致)で特定したうえで数えて
+いるだけである。それでも安全のため、本文中の「→ 商品を見る」の出現数が
+`product_links`の件数と一致しない場合(人間が書いた本文に偶然同じ文言が
+含まれていた等)は、どれがどのリンクに対応するか一意に定まらないため、
+リンクを設定せずneeds_reviewへ安全停止する。
+
+★リンク設定UIのセレクタについて(未確定・要実機検証)★
+本文editorのセレクタ(ProseMirror)とは異なり、選択時に現れるフローティング
+ツールバーとリンクURL入力欄の正確なDOM構造は、まだ実機のHTMLダンプで
+確認できていない(人間による目視確認のみ)。そのため_apply_product_links()
+の候補セレクタは、一般的なリッチテキストエディタのツールバーで使われがちな
+role/aria属性に基づく複数候補であり、_fill_body()のProseMirror候補ほど
+確度が高いとは言えない。候補が一致しない場合は位置ベースの推測に頼らず
+NotePosterErrorで安全停止する(needs_reviewに倒れる)。実機で候補が
+一致しなかった場合は、_fill_body()のときと同様、失敗時の診断データ
+(スクリーンショット・HTMLダンプ)を元に、実際のDOM構造に基づいてセレクタ
+を更新する想定である。
+
+★本文テキスト検証とリンク検証の分離★
+_assert_body_matches()は引き続き「見えているテキスト」だけを検証する
+(商品リンク導入後も、本文には生URLが一切含まれないため、この検証で
+商品カード化が起きていないことも同時に確認できる。カード化が万一発生
+すれば、カードの追加テキストによって文字数が期待値からずれ、この検証が
+不一致として検出する)。これとは別に、_assert_links_match()が本文editor
+内の商品導線部分だけを対象に、リンク(<a>要素)のhref・アンカーテキストを
+個別に検証する。本文中に将来ふつうの参考リンク等が入る可能性があるため、
+本文editor内の<a>要素の総数を数える検証は行わない(商品導線として
+自分自身が生成した「→ 商品を見る」の出現箇所だけをスコープに検証する)。
+どちらか一方でも失敗すれば成功扱いにせず、下書き保存の前後両方で
+この2つの検証を行う。
+
 ★ログイン方式★
 メールアドレス・パスワードを直接入力させる方式は、note側のreCAPTCHA
 導入により機能しない可能性が高いため採用しない。代わりに、
@@ -180,6 +253,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -249,6 +323,23 @@ class TagValidationError(NotePosterError):
     """
 
 
+class ProductLinkValidationError(NotePosterError):
+    """product_links列の形式が不正で安全に解釈できない場合に送出する。
+
+    TagValidationErrorと同じ思想: 不正なJSON・必須フィールド欠落・
+    不正なURL形式などを推測で「直す」ことは絶対にせず、
+    呼び出し側(main.py)でneeds_reviewに振り分けられる。
+    """
+
+
+@dataclass(frozen=True)
+class ProductLink:
+    """本文末尾の商品導線1件分(表示する商品名と、リンク先URL)。"""
+
+    label: str
+    url: str
+
+
 # 本文とタグ行の間に挟む区切り。note公式ヘルプの案内どおり、本文末尾に
 # 5行分の改行を挟んでハッシュタグ行を追記する(仕様確定時の実装イメージ:
 # body + "\n\n\n\n\n" + hashtags)。
@@ -298,22 +389,122 @@ def normalize_tags(raw_tags: list[str]) -> list[str]:
     return normalized
 
 
-def build_body_with_hashtags(body: str, tags: list[str]) -> str:
-    """本文の末尾に、5行分の改行を挟んでハッシュタグ行を追加する。
+def build_body_with_hashtags(
+    body: str,
+    tags: list[str],
+    product_links: list[ProductLink] | None = None,
+) -> str:
+    """本文の末尾に、5行分の改行を挟んで商品導線・ハッシュタグ行を追加する。
 
     noteの現在のエディタでは、公開設定パネルでの一時的なタグ入力は
     「キャンセル」を押すと(note公式の仕様として)破棄される。
     note公式ヘルプが案内する「本文中に #タグ名 と直接書く」方式に
     統一する。
 
-    tags が空の場合は区切り文字列を一切追加せず、本文をそのまま返す
-    (Google Sheets側のbody/tags列自体はこの関数の呼び出し前後で
-    変更しない。あくまでnoteへ入力する直前に組み立てるだけ)。
+    product_links が指定されている場合、タグ行の手前に商品導線セクション
+    (build_product_links_trailer()の結果)を追加する。商品導線・タグの
+    いずれも無い場合は区切り文字列を一切追加せず、本文をそのまま返す
+    (Google Sheetsのbody/tags/product_links列自体はこの関数の呼び出し
+    前後で変更しない。あくまでnoteへ入力する直前に組み立てるだけ)。
+
+    ECの生URLはこの関数の戻り値のどこにも文字列として含まれない
+    (URLはhref属性としてのみ、_apply_product_links()が別途設定する)。
     """
-    if not tags:
-        return body
-    hashtag_line = " ".join(f"#{tag}" for tag in tags)
-    return f"{body}{_TAG_SEPARATOR}{hashtag_line}"
+    result = body
+    if product_links:
+        result = f"{result}{_TAG_SEPARATOR}{build_product_links_trailer(product_links)}"
+    if tags:
+        hashtag_line = " ".join(f"#{tag}" for tag in tags)
+        result = f"{result}{_TAG_SEPARATOR}{hashtag_line}"
+    return result
+
+
+# 商品導線で使う固定文言。リンクを設定する対象はこのテキストだけであり、
+# 商品名(label)はリンクしない通常テキストのまま表示する。
+_PRODUCT_LINK_TEXT = "→ 商品を見る"
+_PRODUCT_LINKS_HEADING = "この記事に出てきた商品"
+
+
+def build_product_links_trailer(product_links: list[ProductLink]) -> str:
+    """商品導線セクションのプレーンテキストを組み立てる(リンクはまだ無い)。
+
+    「この記事に出てきた商品」という見出しの下に、商品ごとに
+    「{label}\\n→ 商品を見る」を5行改行区切りで並べる。ECの生URLは
+    ここには一切登場しない(URLはこの後、_apply_product_links()が
+    「→ 商品を見る」というテキストだけにhrefとして設定する)。
+
+    見出し文言は特定の商品カテゴリ(例:ジャム)に依存しない汎用的な
+    ものにしている。ARTICLE-001のような特定記事向けのハードコードは
+    行わない。
+    """
+    entries = [f"{link.label}\n{_PRODUCT_LINK_TEXT}" for link in product_links]
+    return _PRODUCT_LINKS_HEADING + _TAG_SEPARATOR + _TAG_SEPARATOR.join(entries)
+
+
+def parse_product_links(raw: str) -> list[ProductLink]:
+    """Google Sheetsのproduct_links列(JSON配列の文字列)を解釈する。
+
+    許可する形式: `[{"label": "商品名", "url": "https://..."}, ...]`。
+    空文字列または `[]` は「商品導線なし」として空リストを返す
+    (build_body_with_hashtags()は導線セクションを追加しない)。
+
+    以下はいずれもTagValidationErrorと同じ思想で、推測で「直す」ことは
+    絶対にせず、ProductLinkValidationErrorを送出して呼び出し側で
+    needs_reviewに倒す。
+      - JSONとして解釈できない
+      - トップレベルが配列でない、または要素がオブジェクトでない
+      - label / url のいずれかが欠落、空、または文字列でない
+      - urlがhttp(s)の絶対URLとして解釈できない(スキームやホストが無い)
+    label/urlの前後の空白のみ除去する(タグ正規化と同じく、内部の空白は
+    書き換えない)。
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return []
+
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise ProductLinkValidationError(
+            f"product_links列がJSONとして読み取れません: {raw!r}。"
+            "安全のため自動では修正せず処理を中断します。"
+        ) from exc
+
+    if not isinstance(parsed, list):
+        raise ProductLinkValidationError(
+            f"product_links列はJSON配列である必要がありますが、"
+            f"{type(parsed).__name__} でした: {raw!r}。"
+        )
+
+    links: list[ProductLink] = []
+    for index, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            raise ProductLinkValidationError(
+                f"product_links[{index}] がオブジェクトではありません: {item!r}。"
+            )
+        label = item.get("label")
+        url = item.get("url")
+        if not isinstance(label, str) or not label.strip():
+            raise ProductLinkValidationError(
+                f"product_links[{index}] の label が空、または文字列では"
+                f"ありません: {item!r}。"
+            )
+        if not isinstance(url, str) or not url.strip():
+            raise ProductLinkValidationError(
+                f"product_links[{index}] の url が空、または文字列では"
+                f"ありません: {item!r}。"
+            )
+        url_stripped = url.strip()
+        parsed_url = urlsplit(url_stripped)
+        if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+            raise ProductLinkValidationError(
+                f"product_links[{index}] の url がhttp(s)の絶対URLとして"
+                f"解釈できません: {url!r}。安全のため自動では補完せず"
+                "処理を中断します。"
+            )
+        links.append(ProductLink(label=label.strip(), url=url_stripped))
+
+    return links
 
 
 class NotePoster:
@@ -652,16 +843,25 @@ class NotePoster:
         note公式ヘルプが案内する方式にならい、本文末尾に5行分の改行を
         挟んで「#タグ1 #タグ2」の形で追記してから本文入力欄へ入力する。
 
+        商品リンク(product_links)が指定されている場合、タグ行の手前に
+        「この記事に出てきた商品」という商品導線セクションを追記する。
+        ECの生URLは本文の文字列としては一切登場させず(自動カード化を
+        誘発するため)、「→ 商品を見る」という固定文言だけに、noteの
+        選択ツールバー経由でインラインリンクを設定する
+        (_apply_product_links)。
+
         本文入力欄は、タイトル入力欄と同一のDOM要素を誤って掴んでいない
         ことを確認したうえで使用し(_same_element)、実際に入力に使った
-        locatorから読み戻した内容が期待した本文と一致することを、
-        「下書き保存」を押す前と押した後の両方で確認する
-        (_assert_body_matches)。いずれかに失敗した場合は下書き保存を
-        行わない、または最終的な成功とはみなさずにNotePosterErrorを
-        送出する。
+        locatorから読み戻した内容が期待した本文と一致することを確認する
+        (_assert_body_matches)。商品リンクの設定内容も、本文editor内の
+        <a>要素を個別に検証する(_assert_links_match)。この2つの検証は
+        「下書き保存」を押す前と押した後の両方で行う。いずれかに失敗した
+        場合は下書き保存を行わない、または最終的な成功とはみなさずに
+        NotePosterErrorを送出する。
         """
         tags = normalize_tags(article.tag_list())
-        body_with_hashtags = build_body_with_hashtags(article.body, tags)
+        product_links = parse_product_links(article.product_links)
+        composed_body = build_body_with_hashtags(article.body, tags, product_links)
         hashtag_line = " ".join(f"#{tag}" for tag in tags) if tags else ""
 
         assert self._context is not None, "with文の中で使ってください"
@@ -689,21 +889,35 @@ class NotePoster:
         )
         self._screenshot(page, "02_title_filled")
 
-        logger.info("本文入力欄を特定して入力(末尾にタグを追記済み)")
+        logger.info("本文入力欄を特定して入力(末尾に商品導線・タグを追記済み)")
         body_locator = self._run_step(
             page,
             "本文入力",
-            lambda: self._fill_body(page, body_with_hashtags, title_locator=title_locator),
+            lambda: self._fill_body(page, composed_body, title_locator=title_locator),
         )
         self._screenshot(page, "03_body_filled")
 
-        logger.info("本文入力欄からの読み戻しで内容を確認(下書き保存前)")
+        if product_links:
+            logger.info("商品導線に本文末尾の商品導線を設定(%d件)", len(product_links))
+            self._run_step(
+                page,
+                "商品導線リンク設定",
+                lambda: self._apply_product_links(page, product_links),
+            )
+            self._screenshot(page, "04_product_links_applied")
+
+        logger.info("本文・商品導線の読み戻しで内容を確認(下書き保存前)")
         self._run_step(
             page,
             "本文read-back確認(保存前)",
             lambda: self._assert_body_matches(
-                page, body_locator, body_with_hashtags, hashtag_line, stage="保存前"
+                page, body_locator, composed_body, hashtag_line, stage="保存前"
             ),
+        )
+        self._run_step(
+            page,
+            "商品導線リンク確認(保存前)",
+            lambda: self._assert_links_match(page, product_links, stage="保存前"),
         )
 
         logger.info("自動保存の完了を確認")
@@ -711,18 +925,23 @@ class NotePoster:
 
         logger.info("下書き保存")
         self._run_step(page, "下書き保存", lambda: self._save_draft(page))
-        self._screenshot(page, "04_saved_draft")
+        self._screenshot(page, "05_saved_draft")
 
         logger.info("保存完了(自動保存表示の解消)を確認")
         self._run_step(page, "保存完了確認", lambda: self._wait_for_autosave_idle(page))
 
-        logger.info("本文入力欄からの読み戻しで内容を再確認(下書き保存後)")
+        logger.info("本文・商品導線の読み戻しで内容を再確認(下書き保存後)")
         self._run_step(
             page,
             "本文read-back確認(保存後)",
             lambda: self._assert_body_matches(
-                page, body_locator, body_with_hashtags, hashtag_line, stage="保存後"
+                page, body_locator, composed_body, hashtag_line, stage="保存後"
             ),
+        )
+        self._run_step(
+            page,
+            "商品導線リンク確認(保存後)",
+            lambda: self._assert_links_match(page, product_links, stage="保存後"),
         )
 
         note_url = page.url
@@ -950,6 +1169,206 @@ class NotePoster:
             f"タグ行一致={hashtag_ok} 実際の文字数(概算)={len(actual)} "
             f"期待した文字数(概算)={len(expected_body)}"
         )
+
+    # -- 商品導線(本文末尾のテキストリンク) ------------------------------------
+
+    def _apply_product_links(self, page: Page, product_links: list[ProductLink]) -> None:
+        """本文末尾の商品導線セクションにある「→ 商品を見る」だけに、
+        対応するURLをインラインリンクとして設定する。
+
+        本文editorには既に build_product_links_trailer() が生成した
+        プレーンテキスト(ECの生URLを含まない)が入力済みであることが前提。
+        「→ 商品を見る」という固定文言の、N番目の出現をproduct_links[N]と
+        対応付ける。この出現数と product_links の件数が一致しない場合
+        (人間が書いた本文に偶然同じ文言が含まれていた等)は、どの出現が
+        どのリンクに対応するか一意に定まらないため、推測でリンクを設定
+        せずNotePosterErrorで安全停止する。
+        """
+        if not product_links:
+            return
+
+        occurrences = page.get_by_text(_PRODUCT_LINK_TEXT, exact=True)
+        actual_count = occurrences.count()
+        if actual_count != len(product_links):
+            self._capture_failure(page, "商品導線リンク設定")
+            raise NotePosterError(
+                f"商品導線のリンク対象テキスト('{_PRODUCT_LINK_TEXT}')が本文中に"
+                f"{actual_count}件見つかりましたが、期待した件数は"
+                f"{len(product_links)}件でした。本文中に同じ文字列が意図せず"
+                "含まれている可能性があり、どの出現がどのリンクに対応するか"
+                "一意に定まらないため、誤ったリンク設定を避けて処理を"
+                "中断します。"
+            )
+
+        for index, link in enumerate(product_links):
+            self._set_link_on_text_occurrence(page, occurrences.nth(index), link)
+
+    def _set_link_on_text_occurrence(
+        self, page: Page, target: Locator, link: ProductLink
+    ) -> None:
+        """指定したテキスト要素を選択し、noteの選択ツールバーからリンクを設定する。
+
+        note.comのProseMirrorエディタでは、本文中の文字列を選択すると
+        フローティングツールバーが表示され、その中のリンク機能で選択範囲
+        だけにインラインリンクを設定できる(URLを商品カードへ変換せずに
+        済む方式であることを人間が実機で確認済み)。ただし、このツール
+        バー自体の正確なDOM構造(role/aria/class名)は、本文editorの
+        ProseMirror要素とは異なりまだ実機のHTMLダンプで確認できていない。
+        そのため以下の候補セレクタは一般的なリッチテキストエディタの
+        選択ツールバーで使われがちなrole/aria属性に基づく best-effort な
+        ものであり、_fill_body()のProseMirror候補ほどの確度は無い。
+
+        候補が一致しない場合は位置ベースの推測(例: ツールバー内の最初の
+        ボタン)に一切フォールバックせず、NotePosterErrorで安全停止する
+        (needs_reviewに倒れる)。実機で候補が一致しなかった場合は、
+        _fill_body()のときと同様、失敗時の診断データを元に実際のDOM構造
+        に基づいてセレクタを更新する。
+        """
+        target.select_text()
+
+        link_button_candidates = [
+            ("role=button name=リンク", page.get_by_role("button", name=re.compile("リンク"))),
+            (
+                "role=button name=link(英語UI保険)",
+                page.get_by_role("button", name=re.compile("link", re.IGNORECASE)),
+            ),
+            ("aria-label*=リンク", page.locator('[aria-label*="リンク"]')),
+        ]
+        link_button = self._resolve_locator(
+            page, link_button_candidates, step_name="リンク設定ボタン", timeout_ms=3000
+        )
+        self._assert_not_publish_action(link_button)
+        link_button.click()
+
+        url_input_candidates = [
+            ("css input[type=url]", page.locator('input[type="url"]')),
+            ("placeholder*=URL", page.get_by_placeholder(re.compile("URL", re.IGNORECASE))),
+            (
+                "role=textbox name=URL/リンク",
+                page.get_by_role("textbox", name=re.compile("URL|リンク", re.IGNORECASE)),
+            ),
+        ]
+        url_input = self._resolve_locator(
+            page, url_input_candidates, step_name="リンクURL入力欄", timeout_ms=3000
+        )
+        url_input.click()
+        url_input.press_sequentially(link.url, delay=10)
+        url_input.press("Enter")
+        try:
+            url_input.wait_for(state="hidden", timeout=3000)
+        except PlaywrightTimeoutError:
+            # 閉じたことを確認できなくても、成否は後続のread-back検証
+            # (_assert_links_match)で判断するため、ここでは中断しない。
+            pass
+
+    def _assert_links_match(
+        self,
+        page: Page,
+        product_links: list[ProductLink],
+        *,
+        stage: str,
+    ) -> None:
+        """商品導線セクションのリンクが、意図した通りに設定されているかを確認する。
+
+        本文editor内の<a>要素を総数で数える検証は行わない(本文には
+        将来ふつうの参考リンク等が入る可能性があるため)。代わりに、
+        自分自身が生成した商品導線の各エントリ(label / 「→ 商品を見る」)
+        だけをスコープに、以下を個別に確認する。
+          - 対応する商品名(label)のテキストが存在すること
+          - 商品名自体にはリンクが付いていないこと(誤って商品名まで
+            リンクになっていないか)
+          - 対応する「→ 商品を見る」のテキストが存在すること
+          - そこにちょうど1件の<a>要素があること(余計なリンクが
+            生成されていないこと)
+          - その<a>要素のテキストが「→ 商品を見る」と完全一致すること
+          - その<a>要素のhrefが期待したURLと一致すること
+        商品導線をこの方法で安全にスコープできない場合(出現数が合わない
+        等)も、推測はせずneeds_reviewへ安全停止する。
+        """
+        if not product_links:
+            return
+
+        link_text_occurrences = page.get_by_text(_PRODUCT_LINK_TEXT, exact=True)
+        actual_count = link_text_occurrences.count()
+        if actual_count != len(product_links):
+            self._capture_failure(page, f"商品導線リンク確認_{stage}")
+            raise NotePosterError(
+                f"商品導線リンクの確認({stage})で、リンク対象テキスト"
+                f"('{_PRODUCT_LINK_TEXT}')が{actual_count}件見つかりました"
+                f"(期待: {len(product_links)}件)。商品導線を安全にスコープ"
+                "できないため処理を中断します。"
+            )
+
+        mismatches: list[str] = []
+        for index, link in enumerate(product_links):
+            label_locator = page.get_by_text(link.label, exact=True)
+            if label_locator.count() < 1:
+                mismatches.append(f"『{link.label}』: 商品名のテキストが見つかりません")
+            else:
+                # get_by_text(exact=True)は完全一致テキストを持つ最も内側の
+                # 要素を返すため、商品名自体がリンクになっている場合は
+                # a要素自身が返る(その子にはa要素が無いため、子要素だけ
+                # 見ても誤ってリンク無しと判定してしまう)。
+                try:
+                    label_tag_name = (
+                        label_locator.first.evaluate("el => el.tagName") or ""
+                    ).upper()
+                except PlaywrightTimeoutError:
+                    label_tag_name = ""
+                label_anchor_count = (
+                    1 if label_tag_name == "A" else label_locator.first.locator("a").count()
+                )
+                if label_anchor_count != 0:
+                    mismatches.append(
+                        f"『{link.label}』: 商品名自体に{label_anchor_count}件の"
+                        "リンクが付いています(意図しないリンク)"
+                    )
+
+            link_text_locator = link_text_occurrences.nth(index)
+            # get_by_text(exact=True)は「その完全一致テキストを持つ、最も
+            # 内側の要素」を返す。リンク設定前は<p>→ 商品を見る</p>のような
+            # 構造で<p>自身が返るが、リンク設定後は<p><a>→ 商品を見る</a></p>
+            # のようにa要素の方が内側になるため、a要素自身が返る。そのため
+            # 「自分自身がa要素かどうか」でどちらの状態かを判定する。
+            try:
+                tag_name = (link_text_locator.evaluate("el => el.tagName") or "").upper()
+            except PlaywrightTimeoutError:
+                tag_name = ""
+            if tag_name == "A":
+                anchor_count = 1
+                anchor = link_text_locator
+            else:
+                anchors = link_text_locator.locator("a")
+                anchor_count = anchors.count()
+                anchor = anchors.first if anchor_count >= 1 else None
+            if anchor_count != 1 or anchor is None:
+                mismatches.append(
+                    f"『{link.label}』: 「{_PRODUCT_LINK_TEXT}」のリンク要素が"
+                    f"{anchor_count}件でした(期待: 1件)"
+                )
+                continue
+            try:
+                actual_text = (anchor.inner_text() or "").strip()
+            except PlaywrightTimeoutError:
+                actual_text = ""
+            actual_href = anchor.get_attribute("href") or ""
+            if actual_text != _PRODUCT_LINK_TEXT:
+                mismatches.append(
+                    f"『{link.label}』: リンクのテキストが{actual_text!r}でした"
+                    f"(期待: {_PRODUCT_LINK_TEXT!r})"
+                )
+            if actual_href != link.url:
+                mismatches.append(
+                    f"『{link.label}』: hrefが{actual_href!r}でした"
+                    f"(期待: {link.url!r})"
+                )
+
+        if mismatches:
+            self._capture_failure(page, f"商品導線リンク確認_{stage}")
+            raise NotePosterError(
+                f"商品導線リンクの確認({stage})で不一致が見つかりました: "
+                + " / ".join(mismatches)
+            )
 
     def _wait_for_autosave_idle(self, page: Page, timeout_ms: int = 15000) -> None:
         """自動保存中(「保存中」の表示)が消えるまで待つ。

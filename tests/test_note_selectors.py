@@ -17,13 +17,18 @@ pytest.importorskip("playwright")
 
 from playwright.sync_api import sync_playwright  # noqa: E402
 
+from src.models import Article
 from src.note import (  # noqa: E402
     NotePoster,
     NotePosterError,
+    ProductLink,
+    ProductLinkValidationError,
     TagValidationError,
     _normalize_whitespace,
     build_body_with_hashtags,
+    build_product_links_trailer,
     normalize_tags,
+    parse_product_links,
 )
 
 _NOTE_SOURCE_PATH = Path(__file__).resolve().parent.parent / "src" / "note.py"
@@ -541,6 +546,195 @@ def test_build_body_with_hashtags_returns_body_unchanged_when_no_tags():
     assert build_body_with_hashtags(body, []) == body
 
 
+# -- 商品導線(本文末尾のテキストリンク)のロジック(ブラウザ不要) -------------
+#
+# 実機テストで、本文中にECサイトの生URLを置いたところnoteが自動的に
+# 商品カードへ変換し、read-back検証が(正しく)不一致を検出して安全停止した。
+# 対策として、ECの生URLを本文の文字列としては一切登場させず、「→ 商品を
+# 見る」という固定文言だけにインラインリンクを設定する方式に変更した。
+# 以下はその組み立て・解析ロジック(parse_product_links /
+# build_product_links_trailer / build_body_with_hashtagsへの統合)の検証。
+
+
+def test_parse_product_links_empty_string_returns_empty_list():
+    assert parse_product_links("") == []
+    assert parse_product_links("   ") == []
+
+
+def test_parse_product_links_empty_array_returns_empty_list():
+    assert parse_product_links("[]") == []
+
+
+def test_parse_product_links_parses_single_entry():
+    raw = '[{"label": "TOY JAM 瀬戸内レモン", "url": "https://you-ichi.jp/?pid=192116331"}]'
+
+    result = parse_product_links(raw)
+
+    assert result == [
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331")
+    ]
+
+
+def test_parse_product_links_parses_multiple_entries_preserving_order():
+    raw = (
+        '[{"label": "商品A", "url": "https://example.com/a"}, '
+        '{"label": "商品B", "url": "https://example.com/b"}]'
+    )
+
+    result = parse_product_links(raw)
+
+    assert result == [
+        ProductLink(label="商品A", url="https://example.com/a"),
+        ProductLink(label="商品B", url="https://example.com/b"),
+    ]
+
+
+def test_parse_product_links_trims_surrounding_whitespace_only():
+    raw = '[{"label": "  商品A  ", "url": "  https://example.com/a  "}]'
+
+    result = parse_product_links(raw)
+
+    assert result == [ProductLink(label="商品A", url="https://example.com/a")]
+
+
+def test_parse_product_links_rejects_malformed_json():
+    with pytest.raises(ProductLinkValidationError):
+        parse_product_links("{not valid json")
+
+
+def test_parse_product_links_rejects_non_array_top_level():
+    with pytest.raises(ProductLinkValidationError):
+        parse_product_links('{"label": "商品A", "url": "https://example.com/a"}')
+
+
+def test_parse_product_links_rejects_non_object_element():
+    with pytest.raises(ProductLinkValidationError):
+        parse_product_links('["not-an-object"]')
+
+
+def test_parse_product_links_rejects_missing_label():
+    with pytest.raises(ProductLinkValidationError):
+        parse_product_links('[{"url": "https://example.com/a"}]')
+
+
+def test_parse_product_links_rejects_missing_url():
+    with pytest.raises(ProductLinkValidationError):
+        parse_product_links('[{"label": "商品A"}]')
+
+
+def test_parse_product_links_rejects_empty_label():
+    with pytest.raises(ProductLinkValidationError):
+        parse_product_links('[{"label": "   ", "url": "https://example.com/a"}]')
+
+
+def test_parse_product_links_rejects_url_without_scheme():
+    # 自動で "https://" を補完する等の推測修正は行わず、安全に停止する。
+    with pytest.raises(ProductLinkValidationError):
+        parse_product_links('[{"label": "商品A", "url": "example.com/a"}]')
+
+
+def test_parse_product_links_rejects_unsupported_scheme():
+    with pytest.raises(ProductLinkValidationError):
+        parse_product_links('[{"label": "商品A", "url": "ftp://example.com/a"}]')
+
+
+def test_build_product_links_trailer_single_entry():
+    trailer = build_product_links_trailer(
+        [ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331")]
+    )
+
+    assert trailer == (
+        "この記事に出てきた商品" + ("\n" * 5) + "TOY JAM 瀬戸内レモン" + "\n" + "→ 商品を見る"
+    )
+
+
+def test_build_product_links_trailer_multiple_entries():
+    trailer = build_product_links_trailer(
+        [
+            ProductLink(label="商品A", url="https://example.com/a"),
+            ProductLink(label="商品B", url="https://example.com/b"),
+        ]
+    )
+
+    assert trailer == (
+        "この記事に出てきた商品"
+        + ("\n" * 5)
+        + "商品A"
+        + "\n"
+        + "→ 商品を見る"
+        + ("\n" * 5)
+        + "商品B"
+        + "\n"
+        + "→ 商品を見る"
+    )
+
+
+def test_build_product_links_trailer_heading_is_generic_not_article_specific():
+    # ARTICLE-001向けの「この記事に出てきたジャム」のような特定記事専用の
+    # 文言をハードコードしていないことを確認する(汎用設計の要件)。
+    trailer = build_product_links_trailer(
+        [ProductLink(label="任意の商品", url="https://example.com/x")]
+    )
+
+    assert "ジャム" not in trailer
+    assert "この記事に出てきた商品" in trailer
+
+
+def test_build_body_with_hashtags_appends_product_links_trailer_without_tags():
+    body = "本文"
+    links = [ProductLink(label="商品A", url="https://example.com/a")]
+
+    result = build_body_with_hashtags(body, [], links)
+
+    assert result == body + ("\n" * 5) + build_product_links_trailer(links)
+
+
+def test_build_body_with_hashtags_orders_body_then_links_then_tags():
+    body = "本文"
+    links = [ProductLink(label="商品A", url="https://example.com/a")]
+
+    result = build_body_with_hashtags(body, ["テスト"], links)
+
+    assert result == (
+        body
+        + ("\n" * 5)
+        + build_product_links_trailer(links)
+        + ("\n" * 5)
+        + "#テスト"
+    )
+
+
+def test_build_body_with_hashtags_never_includes_raw_url_text():
+    # ECの生URLは、この関数の戻り値のどこにも文字列として含まれてはいけない
+    # (URLはhref属性としてのみ、_apply_product_links()が別途設定する)。
+    body = "本文"
+    links = [
+        ProductLink(label="商品A", url="https://you-ichi.jp/?pid=192116331"),
+        ProductLink(label="商品B", url="https://you-ichi.jp/?pid=191552342"),
+    ]
+
+    result = build_body_with_hashtags(body, ["テスト"], links)
+
+    for link in links:
+        assert link.url not in result
+
+
+def test_build_body_with_hashtags_with_no_links_and_no_tags_is_unchanged():
+    body = "タグも商品導線も無い記事の本文です。"
+
+    assert build_body_with_hashtags(body, [], []) == body
+    assert build_body_with_hashtags(body, [], None) == body
+
+
+def test_article_from_record_reads_product_links_and_defaults_to_empty():
+    without_column = Article.from_record(2, {"id": "a1"})
+    assert without_column.product_links == ""
+
+    raw = '[{"label": "商品A", "url": "https://example.com/a"}]'
+    with_column = Article.from_record(2, {"id": "a1", "product_links": raw})
+    assert with_column.product_links == raw
+
+
 def test_normalize_tags_strips_leading_hash():
     assert normalize_tags(["#テスト", "#自動投稿"]) == ["テスト", "自動投稿"]
 
@@ -630,3 +824,240 @@ def test_publish_related_labels_are_never_used_as_click_selectors():
                     f"note.py:{i} で公開系の文言 '{label}' がセレクタとして"
                     f"使われている可能性があります: {line!r}"
                 )
+
+
+# -- 商品導線リンクの設定・検証(実機で確認されたnoteの選択ツールバー方式) --
+#
+# 人間が実機で、本文中の「→ 商品を見る」だけを選択するとフローティング
+# ツールバーが表示され、リンク(鎖アイコン)からURLを設定すると商品カードへ
+# 変換されずインラインリンクになることを確認した。以下はそのUI操作を
+# ローカルの疑似ページで再現したテスト。ツールバー自体の正確なDOM構造は
+# 実機のHTMLダンプではまだ確認できていないため、ここでの疑似UIは
+# 「role=button name=リンク」「input[type=url]」という、_apply_product_links
+# が実際に試す候補の1つを模したものであり、実機と完全に一致する保証はない。
+
+_LINK_TOOLBAR_HTML = """
+<div class="editor" contenteditable="true">
+  <p>本文</p>
+  <p>この記事に出てきた商品</p>
+  <p>TOY JAM 瀬戸内レモン</p>
+  <p>→ 商品を見る</p>
+  <p>TOY JAM 瀬戸内レモン月桂樹</p>
+  <p>→ 商品を見る</p>
+</div>
+<div id="toolbar" style="display:none">
+  <button id="link-btn">リンク</button>
+</div>
+<input type="url" id="url-input" style="display:none">
+<script>
+  document.addEventListener('selectionchange', () => {
+    const sel = window.getSelection();
+    const toolbar = document.getElementById('toolbar');
+    if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
+      toolbar.style.display = 'block';
+    } else {
+      toolbar.style.display = 'none';
+    }
+  });
+  document.getElementById('link-btn').addEventListener('click', () => {
+    window.__savedRange = window.getSelection().getRangeAt(0).cloneRange();
+    document.getElementById('url-input').style.display = 'block';
+  });
+  document.getElementById('url-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const range = window.__savedRange;
+      const a = document.createElement('a');
+      a.href = document.getElementById('url-input').value;
+      a.textContent = range.toString();
+      range.deleteContents();
+      range.insertNode(a);
+      document.getElementById('url-input').style.display = 'none';
+      document.getElementById('toolbar').style.display = 'none';
+      document.getElementById('url-input').value = '';
+    }
+  });
+</script>
+"""
+
+
+def test_apply_product_links_sets_correct_href_on_each_occurrence(page):
+    page.set_content(_LINK_TOOLBAR_HTML)
+    poster = _bare_poster()
+    links = [
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+        ProductLink(label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"),
+    ]
+
+    poster._apply_product_links(page, links)
+
+    # get_by_text(exact=True)は完全一致テキストを持つ最も内側の要素を返す。
+    # リンク設定後は<p><a>→ 商品を見る</a></p>のようにa要素の方が内側になる
+    # ため、a要素自身が返る(_assert_links_matchと同じ理由)。
+    occurrences = page.get_by_text("→ 商品を見る", exact=True)
+    assert occurrences.nth(0).evaluate("el => el.tagName") == "A"
+    assert occurrences.nth(0).get_attribute("href") == links[0].url
+    assert occurrences.nth(1).evaluate("el => el.tagName") == "A"
+    assert occurrences.nth(1).get_attribute("href") == links[1].url
+    # 商品名自体はリンクされていない。
+    label_element = page.get_by_text("TOY JAM 瀬戸内レモン", exact=True).first
+    assert label_element.evaluate("el => el.tagName") != "A"
+    assert label_element.locator("a").count() == 0
+
+
+def test_apply_product_links_is_noop_when_no_links():
+    poster = _bare_poster()
+    # ページを用意せずとも、product_links が空なら何もせず正常終了するはず。
+    poster._apply_product_links(page=None, product_links=[])  # 例外が出なければOK
+
+
+def test_apply_product_links_raises_when_occurrence_count_mismatches(page):
+    # 「→ 商品を見る」が本文中に1件しか無いのに、2件のproduct_linksを
+    # 渡した場合、どちらがどちらに対応するか一意に定まらないため安全停止する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>商品A</p>"
+        "<p>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    links = [
+        ProductLink(label="商品A", url="https://example.com/a"),
+        ProductLink(label="商品B", url="https://example.com/b"),
+    ]
+
+    with pytest.raises(NotePosterError):
+        poster._apply_product_links(page, links)
+
+
+def test_set_link_on_text_occurrence_raises_when_toolbar_not_found(page):
+    # リンク設定UI(ツールバー・URL入力欄)が全く存在しないページでは、
+    # 位置ベースの推測に頼らずNotePosterErrorで安全停止する。
+    page.set_content('<div contenteditable="true"><p>→ 商品を見る</p></div>')
+    poster = _bare_poster()
+    target = page.get_by_text("→ 商品を見る", exact=True).first
+
+    with pytest.raises(NotePosterError):
+        poster._set_link_on_text_occurrence(
+            page, target, ProductLink(label="商品A", url="https://example.com/a")
+        )
+
+
+def test_set_link_on_text_occurrence_source_has_no_positional_fallback_candidates():
+    """リンク設定ボタン・URL入力欄の候補セレクタに、位置ベースの無条件
+    フォールバック(「最初の/2番目の」等)が使われていないことを確認する。
+    """
+    import inspect
+
+    source = inspect.getsource(NotePoster._set_link_on_text_occurrence)
+    assert "最終手段" not in source
+
+
+def _product_trailer_html(entries: list[tuple[str, str | None]]) -> str:
+    """(label, href_or_None) のリストから商品導線部分のHTMLを組み立てる。
+
+    hrefがNoneの場合はリンクされていないプレーンテキストのままにする
+    (「リンクが設定されていない」ケースの再現用)。
+    """
+    parts = []
+    for label, href in entries:
+        link_html = f'<a href="{href}">→ 商品を見る</a>' if href is not None else "→ 商品を見る"
+        parts.append(f"<p>{label}</p><p>{link_html}</p>")
+    return (
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>" + "".join(parts) + "</div>"
+    )
+
+
+def test_assert_links_match_passes_when_all_links_correct(page):
+    links = [ProductLink(label="商品A", url="https://example.com/a")]
+    page.set_content(_product_trailer_html([("商品A", "https://example.com/a")]))
+    poster = _bare_poster()
+
+    poster._assert_links_match(page, links, stage="保存前")  # 例外が出なければOK
+
+
+def test_assert_links_match_passes_when_no_links_expected():
+    poster = _bare_poster()
+    poster._assert_links_match(page=None, product_links=[], stage="保存前")  # 例外が出なければOK
+
+
+def test_assert_links_match_raises_on_href_mismatch(page):
+    links = [ProductLink(label="商品A", url="https://example.com/a")]
+    page.set_content(_product_trailer_html([("商品A", "https://example.com/WRONG")]))
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError, match="不一致"):
+        poster._assert_links_match(page, links, stage="保存前")
+
+
+def test_assert_links_match_raises_when_link_missing(page):
+    links = [ProductLink(label="商品A", url="https://example.com/a")]
+    page.set_content(_product_trailer_html([("商品A", None)]))
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._assert_links_match(page, links, stage="保存前")
+
+
+def test_assert_links_match_raises_when_label_itself_is_linked(page):
+    links = [ProductLink(label="商品A", url="https://example.com/a")]
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        '<p><a href="https://example.com/a">商品A</a></p>'
+        '<p><a href="https://example.com/a">→ 商品を見る</a></p>'
+        "</div>"
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._assert_links_match(page, links, stage="保存前")
+
+
+def test_assert_links_match_raises_when_occurrence_count_mismatches(page):
+    links = [
+        ProductLink(label="商品A", url="https://example.com/a"),
+        ProductLink(label="商品B", url="https://example.com/b"),
+    ]
+    page.set_content(_product_trailer_html([("商品A", "https://example.com/a")]))
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._assert_links_match(page, links, stage="保存前")
+
+
+def test_assert_links_match_ignores_unrelated_links_elsewhere_in_body(page):
+    # 本文中に将来ふつうの参考リンク等が入る可能性があるため、本文editor内の
+    # <a>要素の総数を数える検証は行わない設計であることを確認する。
+    links = [ProductLink(label="商品A", url="https://example.com/a")]
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        '<p>本文中に<a href="https://reference.example.com">参考リンク</a>があります</p>'
+        "<p>この記事に出てきた商品</p>"
+        "<p>商品A</p>"
+        '<p><a href="https://example.com/a">→ 商品を見る</a></p>'
+        "</div>"
+    )
+    poster = _bare_poster()
+
+    poster._assert_links_match(page, links, stage="保存前")  # 例外が出なければOK
+
+
+def test_assert_body_matches_detects_card_like_extra_content_in_product_trailer(page):
+    # 実機で発生した不具合(本文中の生URLがnoteによって商品カードへ自動
+    # 変換され、本文read-backで想定外の追加テキストが検出された)の再現。
+    # 商品導線方式に切り替えた後も、この検知能力自体は弱めていないことを
+    # 確認する回帰テスト。
+    page.set_content('<div contenteditable="true" class="editor"></div>')
+    poster = _bare_poster()
+    editor = page.locator(".editor")
+    expected = build_body_with_hashtags(
+        "本文", [], [ProductLink(label="商品A", url="https://example.com/a")]
+    )
+    # 商品カード化により、本来無いはずの追加テキストが混入した状況を再現する。
+    corrupted = expected + "商品画像 価格 購入する"
+    poster._set_multiline_text(page, editor, corrupted)
+
+    with pytest.raises(NotePosterError, match="一致しませんでした"):
+        poster._assert_body_matches(page, editor, expected, "", stage="保存前")

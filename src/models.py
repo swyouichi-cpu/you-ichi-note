@@ -47,6 +47,7 @@ COLUMNS = [
     "error_message",
     "created_at",
     "updated_at",
+    "product_links",
 ]
 
 
@@ -69,6 +70,7 @@ class Article:
     error_message: str = ""
     created_at: str = ""
     updated_at: str = ""
+    product_links: str = ""  # JSON配列の生文字列。詳細はsrc/note.pyのparse_product_links()を参照
 
     @classmethod
     def from_record(cls, row_number: int, record: dict) -> "Article":
@@ -88,6 +90,7 @@ class Article:
             error_message=str(record.get("error_message", "")),
             created_at=str(record.get("created_at", "")),
             updated_at=str(record.get("updated_at", "")),
+            product_links=str(record.get("product_links", "")),
         )
 
     def tag_list(self) -> list[str]:
