@@ -429,6 +429,22 @@ via_shortcut()`を削除)。
 のハッシュ)には一切依存しません。いずれかが1件でなければ`.first()`/
 `.nth()`等の推測に頼らず`needs_review`へ安全停止します。
 
+**出現タイミングの非同期遅延への対応**: 上記のセレクタを実際にGitHub
+Actionsで実行したところ、実行ログでは「ツールバーが0件」として安全停止
+していましたが、その直後に`_capture_failure()`が保存したHTMLダンプには
+実際にはツールバー(とリンクボタン)が存在していました。これはセレクタの
+誤りではなく、「→ 商品を見る」のテキスト選択が完了してからnoteが実際に
+ツールバーをDOMへマウントし`data-active="true"`にするまでの**短い非同期の
+遅延**を考慮していなかったことが原因でした。そこで`_find_active_link_
+toolbar_button()`に`_wait_for_locator_to_appear()`を組み込み、ツール
+バー・リンクボタンそれぞれについて、上限`_LINK_TOOLBAR_APPEAR_TIMEOUT_MS`
+(既定3000ms)だけ出現を待ってから、改めて`count()`で一意性を確認する
+設計に変更しました。固定の`time.sleep()`は使わず、Playwrightの
+`Locator.wait_for(state="visible")`による自動待機を使います。出現を
+待っても0件のまま、または出現後に複数件になった場合は、これまで通り
+`needs_review`へ安全停止します。セレクタ自体(`role`/`data-active`/
+`aria-label`)は変更していません。
+
 クリックの前には、`_select_product_link_text_in_block()`で対象の
 「→ 商品を見る」だけを選択し、`window.getSelection().toString()`を
 読み取って選択内容が期待通り「→ 商品を見る」そのものであることを確認する
@@ -590,6 +606,7 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
 | `ARTICLE-001` | 本文中の生URLによる商品カード自動変換の検証記録 | `needs_review`のまま(人間が確認するまで`ready`へ戻さない。対応不要) |
 | `TEST-004` | 商品導線リンク設定の実機DOM構造確認(GitHub Actions Run #23) | `needs_review`(リンク対象検出ロジックの不具合を発見・修正。対応不要) |
 | `TEST-004`(追加観測) | ショートカット無反応時のツールバー実DOM確認(04/05/06のArtifact) | `needs_review`(ショートカット方式を撤去し、ツールバーボタン方式の観測専用実装へ変更。対応不要) |
+| `TEST-004`(ツールバーボタン方式・再実行) | ツールバーボタン方式の実機実行 | `needs_review`(「0件」判定が出現タイミングの非同期遅延によるものと判明。待機処理を追加。対応不要) |
 
 `TEST-003`(2026年8月28日)での確認事項:
 GitHub Actions=Success / Sheets status=`draft_created` / note_url正常記録 /
@@ -644,6 +661,25 @@ URL入力UIを開かなかった。ユーザーが実機で取得したHTMLダ�
 **観測専用実装**にとどめている(詳細は「10. 商品リンク」)。この観測
 専用実装はローカルpytestでの確認のみで、まだ実際のGitHub Actions実行
 では検証していない。
+
+`TEST-004`(ツールバーボタン方式・再実行)で判明した事項:
+`_find_active_link_toolbar_button()`によるツールバーボタン方式を実際に
+GitHub Actionsで実行したところ、実行ログでは
+`div[role="toolbar"][data-active="true"]`が「0件」として安全停止した。
+しかし、その直後に`_capture_failure()`が保存したHTMLダンプを解析すると、
+実際にはツールバー(および内部の`aria-label="リンク"`ボタン)が1件ずつ
+存在していた。セレクタ自体は誤っておらず、「→ 商品を見る」のテキスト
+選択が完了してからnoteが実際にツールバーをDOMへマウントし
+`data-active="true"`にするまでの短い非同期の遅延を考慮していなかった
+ことが原因と判断した。これを受けて`_wait_for_locator_to_appear()`
+(Playwrightの`Locator.wait_for(state="visible")`による自動待機。固定
+`time.sleep()`は使わない)を導入し、ツールバー・リンクボタンそれぞれに
+ついて上限`_LINK_TOOLBAR_APPEAR_TIMEOUT_MS`(既定3000ms)だけ出現を
+待ってから改めて`count()`で一意性を確認する設計に変更した(詳細は
+「10. 商品リンク」)。セレクタ・観測専用実装の設計(クリック後は
+`LinkButtonObservationStop`で安全停止し、URL入力・確定操作は行わない)
+自体は変更していない。この待機処理の追加はローカルpytestでの確認のみで、
+まだ実際のGitHub Actions実行では再検証していない。
 
 `ARTICLE-001`は人間が確認するまで`status`を`ready`に戻さない
 (対応済み・変更していない)。

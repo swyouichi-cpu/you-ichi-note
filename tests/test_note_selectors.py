@@ -1090,6 +1090,16 @@ def test_select_product_link_text_in_block_raises_when_link_text_appears_twice(p
 #   <button aria-label="リンク">
 # がちょうど1件だけ存在することが判明した(class名等の推測ベースの属性には
 # 依存しない)。以下はこの実機DOM構造をローカルの疑似ページで再現したテスト。
+#
+# さらにTEST-004の実行ログとHTMLダンプを突き合わせた結果、「ツールバーが
+# 0件」という安全停止は、セレクタの誤りではなく「テキスト選択からツール
+# バーが実際にDOMへ出現しdata-active="true"になるまでの短い非同期の遅延」
+# が原因だったと判明した。以下のテストでは、この遅延をJSのsetTimeout()で
+# 再現し、_find_active_link_toolbar_button()が固定sleep()を使わずに
+# 出現を待てること、待っても出現しなければ安全停止することの両方を確認する。
+# 待機を伴わない安全停止系のテストでは、テスト全体の実行時間を抑えるため
+# 短いtimeout_ms(数百ms)を明示的に渡している(本番呼び出し側は常に
+# デフォルト値 _LINK_TOOLBAR_APPEAR_TIMEOUT_MS を使う)。
 
 
 def test_find_active_link_toolbar_button_finds_the_button(page):
@@ -1101,30 +1111,69 @@ def test_find_active_link_toolbar_button_finds_the_button(page):
     assert button.get_attribute("aria-label") == "リンク"
 
 
-def test_find_active_link_toolbar_button_raises_when_no_active_toolbar(page):
+def test_find_active_link_toolbar_button_succeeds_when_toolbar_appears_after_a_short_delay(page):
+    # 選択直後は0件でも、短時間後にツールバー(とその内部のリンクボタン)が
+    # DOMへ出現した場合は、固定sleepを使わずに検出できることを確認する。
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true"><p>本文</p></div>
+        <script>
+          setTimeout(() => {
+            const div = document.createElement('div');
+            div.setAttribute('data-active', 'true');
+            div.setAttribute('role', 'toolbar');
+            div.id = 'desktop-toolbar';
+            const btn = document.createElement('button');
+            btn.setAttribute('aria-label', 'リンク');
+            div.appendChild(btn);
+            document.body.appendChild(div);
+          }, 300);
+        </script>
+        """
+    )
+    poster = _bare_poster()
+
+    button = poster._find_active_link_toolbar_button(page, timeout_ms=2000)
+
+    assert button.get_attribute("aria-label") == "リンク"
+
+
+def test_find_active_link_toolbar_button_raises_when_toolbar_never_appears(page):
+    # timeoutまでツールバーが1件も出現しなければ、これまで通り推測せず
+    # needs_reviewへ安全停止する。テストを高速に保つため短いtimeoutを渡す。
     page.set_content('<div class="editor" contenteditable="true"><p>本文</p></div>')
     poster = _bare_poster()
 
     with pytest.raises(NotePosterError):
-        poster._find_active_link_toolbar_button(page)
+        poster._find_active_link_toolbar_button(page, timeout_ms=200)
 
 
-def test_find_active_link_toolbar_button_raises_when_multiple_active_toolbars(page):
+def test_find_active_link_toolbar_button_raises_when_multiple_toolbars_appear(page):
+    # 出現を待った後に改めてcount()を取り直し、複数件なら安全停止する
+    # ことを確認する(出現後の一意性の再検証)。
     page.set_content(
         """
         <div class="editor" contenteditable="true"><p>本文</p></div>
-        <div data-active="true" role="toolbar" id="desktop-toolbar">
-          <button aria-label="リンク">リンク</button>
-        </div>
-        <div data-active="true" role="toolbar" id="mobile-toolbar">
-          <button aria-label="リンク">リンク</button>
-        </div>
+        <script>
+          setTimeout(() => {
+            for (const id of ['desktop-toolbar', 'mobile-toolbar']) {
+              const div = document.createElement('div');
+              div.setAttribute('data-active', 'true');
+              div.setAttribute('role', 'toolbar');
+              div.id = id;
+              const btn = document.createElement('button');
+              btn.setAttribute('aria-label', 'リンク');
+              div.appendChild(btn);
+              document.body.appendChild(div);
+            }
+          }, 300);
+        </script>
         """
     )
     poster = _bare_poster()
 
     with pytest.raises(NotePosterError):
-        poster._find_active_link_toolbar_button(page)
+        poster._find_active_link_toolbar_button(page, timeout_ms=2000)
 
 
 def test_find_active_link_toolbar_button_ignores_inactive_toolbar(page):
@@ -1140,7 +1189,7 @@ def test_find_active_link_toolbar_button_ignores_inactive_toolbar(page):
     poster = _bare_poster()
 
     with pytest.raises(NotePosterError):
-        poster._find_active_link_toolbar_button(page)
+        poster._find_active_link_toolbar_button(page, timeout_ms=200)
 
 
 def test_find_active_link_toolbar_button_ignores_link_labeled_button_outside_toolbar(page):
@@ -1158,7 +1207,7 @@ def test_find_active_link_toolbar_button_ignores_link_labeled_button_outside_too
     poster = _bare_poster()
 
     with pytest.raises(NotePosterError):
-        poster._find_active_link_toolbar_button(page)
+        poster._find_active_link_toolbar_button(page, timeout_ms=200)
 
 
 def test_find_active_link_toolbar_button_raises_when_button_duplicated_inside_toolbar(page):
@@ -1174,7 +1223,75 @@ def test_find_active_link_toolbar_button_raises_when_button_duplicated_inside_to
     poster = _bare_poster()
 
     with pytest.raises(NotePosterError):
-        poster._find_active_link_toolbar_button(page)
+        poster._find_active_link_toolbar_button(page, timeout_ms=200)
+
+
+def test_find_active_link_toolbar_button_waits_when_only_the_button_appears_late(page):
+    # ツールバー自体は最初から存在するが、内部のリンクボタンだけが遅れて
+    # 出現するケース(ツールバー特定後、ボタン側の出現待ちが正しく働くこと
+    # の確認)。
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true"><p>本文</p></div>
+        <div data-active="true" role="toolbar" id="desktop-toolbar"></div>
+        <script>
+          setTimeout(() => {
+            const btn = document.createElement('button');
+            btn.setAttribute('aria-label', 'リンク');
+            document.getElementById('desktop-toolbar').appendChild(btn);
+          }, 300);
+        </script>
+        """
+    )
+    poster = _bare_poster()
+
+    button = poster._find_active_link_toolbar_button(page, timeout_ms=2000)
+
+    assert button.get_attribute("aria-label") == "リンク"
+
+
+def test_find_active_link_toolbar_button_raises_when_button_never_appears(page):
+    # ツールバーは存在するが、リンクボタンがtimeoutまで一度も出現しない
+    # 場合は安全停止する。
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true"><p>本文</p></div>
+        <div data-active="true" role="toolbar" id="desktop-toolbar">
+          <button aria-label="太字">B</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_active_link_toolbar_button(page, timeout_ms=200)
+
+
+def test_find_active_link_toolbar_button_does_not_use_fixed_sleep():
+    """固定sleepを使わず、Playwrightの自動待機に委ねていることを確認する。
+
+    note.pyがtimeモジュール自体をimportしていないことを確認する
+    (importしていなければ time.sleep() はそもそも呼びようがない)。
+    _find_active_link_toolbar_button / _wait_for_locator_to_appear の
+    ソース中に実際の関数呼び出しとしての "sleep(" が無いことも確認する
+    (docstring中の説明文言はここでは対象にしない)。
+    """
+    import inspect
+    import re
+
+    from src import note as note_module
+
+    assert not hasattr(note_module, "time")
+
+    for func in (
+        NotePoster._find_active_link_toolbar_button,
+        NotePoster._wait_for_locator_to_appear,
+    ):
+        source = inspect.getsource(func)
+        # docstring本文(説明文中の "time.sleep()" という言及)を除いた、
+        # 実際のコード部分だけを検査対象にする。
+        code_only = source.replace(func.__doc__ or "", "")
+        assert re.search(r"\bsleep\s*\(", code_only) is None
 
 
 # -- _set_link_on_text_occurrence(観測専用実装: クリック後は必ず安全停止) -----

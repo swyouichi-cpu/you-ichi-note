@@ -265,6 +265,21 @@ styled-components由来のハッシュには一切依存しない)。いずれ�
 なければ`.first()`/`.nth()`等の推測に頼らずNotePosterErrorで安全停止
 する。
 
+(4) 上記(3)の実装を実際にGitHub Actionsで実行したところ、実行ログ上は
+「ツールバーが0件」として安全停止していたが、その直後に`_capture_failure()`
+が保存したHTMLダンプには実際にはツールバー(とリンクボタン)が存在して
+いた。これはセレクタの誤りではなく、「→ 商品を見る」のテキスト選択が
+完了してからnoteが実際にツールバーをDOMへマウントし`data-active="true"`
+にするまでの短い非同期の遅延を考慮していなかったことが原因と判断した。
+そこで`_find_active_link_toolbar_button()`に`_wait_for_locator_to_appear()`
+(固定`time.sleep()`は使わず、Playwrightの`Locator.wait_for(state=
+"visible")`による自動待機を使う)を組み込み、ツールバー・リンクボタンの
+それぞれについて、上限`_LINK_TOOLBAR_APPEAR_TIMEOUT_MS`(既定3000ms)だけ
+出現を待ってから、改めて`count()`で一意性を確認する設計に変更した。出現
+を待っても0件のまま、または出現後に複数件になった場合は、これまで通り
+`needs_review`へ安全停止する。セレクタ自体(`role`/`data-active`/
+`aria-label`)は変更していない。
+
 ★観測専用実装であることについて(2026年8月29日時点)★
 ボタンをクリックした後に実際にどのようなURL入力UI(ポップオーバーか
 モーダルか、`input`要素か`contenteditable`か等)が出現するかは、まだ
@@ -375,6 +390,14 @@ _FORBIDDEN_PUBLISH_KEYWORDS = ["投稿する", "公開する", "予約投稿", "
 _SCREENSHOT_DIR = os.environ.get("NOTE_DEBUG_SCREENSHOT_DIR", "").strip()
 
 _DEFAULT_CANDIDATE_TIMEOUT_MS = 4000
+
+# 「→ 商品を見る」選択直後からnoteのフローティング編集ツールバーが実際に
+# DOMへ出現しvisibleになるまでの非同期の遅延を吸収するための待機上限
+# (TEST-004で判明: 選択直後は0件でも、実際には短時間後にツールバーが
+# 存在していた)。固定sleep()は使わず、Playwrightの自動待機と組み合わせて
+# この時間内だけ出現を待つ。時間内に出現しなければ推測せずneeds_reviewへ
+# 安全停止する。
+_LINK_TOOLBAR_APPEAR_TIMEOUT_MS = 3000
 
 # 診断データが際限なく増えないよう、記録件数の上限を設ける。
 _MAX_DIAG_ENTRIES = 300
@@ -1421,9 +1444,27 @@ class NotePoster:
                 "ため、推測で選択せず処理を中断します。"
             )
 
-    def _find_active_link_toolbar_button(self, page: Page) -> Locator:
+    def _wait_for_locator_to_appear(self, locator: Locator, timeout_ms: int) -> bool:
+        """locatorが指す要素が出現しvisibleになるのを、上限timeout_ms
+        (ミリ秒)だけ待つ。固定sleep()は使わず、Playwrightの自動待機
+        (`wait_for(state="visible")`)を使う。出現しないまま時間切れに
+        なった場合はFalseを返す(呼び出し側で安全停止の判断に使う)。
+        """
+        try:
+            locator.first.wait_for(state="visible", timeout=timeout_ms)
+            return True
+        except PlaywrightTimeoutError:
+            return False
+
+    def _find_active_link_toolbar_button(
+        self, page: Page, timeout_ms: int = _LINK_TOOLBAR_APPEAR_TIMEOUT_MS
+    ) -> Locator:
         """選択中のテキストに対して表示される、noteのフローティング編集
         ツールバー内の「リンク」ボタンを一意に特定する。
+
+        timeout_ms はテストで待機時間を短縮するために公開している引数
+        であり、実際の呼び出し(_set_link_on_text_occurrence)では常に
+        デフォルト値(_LINK_TOOLBAR_APPEAR_TIMEOUT_MS)を使う。
 
         実機のGitHub Actions実行(TEST-004の追加観測、04/05/06のHTML
         ダンプ)で、noteのフローティング編集ツールバーは
@@ -1438,17 +1479,41 @@ class NotePoster:
         ちょうど1件存在することが判明した。style属性内のclass名(`sc-xxxx`
         のようなstyled-components由来のハッシュ)には一切依存せず、
         `role`/`id`/`data-active`/`aria-label`という意味のある属性だけで
-        スコープする。
+        スコープする(このセレクタ自体はTEST-004で妥当性が確認できている
+        ため変更していない)。
+
+        ★出現タイミングの非同期遅延への対応(TEST-004の追加解析、2026年
+        8月29日)★
+        TEST-004の実行ログでは「ツールバーが0件」として安全停止していたが、
+        その直後に_capture_failure()が保存したHTMLには実際にはツールバー
+        (およびリンクボタン)が存在していた。これは「セレクタが間違って
+        いた」のではなく、「→ 商品を見る」のテキスト選択が完了してから
+        noteがフローティングツールバーを実際にDOMへマウントし
+        `data-active="true"`にするまでに短い非同期の遅延があり、選択直後に
+        即座に`count()`を呼んだ場合はまだ0件だった、という**タイミングの
+        問題**だったと判断できる。
+
+        そのため、いきなり`count()`を確認するのではなく、まず
+        `_wait_for_locator_to_appear()`で要素が出現しvisibleになるのを
+        短時間(`_LINK_TOOLBAR_APPEAR_TIMEOUT_MS`)だけ待つ。固定の
+        `time.sleep()`は使わず、Playwrightの自動待機の仕組みに委ねる。
+        待っても出現しなければ0件として扱い、これまで通り推測せず
+        `needs_review`へ安全停止する。出現した後は、必ず改めて`count()`を
+        取り直し、ちょうど1件であることを検証してから使う(複数件出現した
+        場合も安全停止する)。リンクボタン側についても同様に、ツールバーが
+        見つかった後で短時間だけ出現を待ってから一意性を確認する。
 
         以下のいずれかが成立しない場合は、位置ベースの推測(`.first()`/
         `.nth()`等)に頼らず、NotePosterErrorを送出して安全停止する
         (呼び出し側でneeds_reviewに倒れる)。
-          - `div[role="toolbar"][data-active="true"]` がページ内にちょうど
-            1件だけ存在する(選択中のツールバーを一意に特定できること)
-          - そのツールバー内に `button[aria-label="リンク"]` がちょうど
-            1件だけ存在する(ツールバーの外にある同名要素は対象にしない)
+          - `div[role="toolbar"][data-active="true"]` が(短時間の出現待ち
+            の後)ページ内にちょうど1件だけ存在する
+          - そのツールバー内に `button[aria-label="リンク"]` が(短時間の
+            出現待ちの後)ちょうど1件だけ存在する(ツールバーの外にある
+            同名要素は対象にしない)
         """
         toolbar = page.locator('div[role="toolbar"][data-active="true"]')
+        self._wait_for_locator_to_appear(toolbar, timeout_ms)
         try:
             toolbar_count = toolbar.count()
         except PlaywrightTimeoutError:
@@ -1458,11 +1523,13 @@ class NotePoster:
             raise NotePosterError(
                 "選択中のフローティング編集ツールバー"
                 '(div[role="toolbar"][data-active="true"])が'
-                f"{toolbar_count}件見つかりました(期待: 1件)。ツールバーを"
-                "安全に特定できないため処理を中断します。"
+                f"{timeout_ms}ms待っても{toolbar_count}件"
+                "でした(期待: 1件)。ツールバーを安全に特定できないため"
+                "処理を中断します。"
             )
 
         link_button = toolbar.locator('button[aria-label="リンク"]')
+        self._wait_for_locator_to_appear(link_button, timeout_ms)
         try:
             link_button_count = link_button.count()
         except PlaywrightTimeoutError:
@@ -1472,8 +1539,9 @@ class NotePoster:
             raise NotePosterError(
                 "ツールバー内の「リンク」ボタン"
                 '(button[aria-label="リンク"])が'
-                f"{link_button_count}件見つかりました(期待: 1件)。ボタンを"
-                "安全に特定できないため処理を中断します。"
+                f"{timeout_ms}ms待っても"
+                f"{link_button_count}件でした(期待: 1件)。ボタンを安全に"
+                "特定できないため処理を中断します。"
             )
         return link_button
 
