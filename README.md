@@ -543,14 +543,40 @@ noteのエディタは、`build_product_links_trailer()`が生成する
 あることは既に確認済みですが、念のためここでも一致するテキストノードの
 件数を数え、ちょうど1件でなければ推測で選択せず安全停止します。
 
-**リンクURL入力欄のセレクタについて(未確定・次回の実機テストで観測予定)**:
-ツールバーの「リンク」ボタンをクリックした後に現れるURL入力欄の正確な
-DOM構造は、この時点ではまだ一度も実機で観測できていません。前述の通り
-`_set_link_on_text_occurrence()`はボタンをクリックした直後に意図的に
-安全停止する観測専用実装であるため、推測でURL入力欄のセレクタ候補を
-実装することはしていません。次回の実機テストでボタンクリック直後の
-HTML/スクリーンショットを取得し、それを元に実際のDOM構造に基づいて
-URL入力からの本実装(URL入力→確定→read-back検証)を追加する想定です。
+**リンクURL入力欄のセレクタ(実機確認済み)と観測専用実装・第2段階**:
+ツールバーの「リンク」ボタンをクリックした後に現れるURL入力欄の実DOMを、
+追加の実機Artifactで確認できました。
+
+```html
+<textarea inputmode="text" name="alt" placeholder="https://"></textarea>
+<button aria-label="URLの入力をやめる"></button>
+```
+
+`_find_url_input_textarea()`が、`_URL_INPUT_SELECTOR =
+'textarea[placeholder="https://"][inputmode="text"][name="alt"]'`という、
+3つの独立した意味のある属性をすべて満たすセレクタで一意に特定します
+(class名には依存しません)。`placeholder`のみの案と比較検討した結果、
+`name`のような機能的な属性はUIコピー変更の影響を受けにくく、複数属性の
+AND条件は「どれか1つでも変われば安全に0件へ倒れる」という望ましい
+fail-closed特性を持つため、こちらを採用しました。特定方法は
+`_find_active_link_toolbar_button()`と同じ設計です。`_wait_for_locator_
+to_appear()`で出現・可視化を待ってから、改めて`count()`を取り直して
+ちょうど1件であることを検証します。timeout・0件・複数件・strict mode
+違反のいずれも、推測せず`needs_review`へ安全停止します。
+
+一意に特定できた場合のみ`product_links`の対象URLを入力し、入力に使った
+**同じlocator**から`input_value()`でread-backして期待したURLと完全一致
+することを確認します。一致すればHTML/スクリーンショット/診断データを
+保存したうえで`UrlInputObservationStop`(`LinkButtonObservationStop`とは
+ログ上で区別できる別のサブクラス)を送出して意図的に処理を止め、不一致
+であれば(可能な限り診断データを保存したうえで)通常の`NotePosterError`
+で安全停止します。ただし**URLの確定方法**(Enterキー送信・Tabキー送信・
+意図的なフォーカス解除・確定ボタンのクリック・他要素のクリックのいずれ
+も)はまだ実機で確認できていないため一切行いません。診断データの取得
+(`_capture_failure()`)自体もHTML取得・スクリーンショット・
+`page.evaluate()`のみで構成されており、URL入力欄のフォーカスを奪う操作
+は行いません。次回の実機テストでこの観測データを取得したのち、URLの
+確定方法を本実装する想定です。
 
 **検証方法(本文テキストとリンクの分離)**: `_assert_body_matches()`は
 引き続き「見えているテキスト」だけを検証します(商品リンク導入後も本文に
@@ -598,14 +624,24 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
     ちょうど1件であることを確認したうえでのみ特定し(`.first()`/`.nth()`
     は使わない)、クリック直前には他のボタンクリック箇所と同様に
     `_assert_not_publish_action()`を必ず適用する
-14. 商品リンクのリンクボタンをクリックした後に出現するURL入力UIの構造は
-    まだ実機で確認できていないため、現時点では**観測専用実装**とする
-    (`_set_link_on_text_occurrence()`)。ボタンクリック直後にHTML/
-    スクリーンショット/診断データを保存したうえで、意図的に
-    `LinkButtonObservationStop`を送出して処理を停止する。URL入力欄を
-    探す・URLを入力する・Enterを押す・確定ボタンを押す、という操作を
-    推測で追加しない。この制約は、次回の実機テストで取得した観測データを
-    元にURL入力UIの本実装を行うまで維持する
+14. 商品リンクのリンクボタンをクリックした後に出現するURL入力欄
+    (`textarea[placeholder="https://"][inputmode="text"][name="alt"]`)は
+    実機Artifactで構造を確認できたため、一意に特定できた場合のみURLを
+    入力し、入力に使った同じlocatorから`input_value()`でread-backして
+    完全一致を確認する。一致した場合はHTML/スクリーンショット/診断
+    データを保存したうえで、意図的に`UrlInputObservationStop`を送出して
+    処理を停止する(現時点では**観測専用実装**、`_set_link_on_text_
+    occurrence()`)。read-backが不一致の場合も(可能な限り)診断データを
+    保存したうえで通常の`NotePosterError`で安全停止する
+15. 商品リンクのURL入力欄が特定できない場合(0件・複数件・timeout・
+    strict mode違反)は、リンクボタンのクリック処理と同様に推測せず
+    `needs_review`へ安全停止する
+16. **URLの確定方法**(Enterキー送信・Tabキー送信・意図的なフォーカス
+    解除・確定ボタンのクリック・他要素のクリックのいずれも)はまだ実機で
+    確認できていないため、一切実装しない。診断データの取得
+    (`_capture_failure()`)自体もURL入力欄のフォーカスを奪う操作を含まない
+    ことを確認済みである。この制約は、次回の実機テストで取得した観測
+    データを元にURL確定方法の本実装を行うまで維持する
 
 ## 12. Phase 1 実機検証記録
 
@@ -618,6 +654,7 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
 | `TEST-004` | 商品導線リンク設定の実機DOM構造確認(GitHub Actions Run #23) | `needs_review`(リンク対象検出ロジックの不具合を発見・修正。対応不要) |
 | `TEST-004`(追加観測) | ショートカット無反応時のツールバー実DOM確認(04/05/06のArtifact) | `needs_review`(ショートカット方式を撤去し、ツールバーボタン方式の観測専用実装へ変更。対応不要) |
 | `TEST-004`(ツールバーボタン方式・再実行) | ツールバーボタン方式の実機実行 | `needs_review`(「0件」判定が出現タイミングの非同期遅延によるものと判明。待機処理を追加。対応不要) |
+| `TEST-004`(URL入力欄の観測) | リンクボタンクリック後のURL入力UIの実DOM確認 | `needs_review`(URL入力欄のセレクタを確認し、URL入力→read-back確認までの観測専用実装・第2段階を追加。対応不要) |
 
 `TEST-003`(2026年8月28日)での確認事項:
 GitHub Actions=Success / Sheets status=`draft_created` / note_url正常記録 /
@@ -691,6 +728,21 @@ GitHub Actionsで実行したところ、実行ログでは
 `LinkButtonObservationStop`で安全停止し、URL入力・確定操作は行わない)
 自体は変更していない。この待機処理の追加はローカルpytestでの確認のみで、
 まだ実際のGitHub Actions実行では再検証していない。
+
+`TEST-004`(URL入力欄の観測)で判明した事項: リンクボタンをクリックした
+後に実際に出現するURL入力UIの実DOM(`<textarea inputmode="text"
+name="alt" placeholder="https://"></textarea>`と、隣接する`aria-label=
+"URLの入力をやめる"`ボタン)を確認できた。これを受けて`_find_url_input_
+textarea()`(`_find_active_link_toolbar_button()`と同じ、待機→`count()`
+再確認の設計)を追加し、`_set_link_on_text_occurrence()`を「リンクボタン
+クリック→URL入力欄の特定→URL入力→同じlocatorからのread-back確認」まで
+進めた(詳細は「10. 商品リンク」)。read-back一致時は新設した
+`UrlInputObservationStop`で意図的に安全停止し(`LinkButtonObservation
+Stop`とはログ上で区別可能)、不一致時は通常の`NotePosterError`で安全
+停止する。URLの確定方法(Enter・Tab・フォーカス解除・確定ボタン・他要素
+クリックのいずれも)はまだ実装していない。この観測専用実装・第2段階は
+ローカルpytestでの確認のみで、まだ実際のGitHub Actions実行では検証して
+いない。
 
 `ARTICLE-001`は人間が確認するまで`status`を`ready`に戻さない
 (対応済み・変更していない)。

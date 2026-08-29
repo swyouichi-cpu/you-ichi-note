@@ -25,6 +25,7 @@ from src.note import (  # noqa: E402
     ProductLink,
     ProductLinkValidationError,
     TagValidationError,
+    UrlInputObservationStop,
     _normalize_whitespace,
     build_body_with_hashtags,
     build_product_links_trailer,
@@ -866,19 +867,35 @@ _LINK_TOOLBAR_HTML = """
   <button aria-label="引用">引用</button>
 </div>
 <script>
+  window.__urlInputKeys = [];
   document.querySelector('#desktop-toolbar button[aria-label="リンク"]')
     .addEventListener('click', (e) => {
       e.target.setAttribute('data-clicked', 'true');
+      // 実機で確認できたURL入力欄(TEST-004の追加観測)を再現する。
+      const textarea = document.createElement('textarea');
+      textarea.setAttribute('inputmode', 'text');
+      textarea.setAttribute('name', 'alt');
+      textarea.setAttribute('placeholder', 'https://');
+      textarea.addEventListener('keydown', (ev) => {
+        window.__urlInputKeys.push(ev.key);
+      });
+      const cancelButton = document.createElement('button');
+      cancelButton.setAttribute('aria-label', 'URLの入力をやめる');
+      document.body.appendChild(textarea);
+      document.body.appendChild(cancelButton);
     });
 </script>
 """
 
+_URL_INPUT_SELECTOR_FOR_TESTS = 'textarea[placeholder="https://"][inputmode="text"][name="alt"]'
 
-def test_apply_product_links_clicks_toolbar_button_then_stops_for_observation(page):
-    # クリック後のURL入力UIはまだ実機で確認できていないため、意図的に
-    # LinkButtonObservationStopで安全停止する(観測専用実装)。それでも
-    # 実際に「リンク」ボタンがクリックされたこと、URL入力・確定操作を
-    # 一切行っていない(<a>要素が作られていない)ことは確認する。
+
+def test_apply_product_links_clicks_toolbar_button_and_inputs_url_then_stops_for_observation(page):
+    # リンクボタンをクリックした先に出現するURL入力欄まで到達し、URLを
+    # 入力してread-backが一致することを確認したうえで、意図的に
+    # UrlInputObservationStopで安全停止する(観測専用実装・第2段階)。
+    # URLの確定操作(Enter/Tab/フォーカス解除/確定ボタン/他要素クリック)は
+    # 一切行わない。
     page.set_content(_LINK_TOOLBAR_HTML)
     poster = _bare_poster()
     body_locator = page.locator(".editor")
@@ -886,12 +903,24 @@ def test_apply_product_links_clicks_toolbar_button_then_stops_for_observation(pa
         ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
     ]
 
-    with pytest.raises(LinkButtonObservationStop):
+    with pytest.raises(UrlInputObservationStop):
         poster._apply_product_links(page, body_locator, links)
 
     button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
     assert button.get_attribute("data-clicked") == "true"
+
+    url_input = page.locator(_URL_INPUT_SELECTOR_FOR_TESTS)
+    assert url_input.input_value() == links[0].url
+    # URL確定操作を一切行っていないため、<a>要素はまだ作られていない。
     assert body_locator.locator("a").count() == 0
+    # Enter/Tabを送信していないことを確認する(press_sequentially由来の
+    # 文字キー以外が送られていないこと)。
+    sent_keys = page.evaluate("() => window.__urlInputKeys")
+    assert "Enter" not in sent_keys
+    assert "Tab" not in sent_keys
+    # 診断処理(_capture_failure)自身がフォーカスを外していないことも
+    # 確認する(URL入力欄がactiveElementのままであること)。
+    assert page.evaluate("() => document.activeElement.tagName") == "TEXTAREA"
 
 
 def test_apply_product_links_is_noop_when_no_links():
@@ -1372,22 +1401,153 @@ def test_set_link_on_text_occurrence_raises_when_block_has_no_matching_text_node
         )
 
 
-def test_set_link_on_text_occurrence_clicks_button_then_raises_observation_stop(page):
+def test_set_link_on_text_occurrence_inputs_url_then_raises_url_input_observation_stop(page):
     page.set_content(_LINK_TOOLBAR_HTML)
     poster = _bare_poster()
     block = page.locator(".editor p").nth(2)
+    link = ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a")
 
-    with pytest.raises(LinkButtonObservationStop):
-        poster._set_link_on_text_occurrence(
-            page,
-            block,
-            ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a"),
-        )
+    with pytest.raises(UrlInputObservationStop):
+        poster._set_link_on_text_occurrence(page, block, link)
 
     button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
     assert button.get_attribute("data-clicked") == "true"
-    # URL入力・確定操作は行っていないため、<a>要素はまだ作られていない。
+    url_input = page.locator(_URL_INPUT_SELECTOR_FOR_TESTS)
+    assert url_input.input_value() == link.url
+    # URL確定操作は行っていないため、<a>要素はまだ作られていない。
     assert page.locator(".editor a").count() == 0
+
+
+# -- _find_url_input_textarea(実機Artifactで確認したURL入力欄構造) --------
+#
+# TEST-004の追加観測で、リンクボタンをクリックした直後に
+#   <textarea inputmode="text" name="alt" placeholder="https://"></textarea>
+# というURL入力欄が出現することが判明した。以下はこの実機DOM構造を
+# ローカルの疑似ページで再現したテスト。
+
+_URL_INPUT_HTML = """
+<textarea inputmode="text" name="alt" placeholder="https://"></textarea>
+<button aria-label="URLの入力をやめる"></button>
+"""
+
+
+def test_find_url_input_textarea_selector_matches_the_confirmed_real_dom():
+    # 実機確認済みの3属性(placeholder/inputmode/name)すべてを満たす
+    # セレクタになっていることを確認する。
+    from src import note as note_module
+
+    assert note_module._URL_INPUT_SELECTOR == _URL_INPUT_SELECTOR_FOR_TESTS
+
+
+def test_find_url_input_textarea_finds_the_textarea(page):
+    page.set_content(_URL_INPUT_HTML)
+    poster = _bare_poster()
+
+    url_input = poster._find_url_input_textarea(page)
+
+    assert url_input.get_attribute("name") == "alt"
+    assert url_input.get_attribute("placeholder") == "https://"
+    assert url_input.get_attribute("inputmode") == "text"
+
+
+def test_find_url_input_textarea_succeeds_when_it_appears_after_a_short_delay(page):
+    # クリック直後は0件でも、短時間後にURL入力欄がDOMへ出現した場合は、
+    # 固定sleepを使わずに検出できることを確認する。
+    page.set_content(
+        """
+        <script>
+          setTimeout(() => {
+            const textarea = document.createElement('textarea');
+            textarea.setAttribute('inputmode', 'text');
+            textarea.setAttribute('name', 'alt');
+            textarea.setAttribute('placeholder', 'https://');
+            document.body.appendChild(textarea);
+          }, 300);
+        </script>
+        """
+    )
+    poster = _bare_poster()
+
+    url_input = poster._find_url_input_textarea(page, timeout_ms=2000)
+
+    assert url_input.get_attribute("placeholder") == "https://"
+
+
+def test_find_url_input_textarea_raises_when_it_never_appears(page):
+    page.set_content("<div>本文</div>")
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_url_input_textarea(page, timeout_ms=200)
+
+
+def test_find_url_input_textarea_raises_when_multiple_appear(page):
+    page.set_content(
+        """
+        <textarea inputmode="text" name="alt" placeholder="https://"></textarea>
+        <textarea inputmode="text" name="alt" placeholder="https://"></textarea>
+        """
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_url_input_textarea(page, timeout_ms=200)
+
+
+_LINK_TOOLBAR_HTML_WITH_MISBEHAVING_URL_INPUT = """
+<div class="editor" contenteditable="true">
+  <p>本文</p>
+  <p>この記事に出てきた商品</p>
+  <p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>
+</div>
+<div data-active="true" role="toolbar" id="desktop-toolbar">
+  <button aria-label="リンク">リンク</button>
+</div>
+<script>
+  document.querySelector('#desktop-toolbar button[aria-label="リンク"]')
+    .addEventListener('click', () => {
+      const textarea = document.createElement('textarea');
+      textarea.setAttribute('inputmode', 'text');
+      textarea.setAttribute('name', 'alt');
+      textarea.setAttribute('placeholder', 'https://');
+      // read-back不一致を再現するため、入力値を強制的に書き換える。
+      textarea.addEventListener('input', () => {
+        textarea.value = 'https://example.com/UNEXPECTED';
+      });
+      document.body.appendChild(textarea);
+    });
+</script>
+"""
+
+
+def test_set_link_on_text_occurrence_raises_when_url_readback_mismatches(page):
+    # 入力したURLとread-backした値が一致しない場合は、観測専用停止
+    # (UrlInputObservationStop)ではなく通常のNotePosterErrorで安全停止
+    # することを確認する。
+    page.set_content(_LINK_TOOLBAR_HTML_WITH_MISBEHAVING_URL_INPUT)
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(2)
+    link = ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/expected")
+
+    with pytest.raises(NotePosterError) as exc_info:
+        poster._set_link_on_text_occurrence(page, block, link)
+
+    assert not isinstance(exc_info.value, UrlInputObservationStop)
+
+
+def test_set_link_on_text_occurrence_logs_diagnostics_on_readback_mismatch(page, caplog):
+    # read-back不一致の場合も、_capture_failure() 経由で診断サマリの
+    # ログが出力されている(=Artifact保存処理が呼ばれている)ことを確認する。
+    page.set_content(_LINK_TOOLBAR_HTML_WITH_MISBEHAVING_URL_INPUT)
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(2)
+    link = ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/expected")
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(NotePosterError):
+            poster._set_link_on_text_occurrence(page, block, link)
+
+    assert "商品導線URL入力read-back不一致" in caplog.text
 
 
 def test_set_link_on_text_occurrence_applies_publish_action_guard_before_click(page):
@@ -1423,11 +1583,27 @@ def test_set_link_on_text_occurrence_source_has_no_positional_fallback_candidate
     for func in (
         NotePoster._set_link_on_text_occurrence,
         NotePoster._find_active_link_toolbar_button,
+        NotePoster._find_url_input_textarea,
         NotePoster._find_product_link_block,
         NotePoster._select_product_link_text_in_block,
     ):
         source = inspect.getsource(func)
         assert "最終手段" not in source
+
+
+def test_set_link_on_text_occurrence_source_never_confirms_the_url():
+    """URL入力後の確定操作(Enter/Tab送信、確定ボタンのクリック等)を
+    まだ一切実装していないことをソースから確認する回帰テスト。
+    """
+    import inspect
+
+    source = inspect.getsource(NotePoster._set_link_on_text_occurrence)
+    assert 'press("Enter")' not in source
+    assert 'press("Tab")' not in source
+    assert "URLの入力をやめる" not in source
+    # url_input自身への操作(click/press_sequentially/input_value)以外の
+    # 要素をクリックしていないことも確認する(他の場所をクリックしない)。
+    assert source.count(".click()") == 2  # link_button.click() と url_input.click()
 
 
 def _product_trailer_html(entries: list[tuple[str, str | None]]) -> str:

@@ -293,21 +293,37 @@ Error`。`TimeoutError`もこのサブクラス)を送出する。この例外�
 進むことはしない(`_wait_for_locator_to_appear()`はこの場合Falseを返し、
 呼び出し側が改めて`count()`で具体的な件数を確認してから安全停止する)。
 
-★観測専用実装であることについて(2026年8月29日時点)★
-ボタンをクリックした後に実際にどのようなURL入力UI(ポップオーバーか
-モーダルか、`input`要素か`contenteditable`か等)が出現するかは、まだ
-一度も実機で観測できていない。この状態でURL入力欄のセレクタを推測実装
-すると、ショートカット方式のときと同じ「未確認のDOM構造を前提にした
-実装」を繰り返すことになる。そのため`_set_link_on_text_occurrence()`は
-意図的に、リンクボタンをクリックした直後にHTML/スクリーンショット/
-診断データを保存したうえで、`LinkButtonObservationStop`(NotePosterError
-のサブクラス。通常の「リンク設定に失敗した」という意味の例外とログ上で
-明確に区別するための専用クラス)を送出して処理を止める。URL入力欄を
-探す・URLを入力する・Enterを押す・確定ボタンを押す、という操作は一切
-行わない。次回の実機テストでこの観測データを取得したのち、URL入力UIの
-自動化を本実装する想定である。呼び出し側(main.py)では他のNotePoster
-Errorと同様にneeds_reviewへ倒れ、下書き保存やSheetsのdraft_created化は
-一切行われない。
+★観測専用実装であることについて・第1段階(2026年8月29日時点)★
+当初、ボタンをクリックした後に実際にどのようなURL入力UI(ポップオーバー
+かモーダルか、`input`要素か`contenteditable`か等)が出現するかは、まだ
+一度も実機で観測できていなかった。この状態でURL入力欄のセレクタを推測
+実装すると、ショートカット方式のときと同じ「未確認のDOM構造を前提に
+した実装」を繰り返すことになる。そのため`_set_link_on_text_occurrence()`
+は当時、意図的に、リンクボタンをクリックした直後にHTML/スクリーン
+ショット/診断データを保存したうえで、`LinkButtonObservationStop`
+(NotePosterErrorのサブクラス。通常の「リンク設定に失敗した」という
+意味の例外とログ上で明確に区別するための専用クラス)を送出して処理を
+止める設計にしていた。
+
+★観測専用実装であることについて・第2段階(2026年8月29日時点)★
+その後、追加の実機Artifactから、リンクボタンをクリックした後に
+
+  <textarea inputmode="text" name="alt" placeholder="https://"></textarea>
+
+というURL入力欄が出現することが判明した(`_find_url_input_textarea`、
+`_URL_INPUT_SELECTOR`)。これを受けて、URL入力欄を一意に特定できた場合
+のみ`product_links`の対象URLを入力し、入力に使った同じlocatorから
+`input_value()`でread-backして期待したURLと完全一致することを確認する
+段階まで実装を進めた。read-backが一致すればHTML/スクリーンショット/
+診断データを保存したうえで`UrlInputObservationStop`(`LinkButtonObserv
+ationStop`とはログ上で区別できる別のサブクラス)を送出して処理を止め、
+不一致であれば(可能な限り診断データを保存したうえで)通常のNotePoster
+Errorで安全停止する。ただし**URLの確定方法**(Enterキー送信・Tabキー
+送信・意図的なフォーカス解除・確定ボタンのクリック・他要素のクリックの
+いずれも)はまだ実機で確認できていないため、一切行わない。次回の実機
+テストでこの観測データを取得したのち、URLの確定方法を本実装する想定
+である。呼び出し側(main.py)では他のNotePosterErrorと同様にneeds_
+reviewへ倒れ、下書き保存やSheetsのdraft_created化は一切行われない。
 
 ★本文テキスト検証とリンク検証の分離★
 _assert_body_matches()は引き続き「見えているテキスト」だけを検証する
@@ -413,6 +429,17 @@ _DEFAULT_CANDIDATE_TIMEOUT_MS = 4000
 # 安全停止する。
 _LINK_TOOLBAR_APPEAR_TIMEOUT_MS = 3000
 
+# リンクボタンをクリックしてからURL入力欄(textarea)が実際にDOMへ出現する
+# までの非同期の遅延を吸収するための待機上限。ツールバーの出現待ちとは
+# 別の待機ポイントのため、値は同じでも独立した定数にしている。
+_URL_INPUT_APPEAR_TIMEOUT_MS = 3000
+
+# リンクボタンクリック後に現れるURL入力欄のセレクタ(TEST-004の追加観測で
+# 実機確認済み: <textarea inputmode="text" name="alt" placeholder="https://">)。
+# class名には依存せず、意味のある3つの属性をすべて満たすものだけを対象に
+# する。
+_URL_INPUT_SELECTOR = 'textarea[placeholder="https://"][inputmode="text"][name="alt"]'
+
 # 診断データが際限なく増えないよう、記録件数の上限を設ける。
 _MAX_DIAG_ENTRIES = 300
 
@@ -468,6 +495,23 @@ class LinkButtonObservationStop(NotePosterError):
     (呼び出し側ではNotePosterErrorのサブクラスとして他と同様に
     needs_reviewへ倒れる)から明確に区別できるよう、専用のサブクラスに
     している。
+    """
+
+
+class UrlInputObservationStop(NotePosterError):
+    """商品導線リンクのURL入力欄にURLを入力し、read-backで一致を確認した
+    直後に、意図的に処理を安全停止する際に送出する
+    (観測専用実装・第2段階、2026年8月29日)。
+
+    URLの確定方法(Enterキー送信・確定ボタンのクリック等)はまだ実機で
+    確認できていないため、確定操作へは進まず、HTML/スクリーンショット/
+    診断データを保存したうえでここで停止する。`LinkButtonObservationStop`
+    (リンクボタンをクリックした直後の観測停止)とはログ上で明確に区別
+    できるよう、別の専用サブクラスにしている(ログを見れば「リンクボタン
+    クリック後の観測停止」なのか「URL入力後の観測停止」なのかが一目で
+    分かる)。read-backが不一致だった場合はこの例外ではなく、通常の
+    NotePosterErrorを送出する(観測が成功した上での意図的な停止ではなく、
+    実際に問題が起きたことを示すため)。
     """
 
 
@@ -1571,14 +1615,62 @@ class NotePoster:
             )
         return link_button
 
+    def _find_url_input_textarea(
+        self, page: Page, timeout_ms: int = _URL_INPUT_APPEAR_TIMEOUT_MS
+    ) -> Locator:
+        """リンクボタンをクリックした後に現れるURL入力欄(textarea)を
+        一意に特定する。
+
+        実機のGitHub Actions実行(TEST-004の追加観測)で、リンクボタンを
+        クリックした直後に
+
+          <textarea inputmode="text" name="alt" placeholder="https://">
+          </textarea>
+          <button aria-label="URLの入力をやめる">
+
+        というインラインのURL入力UIが出現することが判明した。class名には
+        一切依存せず、`placeholder`/`inputmode`/`name`という3つの独立した
+        意味のある属性をすべて満たす`<textarea>`だけを対象にする
+        (`_URL_INPUT_SELECTOR`)。「URLの入力をやめる」ボタンの存在は、
+        このUIが確かにURL入力用であることの状況証拠として実機で確認した
+        ものであり、セレクタそのものには使っていない(現時点では構造の
+        全体像が不明なため、推測でスコープを広げない)。
+
+        `_find_active_link_toolbar_button()`と同じ設計で、いきなり
+        `count()`を確認するのではなく、まず`_wait_for_locator_to_appear()`
+        で出現・可視化を待ってから、改めて`count()`を取り直してちょうど
+        1件であることを検証する。`.first()`/`.nth()`のような位置ベースの
+        絞り込みは一切行わない。待機中にlocatorが2件以上に一致した場合は
+        Playwrightのstrict modeにより例外が送出されるが、これも「一意に
+        特定できない」ケースとして扱う。timeout・0件・複数件・strict mode
+        違反のいずれの場合も、推測せずNotePosterErrorを送出して安全停止
+        する(呼び出し側でneeds_reviewに倒れる)。
+        """
+        url_input = page.locator(_URL_INPUT_SELECTOR)
+        self._wait_for_locator_to_appear(url_input, timeout_ms)
+        try:
+            url_input_count = url_input.count()
+        except PlaywrightTimeoutError:
+            url_input_count = 0
+        if url_input_count != 1:
+            self._capture_failure(page, "商品導線URL入力欄特定")
+            raise NotePosterError(
+                f"商品導線のURL入力欄({_URL_INPUT_SELECTOR})が"
+                f"{timeout_ms}ms待っても{url_input_count}件でした"
+                "(期待: 1件)。URL入力欄を安全に特定できないため処理を"
+                "中断します。"
+            )
+        return url_input
+
     def _set_link_on_text_occurrence(
         self, page: Page, block: Locator, link: ProductLink
     ) -> None:
         """指定したブロック内の「→ 商品を見る」だけを選択し、noteのフロー
-        ティング編集ツールバーの「リンク」ボタンをクリックする。
+        ティング編集ツールバーの「リンク」ボタンをクリックしたうえで、
+        URL入力欄にURLを入力してread-backを確認する。
 
-        ★観測専用実装(2026年8月29日時点、TEST-004の追加観測を踏まえた
-        修正)★
+        ★観測専用実装・第1段階(2026年8月29日時点、TEST-004の追加観測を
+        踏まえた修正)★
         実機のGitHub Actions実行(TEST-004)で、note公式の「エディタの
         ガイド」パネルを実際にパースした結果、リンク挿入はツールバーの
         「ボタン」一覧には存在するものの、「キーボードショートカット」
@@ -1590,18 +1682,29 @@ class NotePoster:
         ボタンをクリックする方式(`_find_active_link_toolbar_button`)に
         切り替えた。
 
-        ただし、ボタンをクリックした後に実際にどのようなURL入力UI
-        (ポップオーバーかモーダルか、`input`要素か`contenteditable`か等)
-        が出現するかは、まだ一度も実機で観測できていない。この状態で
-        URL入力欄のセレクタを推測実装すると、ショートカット方式のときと
-        同じ「未確認のDOM構造を前提にした実装」を繰り返すことになる。
-        そのため今回は意図的に、リンクボタンをクリックした直後にHTML/
-        スクリーンショット/診断データを保存したうえで
-        `LinkButtonObservationStop`(観測専用の安全停止、通常の
-        NotePosterErrorとログ上で区別できるサブクラス)を送出して処理を
-        止める。URL入力欄を探す・URLを入力する・Enterを押す・確定ボタンを
-        押す、という操作は一切行わない。次回の実機テストでこの観測データを
-        取得したのち、URL入力UIの自動化を本実装する想定である。
+        ★観測専用実装・第2段階(2026年8月29日時点、TEST-004の追加観測を
+        踏まえた修正)★
+        リンクボタンをクリックした後、実機で
+
+          <textarea inputmode="text" name="alt" placeholder="https://">
+          </textarea>
+
+        というURL入力欄が出現することが確認できた
+        (`_find_url_input_textarea`)。そこでこの段階では、URL入力欄を
+        一意に特定できた場合のみ`product_links`の対象URLを入力し、入力に
+        使った同じlocatorから`input_value()`でread-backして期待したURLと
+        完全一致することを確認する。ただし**URLの確定方法**(Enterキー
+        送信・Tabキー送信・意図的なフォーカス解除・確定ボタンのクリック・
+        他要素のクリックのいずれも)はまだ実機で確認できていないため、
+        一切行わない。read-backが一致した時点でHTML/スクリーンショット/
+        診断データを保存したうえで`UrlInputObservationStop`(観測専用の
+        安全停止。`LinkButtonObservationStop`とはログ上で区別できる別の
+        サブクラス)を送出して処理を止める。read-backが不一致だった場合も
+        (可能な限り)診断データを保存したうえで、通常のNotePosterErrorで
+        安全停止する(観測の成功ではなく実際の問題として扱う)。
+        `<a href>`が実際に生成されたかの確認や`_assert_links_match()`には
+        まだ進まない。次回の実機テストでこの観測データを取得したのち、
+        URLの確定方法を本実装する想定である。
         """
         self._select_product_link_text_in_block(page, block)
 
@@ -1623,12 +1726,30 @@ class NotePoster:
         self._assert_not_publish_action(link_button)
         link_button.click()
 
-        self._capture_failure(page, "商品導線リンクボタンクリック後の観測")
-        raise LinkButtonObservationStop(
-            f"『{link.label}』の「{_PRODUCT_LINK_TEXT}」に対してツールバーの"
-            "「リンク」ボタンをクリックしました。ボタンクリック後に出現する"
-            "URL入力UIの構造がまだ実機で確認できていないため、URL入力・確定"
-            "操作は行わず、観測のために意図的にここで処理を停止します"
+        url_input = self._find_url_input_textarea(page)
+        url_input.click()
+        url_input.press_sequentially(link.url, delay=10)
+
+        try:
+            actual_value = url_input.input_value()
+        except PlaywrightTimeoutError:
+            actual_value = None
+
+        if actual_value != link.url:
+            self._capture_failure(page, "商品導線URL入力read-back不一致")
+            raise NotePosterError(
+                f"『{link.label}』のURL入力欄にURL({link.url!r})を"
+                f"入力しましたが、read-backした値が{actual_value!r}でした。"
+                "安全のため処理を中断します。"
+            )
+
+        self._capture_failure(page, "商品導線URL入力後の観測")
+        raise UrlInputObservationStop(
+            f"『{link.label}』のURL入力欄に{link.url!r}を入力し、"
+            "read-backで一致を確認しました。URLの確定方法(Enter送信・"
+            "Tab送信・意図的なフォーカス解除・確定ボタンのクリック等)は"
+            "まだ実機で確認できていないため、確定操作は行わず、観測のために"
+            "意図的にここで処理を停止します"
             "(HTML/スクリーンショット/診断データは保存済みです)。"
         )
 
