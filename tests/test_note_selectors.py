@@ -826,17 +826,18 @@ def test_publish_related_labels_are_never_used_as_click_selectors():
                 )
 
 
-# -- 商品導線リンクの設定・検証(実機で確認されたnoteの選択ツールバー方式) --
+# -- 商品導線リンクの設定・検証(note公式ショートカット Control+K/Meta+K方式) --
 #
-# 人間が実機で、本文中の「→ 商品を見る」だけを選択するとフローティング
-# ツールバーが表示され、リンク(鎖アイコン)からURLを設定すると商品カードへ
-# 変換されずインラインリンクになることを確認した。以下はそのUI操作を
-# ローカルの疑似ページで再現したテスト。ツールバー自体の正確なDOM構造は
-# 実機のHTMLダンプではまだ確認できていないため、ここでの疑似UIは
-# 「role=button name=リンク」「input[type=url]」という、_apply_product_links
-# が実際に試す候補の1つを模したものであり、実機と完全に一致する保証はない。
+# 人間が実機で、note公式の「エディタのガイド」に明記されたリンク挿入
+# ショートカット(Mac: ⌘+K)を使って「→ 商品を見る」だけを選択した状態から
+# リンクを設定すると、商品カードへ変換されずインラインリンクになることを
+# 確認した。以下はそのショートカット操作をローカルの疑似ページで再現した
+# テスト。URL入力欄自体の正確なDOM構造は実機のHTMLダンプではまだ確認
+# できていないため、ここでの疑似UIは「input[type=url]」という、
+# _open_link_input_via_shortcut が実際に試す候補の1つを模したものであり、
+# 実機と完全に一致する保証はない。
 
-_LINK_TOOLBAR_HTML = """
+_LINK_SHORTCUT_HTML = """
 <div class="editor" contenteditable="true">
   <p>本文</p>
   <p>この記事に出てきた商品</p>
@@ -845,23 +846,18 @@ _LINK_TOOLBAR_HTML = """
   <p>TOY JAM 瀬戸内レモン月桂樹</p>
   <p>→ 商品を見る</p>
 </div>
-<div id="toolbar" style="display:none">
-  <button id="link-btn">リンク</button>
-</div>
 <input type="url" id="url-input" style="display:none">
 <script>
-  document.addEventListener('selectionchange', () => {
-    const sel = window.getSelection();
-    const toolbar = document.getElementById('toolbar');
-    if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
-      toolbar.style.display = 'block';
-    } else {
-      toolbar.style.display = 'none';
+  document.addEventListener('keydown', (e) => {
+    if (e.key.toLowerCase() === 'k' && (e.ctrlKey || e.metaKey)) {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
+        window.__savedRange = sel.getRangeAt(0).cloneRange();
+        const input = document.getElementById('url-input');
+        input.style.display = 'block';
+        input.focus();
+      }
     }
-  });
-  document.getElementById('link-btn').addEventListener('click', () => {
-    window.__savedRange = window.getSelection().getRangeAt(0).cloneRange();
-    document.getElementById('url-input').style.display = 'block';
   });
   document.getElementById('url-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
@@ -872,7 +868,6 @@ _LINK_TOOLBAR_HTML = """
       range.deleteContents();
       range.insertNode(a);
       document.getElementById('url-input').style.display = 'none';
-      document.getElementById('toolbar').style.display = 'none';
       document.getElementById('url-input').value = '';
     }
   });
@@ -881,7 +876,7 @@ _LINK_TOOLBAR_HTML = """
 
 
 def test_apply_product_links_sets_correct_href_on_each_occurrence(page):
-    page.set_content(_LINK_TOOLBAR_HTML)
+    page.set_content(_LINK_SHORTCUT_HTML)
     poster = _bare_poster()
     links = [
         ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
@@ -890,9 +885,6 @@ def test_apply_product_links_sets_correct_href_on_each_occurrence(page):
 
     poster._apply_product_links(page, links)
 
-    # get_by_text(exact=True)は完全一致テキストを持つ最も内側の要素を返す。
-    # リンク設定後は<p><a>→ 商品を見る</a></p>のようにa要素の方が内側になる
-    # ため、a要素自身が返る(_assert_links_matchと同じ理由)。
     occurrences = page.get_by_text("→ 商品を見る", exact=True)
     assert occurrences.nth(0).evaluate("el => el.tagName") == "A"
     assert occurrences.nth(0).get_attribute("href") == links[0].url
@@ -930,12 +922,140 @@ def test_apply_product_links_raises_when_occurrence_count_mismatches(page):
         poster._apply_product_links(page, links)
 
 
-def test_set_link_on_text_occurrence_raises_when_toolbar_not_found(page):
-    # リンク設定UI(ツールバー・URL入力欄)が全く存在しないページでは、
-    # 位置ベースの推測に頼らずNotePosterErrorで安全停止する。
-    page.set_content('<div contenteditable="true"><p>→ 商品を見る</p></div>')
+# -- _resolve_link_target_for_label(商品名との位置関係による一意特定) -------
+#
+# 「ページ全体でN番目に出現するか」という一覧インデックスだけに頼るのでは
+# なく、商品名(label)の直後にある兄弟要素という、build_product_links_
+# trailer()自身が生成したDOM構造との対応関係を使って一意に特定する。
+
+
+def test_resolve_link_target_for_label_finds_the_paragraph_right_after_label(page):
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>商品A</p>"
+        "<p>→ 商品を見る</p>"
+        "<p>商品B</p>"
+        "<p>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+
+    target_a = poster._resolve_link_target_for_label(
+        page, ProductLink(label="商品A", url="https://example.com/a")
+    )
+    target_b = poster._resolve_link_target_for_label(
+        page, ProductLink(label="商品B", url="https://example.com/b")
+    )
+
+    assert target_a.inner_text().strip() == "→ 商品を見る"
+    assert target_b.inner_text().strip() == "→ 商品を見る"
+    assert poster._same_element(page, target_a, target_b) is False
+
+
+def test_resolve_link_target_for_label_raises_when_label_appears_multiple_times(page):
+    # 商品名が本文中に偶然複数回出現する場合、どちらが商品導線の行かを
+    # 安全に一意特定できないため中断する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>商品A</p>"
+        "<p>この記事に出てきた商品</p>"
+        "<p>商品A</p>"
+        "<p>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._resolve_link_target_for_label(
+            page, ProductLink(label="商品A", url="https://example.com/a")
+        )
+
+
+def test_resolve_link_target_for_label_raises_when_next_sibling_is_not_link_text(page):
+    # labelの直後の要素が「→ 商品を見る」ではない(構造が想定と異なる)場合、
+    # 推測せず中断する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>商品A</p>"
+        "<p>関係ない文章</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._resolve_link_target_for_label(
+            page, ProductLink(label="商品A", url="https://example.com/a")
+        )
+
+
+def test_resolve_link_target_for_label_raises_when_label_is_the_last_element(page):
+    # labelの直後に兄弟要素が無い場合も安全に一意特定できないため中断する。
+    page.set_content('<div class="editor" contenteditable="true"><p>商品A</p></div>')
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._resolve_link_target_for_label(
+            page, ProductLink(label="商品A", url="https://example.com/a")
+        )
+
+
+# -- _open_link_input_via_shortcut(Control+K / Meta+Kの2変種を順に試す) ------
+
+
+def test_open_link_input_via_shortcut_succeeds_with_control_k(page):
+    page.set_content(_LINK_SHORTCUT_HTML)
     poster = _bare_poster()
     target = page.get_by_text("→ 商品を見る", exact=True).first
+    target.select_text()
+
+    url_input = poster._open_link_input_via_shortcut(page)
+
+    assert url_input.is_visible()
+
+
+def test_open_link_input_via_shortcut_falls_back_to_meta_k_when_control_k_does_nothing(page):
+    # note側がMac用のMeta+Kしか listen していない状況を模す
+    # (Control+Kでは何も起きず、Meta+Kでのみ入力欄が現れる)。
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true"><p>→ 商品を見る</p></div>
+        <input type="url" id="url-input" style="display:none">
+        <script>
+          document.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'k' && e.metaKey && !e.ctrlKey) {
+              document.getElementById('url-input').style.display = 'block';
+            }
+          });
+        </script>
+        """
+    )
+    poster = _bare_poster()
+    target = page.get_by_text("→ 商品を見る", exact=True).first
+    target.select_text()
+
+    url_input = poster._open_link_input_via_shortcut(page)
+
+    assert url_input.is_visible()
+
+
+def test_open_link_input_via_shortcut_raises_when_neither_modifier_works(page):
+    page.set_content('<div class="editor" contenteditable="true"><p>→ 商品を見る</p></div>')
+    poster = _bare_poster()
+    target = page.get_by_text("→ 商品を見る", exact=True).first
+    target.select_text()
+
+    with pytest.raises(NotePosterError):
+        poster._open_link_input_via_shortcut(page)
+
+
+def test_set_link_on_text_occurrence_raises_when_selection_does_not_match_expected_text(page):
+    # target.select_text() で選択されるはずのテキストが、意図した
+    # 「→ 商品を見る」と異なる場合(構造の想定違い)は安全停止する。
+    page.set_content('<div class="editor" contenteditable="true"><p>違う文言</p></div>')
+    poster = _bare_poster()
+    target = page.locator(".editor p").first
 
     with pytest.raises(NotePosterError):
         poster._set_link_on_text_occurrence(
@@ -944,13 +1064,18 @@ def test_set_link_on_text_occurrence_raises_when_toolbar_not_found(page):
 
 
 def test_set_link_on_text_occurrence_source_has_no_positional_fallback_candidates():
-    """リンク設定ボタン・URL入力欄の候補セレクタに、位置ベースの無条件
-    フォールバック(「最初の/2番目の」等)が使われていないことを確認する。
+    """リンク設定関連の候補セレクタに、位置ベースの無条件フォールバック
+    (「最初の/2番目の」等)が使われていないことを確認する。
     """
     import inspect
 
-    source = inspect.getsource(NotePoster._set_link_on_text_occurrence)
-    assert "最終手段" not in source
+    for func in (
+        NotePoster._set_link_on_text_occurrence,
+        NotePoster._open_link_input_via_shortcut,
+        NotePoster._resolve_link_target_for_label,
+    ):
+        source = inspect.getsource(func)
+        assert "最終手段" not in source
 
 
 def _product_trailer_html(entries: list[tuple[str, str | None]]) -> str:

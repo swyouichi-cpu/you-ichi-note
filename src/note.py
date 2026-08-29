@@ -169,31 +169,54 @@ URLを自動的に商品カード(画像・商品名・価格・説明・購入�
 
 というプレーンテキストの導線セクションを組み立てて本文に追記し
 (build_product_links_trailer())、その後で「→ 商品を見る」という
-固定文言(_PRODUCT_LINK_TEXT)だけをN番目の出現ごとに選択してリンクを
-設定する(_apply_product_links())。ECの生URLは本文の文字列としては
-一切登場せず、href属性としてのみ設定される。`product_links`が空または
-`[]`の場合は導線セクション自体を追加しない(タグ0件時の設計と同じ)。
-不正なJSON・必須フィールド欠落・不正なURL形式は、タグの内部空白と同じ
-思想で自動修正せずProductLinkValidationErrorを送出してneeds_reviewへ
-倒す(ARTICLE-001に限らず、どの記事にも同じロジックが適用される)。
+固定文言(_PRODUCT_LINK_TEXT)だけに、商品名(label)との位置関係で一意に
+特定した対象へリンクを設定する(_apply_product_links())。ECの生URLは
+本文の文字列としては一切登場せず、href属性としてのみ設定される。
+`product_links`が空または`[]`の場合は導線セクション自体を追加しない
+(タグ0件時の設計と同じ)。不正なJSON・必須フィールド欠落・不正なURL
+形式は、タグの内部空白と同じ思想で自動修正せずProductLinkValidationError
+を送出してneeds_reviewへ倒す(ARTICLE-001に限らず、どの記事にも同じ
+ロジックが適用される)。
 
-★選択操作は位置ベースフォールバックではない★
+★リンク対象の特定は位置ベースフォールバックではない★
 「→ 商品を見る」というテキストは複数の商品がある場合、本文中に複数回
-出現する。これをN番目の出現として`page.get_by_text(...).nth(N)`で
-選択するが、これは _fill_body() で撤去した「画面上に見えるN番目の
-contenteditable要素」のような構造推測とは性質が異なる。ここでのNは、
+出現する。当初は「ページ全体でN番目の出現」という一覧インデックスで
+`product_links[N]`と対応付けていたが、より安全な一意特定方法として、
+_resolve_link_target_for_label() で「商品名(label)の直後にある兄弟要素」
+という、build_product_links_trailer()自身が生成したDOM構造(label行の
+直後に必ずリンク対象行が来る)との対応関係を使う方式に変更した
+(2026年8月29日)。これは _fill_body() で撤去した「画面上に見えるN番目の
+contenteditable要素」のような構造推測とは性質が異なる。ここでの特定は、
 noteのDOM構造を推測しているのではなく、**このコード自身が直前に生成した
-既知のテキスト**の出現順序を、内容(テキスト一致)で特定したうえで数えて
-いるだけである。それでも安全のため、本文中の「→ 商品を見る」の出現数が
-`product_links`の件数と一致しない場合(人間が書いた本文に偶然同じ文言が
-含まれていた等)は、どれがどのリンクに対応するか一意に定まらないため、
-リンクを設定せずneeds_reviewへ安全停止する。
+既知の構造(label→リンク対象行という順序)**を根拠にしている。
+labelのテキストが本文中にちょうど1件だけ存在し、かつその直後の兄弟要素の
+テキストが「→ 商品を見る」と完全一致することを確認したうえで対象を返し、
+いずれか一方でも成立しなければ推測せずneeds_reviewへ安全停止する
+(例えば、人間が書いた本文に偶然同じlabelや同じ文言が含まれていた場合)。
 
-★リンク設定UIのセレクタについて(未確定・要実機検証)★
-本文editorのセレクタ(ProseMirror)とは異なり、選択時に現れるフローティング
-ツールバーとリンクURL入力欄の正確なDOM構造は、まだ実機のHTMLダンプで
-確認できていない(人間による目視確認のみ)。そのため_apply_product_links()
-の候補セレクタは、一般的なリッチテキストエディタのツールバーで使われがちな
+★リンク設定操作: note公式ショートカット(Control+K / Meta+K)★
+当初はフローティングツールバーのリンクボタンをrole/aria属性(推測ベースの
+best-effort候補)で探してクリックする方式を実装していたが、そのボタンが
+アイコンのみでアクセシブルな名前を持たない場合に候補が一つも一致しない
+リスクがあった。その後、note公式の「エディタのガイド」にリンク挿入の
+ショートカットとしてMac: ⌘+K が明記されていることを人間が確認し
+(実機で「→ 商品を見る」を選択してこのショートカットを使うと、URL入力欄が
+表示されてインラインリンクを設定でき、商品カード化されないことも確認済み)、
+DOM構造の推測に頼らないこの公式ショートカット方式に変更した
+(_set_link_on_text_occurrence() / _open_link_input_via_shortcut())。
+GitHub Actionsのheadless ChromiumはLinux上で動作するため、noteが
+navigator.platformに応じてMeta/Ctrlいずれかのキーを見ている可能性がある。
+実機ではどちらが効くかまだ確認できていないため、Control+K→Meta+Kの順に
+試し、実際にURL入力欄が現れた方を採用する(これも位置ベースフォールバック
+ではなく、公式ショートカットの2つのプラットフォーム変種を順に試すだけ)。
+選択直後には実際の選択内容(`window.getSelection().toString()`)が意図した
+文字列と一致することも確認してからショートカットを送る。
+
+★リンクURL入力欄のセレクタについて(未確定・要実機検証)★
+本文editorのセレクタ(ProseMirror)とは異なり、ショートカット送信後に現れる
+リンクURL入力欄の正確なDOM構造は、まだ実機のHTMLダンプで確認できていない
+(人間による目視確認のみ)。そのため_open_link_input_via_shortcut()の
+候補セレクタは、一般的なリッチテキストエディタのURL入力欄で使われがちな
 role/aria属性に基づく複数候補であり、_fill_body()のProseMirror候補ほど
 確度が高いとは言えない。候補が一致しない場合は位置ベースの推測に頼らず
 NotePosterErrorで安全停止する(needs_reviewに倒れる)。実機で候補が
@@ -846,9 +869,9 @@ class NotePoster:
         商品リンク(product_links)が指定されている場合、タグ行の手前に
         「この記事に出てきた商品」という商品導線セクションを追記する。
         ECの生URLは本文の文字列としては一切登場させず(自動カード化を
-        誘発するため)、「→ 商品を見る」という固定文言だけに、noteの
-        選択ツールバー経由でインラインリンクを設定する
-        (_apply_product_links)。
+        誘発するため)、「→ 商品を見る」という固定文言だけに、note公式の
+        リンク挿入ショートカット(Control+K / Meta+K)経由でインライン
+        リンクを設定する(_apply_product_links)。
 
         本文入力欄は、タイトル入力欄と同一のDOM要素を誤って掴んでいない
         ことを確認したうえで使用し(_same_element)、実際に入力に使った
@@ -1178,11 +1201,11 @@ class NotePoster:
 
         本文editorには既に build_product_links_trailer() が生成した
         プレーンテキスト(ECの生URLを含まない)が入力済みであることが前提。
-        「→ 商品を見る」という固定文言の、N番目の出現をproduct_links[N]と
-        対応付ける。この出現数と product_links の件数が一致しない場合
-        (人間が書いた本文に偶然同じ文言が含まれていた等)は、どの出現が
-        どのリンクに対応するか一意に定まらないため、推測でリンクを設定
-        せずNotePosterErrorで安全停止する。
+        まず「→ 商品を見る」の出現数がproduct_linksの件数と一致するかを
+        大まかに確認し(一致しない場合は本文中に同じ文字列が意図せず
+        含まれている可能性があるため安全停止する)、各リンクの実際の対象
+        要素は _resolve_link_target_for_label() で商品名(label)との
+        位置関係から一意に特定する(詳細はそちらのdocstringを参照)。
         """
         if not product_links:
             return
@@ -1195,62 +1218,111 @@ class NotePoster:
                 f"商品導線のリンク対象テキスト('{_PRODUCT_LINK_TEXT}')が本文中に"
                 f"{actual_count}件見つかりましたが、期待した件数は"
                 f"{len(product_links)}件でした。本文中に同じ文字列が意図せず"
-                "含まれている可能性があり、どの出現がどのリンクに対応するか"
-                "一意に定まらないため、誤ったリンク設定を避けて処理を"
-                "中断します。"
+                "含まれている可能性があり、商品導線を安全にスコープできない"
+                "ため、誤ったリンク設定を避けて処理を中断します。"
             )
 
-        for index, link in enumerate(product_links):
-            self._set_link_on_text_occurrence(page, occurrences.nth(index), link)
+        for link in product_links:
+            target = self._resolve_link_target_for_label(page, link)
+            self._set_link_on_text_occurrence(page, target, link)
+
+    def _resolve_link_target_for_label(self, page: Page, link: ProductLink) -> Locator:
+        """商品名(label)から、その直後にある「→ 商品を見る」の段落を一意に特定する。
+
+        「→ 商品を見る」という文言はproduct_linksが複数件あると本文中に
+        複数回出現しうる。これを「ページ全体でN番目に出現するか」という
+        一覧のインデックスだけに頼るのではなく、build_product_links_trailer()
+        が「{label}\\n→ 商品を見る」という順序で生成していることを利用し、
+        各商品の名前(label)の直後にある兄弟要素として一意に特定する
+        (このコード自身が生成したDOM構造との対応関係を使った特定であり、
+        DOM構造を推測しているわけではない)。
+
+        以下のいずれかが成立しない場合は、安全に一意特定できないと判断し、
+        推測せずNotePosterErrorを送出する(呼び出し側でneeds_reviewに倒れる)。
+          - labelのテキストが本文中にちょうど1件だけ存在する
+          - その直後の兄弟要素がちょうど1件存在する
+          - その兄弟要素のテキストが「→ 商品を見る」と完全一致する
+        """
+        label_locator = page.get_by_text(link.label, exact=True)
+        label_count = label_locator.count()
+        if label_count != 1:
+            self._capture_failure(page, "商品導線ラベル特定")
+            raise NotePosterError(
+                f"商品名『{link.label}』のテキストが本文中に{label_count}件"
+                "見つかりました(期待: 1件)。商品導線を安全にスコープできない"
+                "ため処理を中断します。"
+            )
+
+        sibling = label_locator.first.locator("xpath=following-sibling::*[1]")
+        try:
+            sibling_count = sibling.count()
+        except PlaywrightTimeoutError:
+            sibling_count = 0
+        if sibling_count != 1:
+            self._capture_failure(page, "商品導線ラベル特定")
+            raise NotePosterError(
+                f"商品名『{link.label}』の直後にある要素を特定できませんでした"
+                f"({sibling_count}件)。商品導線の構造が想定と異なるため"
+                "処理を中断します。"
+            )
+
+        try:
+            sibling_text = (sibling.inner_text() or "").strip()
+        except PlaywrightTimeoutError:
+            sibling_text = ""
+        if sibling_text != _PRODUCT_LINK_TEXT:
+            self._capture_failure(page, "商品導線ラベル特定")
+            raise NotePosterError(
+                f"商品名『{link.label}』の直後の要素のテキストが"
+                f"{sibling_text!r}でした(期待: {_PRODUCT_LINK_TEXT!r})。"
+                "商品導線の構造が想定と異なるため処理を中断します。"
+            )
+        return sibling
 
     def _set_link_on_text_occurrence(
         self, page: Page, target: Locator, link: ProductLink
     ) -> None:
-        """指定したテキスト要素を選択し、noteの選択ツールバーからリンクを設定する。
+        """指定した段落を選択し、noteの公式リンク挿入ショートカットでリンクを設定する。
 
-        note.comのProseMirrorエディタでは、本文中の文字列を選択すると
-        フローティングツールバーが表示され、その中のリンク機能で選択範囲
-        だけにインラインリンクを設定できる(URLを商品カードへ変換せずに
-        済む方式であることを人間が実機で確認済み)。ただし、このツール
-        バー自体の正確なDOM構造(role/aria/class名)は、本文editorの
-        ProseMirror要素とは異なりまだ実機のHTMLダンプで確認できていない。
-        そのため以下の候補セレクタは一般的なリッチテキストエディタの
-        選択ツールバーで使われがちなrole/aria属性に基づく best-effort な
-        ものであり、_fill_body()のProseMirror候補ほどの確度は無い。
+        note公式の「エディタのガイド」に、リンク挿入のショートカットとして
+        Mac: ⌘+K が明記されており、実機で人間が「→ 商品を見る」を選択して
+        このショートカットを使うと、URL入力欄が表示されてインラインリンクを
+        設定でき、商品カードへは変換されないことを確認済み(2026年8月29日)。
 
-        候補が一致しない場合は位置ベースの推測(例: ツールバー内の最初の
-        ボタン)に一切フォールバックせず、NotePosterErrorで安全停止する
-        (needs_reviewに倒れる)。実機で候補が一致しなかった場合は、
-        _fill_body()のときと同様、失敗時の診断データを元に実際のDOM構造
-        に基づいてセレクタを更新する。
+        以前はフローティングツールバーのリンクボタンをrole/aria属性で
+        探してクリックしていたが、そのボタンがアイコンのみでアクセシブル
+        な名前を持たない可能性があり(実機DOM未確認のbest-effortだった)、
+        公式ショートカットの方がnoteの公開ドキュメントに明記された安定
+        した操作契約であるため、こちらを優先する。GitHub Actionsの
+        headless ChromiumはLinux上で動作するため、note側がnavigator.platform
+        に応じてMeta/Ctrlいずれかのキーを見ている可能性がある。実機では
+        まだどちらが効くか確認できていないため、Control+K→Meta+Kの順に
+        試し、実際にURL入力欄が現れた方を採用する(DOM構造の推測ではなく、
+        公式ショートカットのプラットフォーム変種を順に試すだけであり、
+        位置ベースフォールバックとは異なる)。
+
+        選択操作の直後、実際の選択内容が意図した文字列と一致することを
+        確認してからショートカットを送る(意図しない範囲を選択したまま
+        リンクを設定してしまう事故を防ぐため)。
         """
         target.select_text()
 
-        link_button_candidates = [
-            ("role=button name=リンク", page.get_by_role("button", name=re.compile("リンク"))),
-            (
-                "role=button name=link(英語UI保険)",
-                page.get_by_role("button", name=re.compile("link", re.IGNORECASE)),
-            ),
-            ("aria-label*=リンク", page.locator('[aria-label*="リンク"]')),
-        ]
-        link_button = self._resolve_locator(
-            page, link_button_candidates, step_name="リンク設定ボタン", timeout_ms=3000
-        )
-        self._assert_not_publish_action(link_button)
-        link_button.click()
+        try:
+            selected_text = page.evaluate(
+                "() => (window.getSelection() && window.getSelection().toString()) || ''"
+            )
+        except PlaywrightTimeoutError:
+            selected_text = ""
+        if selected_text.strip() != _PRODUCT_LINK_TEXT:
+            self._capture_failure(page, "商品導線テキスト選択確認")
+            raise NotePosterError(
+                f"『{link.label}』の「{_PRODUCT_LINK_TEXT}」を選択したはずですが、"
+                f"実際の選択内容が{selected_text.strip()!r}でした。安全のため"
+                "処理を中断します。"
+            )
 
-        url_input_candidates = [
-            ("css input[type=url]", page.locator('input[type="url"]')),
-            ("placeholder*=URL", page.get_by_placeholder(re.compile("URL", re.IGNORECASE))),
-            (
-                "role=textbox name=URL/リンク",
-                page.get_by_role("textbox", name=re.compile("URL|リンク", re.IGNORECASE)),
-            ),
-        ]
-        url_input = self._resolve_locator(
-            page, url_input_candidates, step_name="リンクURL入力欄", timeout_ms=3000
-        )
+        url_input = self._open_link_input_via_shortcut(page)
+
         url_input.click()
         url_input.press_sequentially(link.url, delay=10)
         url_input.press("Enter")
@@ -1260,6 +1332,39 @@ class NotePoster:
             # 閉じたことを確認できなくても、成否は後続のread-back検証
             # (_assert_links_match)で判断するため、ここでは中断しない。
             pass
+
+    def _open_link_input_via_shortcut(self, page: Page) -> Locator:
+        """note公式のリンク挿入ショートカット(Control+K / Meta+K)を送信し、
+        URL入力欄が現れるのを待つ。
+
+        URL入力欄自体のセレクタは、本文editor(ProseMirror)ほど確度の高い
+        実機DOM確認ができていないbest-effortな候補のままである点は変わらない。
+        """
+        url_input_candidates = [
+            ("css input[type=url]", page.locator('input[type="url"]')),
+            ("placeholder*=URL", page.get_by_placeholder(re.compile("URL", re.IGNORECASE))),
+            (
+                "role=textbox name=URL/リンク",
+                page.get_by_role("textbox", name=re.compile("URL|リンク", re.IGNORECASE)),
+            ),
+        ]
+        for modifier in ("Control+K", "Meta+K"):
+            page.keyboard.press(modifier)
+            try:
+                return self._resolve_locator(
+                    page,
+                    url_input_candidates,
+                    step_name=f"リンクURL入力欄(ショートカット{modifier})",
+                    timeout_ms=2000,
+                )
+            except NotePosterError:
+                continue
+
+        self._capture_failure(page, "リンク挿入ショートカット")
+        raise NotePosterError(
+            "note公式のリンク挿入ショートカット(Control+K / Meta+K)を送信しましたが、"
+            "URL入力欄の表示を確認できませんでした。処理を中断します。"
+        )
 
     def _assert_links_match(
         self,
@@ -1272,18 +1377,15 @@ class NotePoster:
 
         本文editor内の<a>要素を総数で数える検証は行わない(本文には
         将来ふつうの参考リンク等が入る可能性があるため)。代わりに、
-        自分自身が生成した商品導線の各エントリ(label / 「→ 商品を見る」)
-        だけをスコープに、以下を個別に確認する。
-          - 対応する商品名(label)のテキストが存在すること
-          - 商品名自体にはリンクが付いていないこと(誤って商品名まで
-            リンクになっていないか)
-          - 対応する「→ 商品を見る」のテキストが存在すること
-          - そこにちょうど1件の<a>要素があること(余計なリンクが
-            生成されていないこと)
+        _resolve_link_target_for_label() で自分自身が生成した商品導線の
+        各エントリ(label直後の段落)だけをスコープに、以下を個別に確認する。
+          - 対応する商品名(label)自体にはリンクが付いていないこと
+          - 対応する「→ 商品を見る」の段落にちょうど1件の<a>要素があること
+            (余計なリンクが生成されていないこと)
           - その<a>要素のテキストが「→ 商品を見る」と完全一致すること
           - その<a>要素のhrefが期待したURLと一致すること
-        商品導線をこの方法で安全にスコープできない場合(出現数が合わない
-        等)も、推測はせずneeds_reviewへ安全停止する。
+        商品導線をこの方法で安全にスコープできない場合(labelが複数件・
+        0件見つかる等)も、推測はせずneeds_reviewへ安全停止する。
         """
         if not product_links:
             return
@@ -1300,10 +1402,13 @@ class NotePoster:
             )
 
         mismatches: list[str] = []
-        for index, link in enumerate(product_links):
+        for link in product_links:
             label_locator = page.get_by_text(link.label, exact=True)
-            if label_locator.count() < 1:
-                mismatches.append(f"『{link.label}』: 商品名のテキストが見つかりません")
+            if label_locator.count() != 1:
+                mismatches.append(
+                    f"『{link.label}』: 商品名のテキストが"
+                    f"{label_locator.count()}件でした(期待: 1件)"
+                )
             else:
                 # get_by_text(exact=True)は完全一致テキストを持つ最も内側の
                 # 要素を返すため、商品名自体がリンクになっている場合は
@@ -1324,29 +1429,22 @@ class NotePoster:
                         "リンクが付いています(意図しないリンク)"
                     )
 
-            link_text_locator = link_text_occurrences.nth(index)
-            # get_by_text(exact=True)は「その完全一致テキストを持つ、最も
-            # 内側の要素」を返す。リンク設定前は<p>→ 商品を見る</p>のような
-            # 構造で<p>自身が返るが、リンク設定後は<p><a>→ 商品を見る</a></p>
-            # のようにa要素の方が内側になるため、a要素自身が返る。そのため
-            # 「自分自身がa要素かどうか」でどちらの状態かを判定する。
             try:
-                tag_name = (link_text_locator.evaluate("el => el.tagName") or "").upper()
-            except PlaywrightTimeoutError:
-                tag_name = ""
-            if tag_name == "A":
-                anchor_count = 1
-                anchor = link_text_locator
-            else:
-                anchors = link_text_locator.locator("a")
-                anchor_count = anchors.count()
-                anchor = anchors.first if anchor_count >= 1 else None
-            if anchor_count != 1 or anchor is None:
+                paragraph = self._resolve_link_target_for_label(page, link)
+            except NotePosterError as exc:
+                mismatches.append(f"『{link.label}』: {exc}")
+                continue
+
+            anchors = paragraph.locator("a")
+            anchor_count = anchors.count()
+            if anchor_count != 1:
                 mismatches.append(
                     f"『{link.label}』: 「{_PRODUCT_LINK_TEXT}」のリンク要素が"
                     f"{anchor_count}件でした(期待: 1件)"
                 )
                 continue
+
+            anchor = anchors.first
             try:
                 actual_text = (anchor.inner_text() or "").strip()
             except PlaywrightTimeoutError:
