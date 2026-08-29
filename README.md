@@ -604,17 +604,55 @@ to_appear()`で出現・可視化を待ってから、改めて`count()`を取�
 
 一意に特定できた場合のみ`product_links`の対象URLを入力し、入力に使った
 **同じlocator**から`input_value()`でread-backして期待したURLと完全一致
-することを確認します。一致すればHTML/スクリーンショット/診断データを
-保存したうえで`UrlInputObservationStop`(`LinkButtonObservationStop`とは
-ログ上で区別できる別のサブクラス)を送出して意図的に処理を止め、不一致
-であれば(可能な限り診断データを保存したうえで)通常の`NotePosterError`
-で安全停止します。ただし**URLの確定方法**(Enterキー送信・Tabキー送信・
-意図的なフォーカス解除・確定ボタンのクリック・他要素のクリックのいずれ
-も)はまだ実機で確認できていないため一切行いません。診断データの取得
-(`_capture_failure()`)自体もHTML取得・スクリーンショット・
-`page.evaluate()`のみで構成されており、URL入力欄のフォーカスを奪う操作
-は行いません。次回の実機テストでこの観測データを取得したのち、URLの
-確定方法を本実装する想定です。
+することを確認します。read-backが不一致であれば(可能な限り診断データを
+保存したうえで)通常の`NotePosterError`で安全停止します。
+
+**「適用」ボタンのクリック(実機確認済み)**: read-backが一致した後、
+実機Artifactで確認できた「適用」ボタンをクリックするところまで実装を
+進めています。実DOMは以下の通り、URL入力欄と同じフローティング編集
+ツールバーの内部に存在します。
+
+```html
+<div data-active="true" role="toolbar" id="desktop-toolbar">
+  ...
+  <textarea inputmode="text" name="alt" placeholder="https://"></textarea>
+  <button data-name="Button" type="button" id=":r16:">
+    <span>適用</span>
+  </button>
+  <button aria-label="URLの入力をやめる">...</button>
+  ...
+</div>
+```
+
+「適用」ボタンの`id`(`:r16:`のような値)はReactの`useId`等が生成する
+動的IDの可能性が高いため、セレクタには使いません。また、ページ全体から
+「適用」という文字列を検索するのでもありません。代わりに、URL入力欄の
+特定に使ったのと**同じアクティブなツールバー**をスコープとして使い、
+`toolbar.get_by_role("button", name="適用", exact=True)`で一意に特定
+します(`_find_url_apply_button()`)。この際、
+1. `div[role="toolbar"][data-active="true"]`がページ内にちょうど1件で
+   あることを再確認
+2. そのツールバー内にURL入力欄がちょうど1件存在することを再確認
+   (URL入力欄と「適用」ボタンが同じツールバー内にあることを、DOM構造の
+   推測やXPathでの祖先指定を使わずに、スコープそのもので保証します)
+3. そのツールバー内で「適用」ボタンがちょうど1件であることを確認
+
+のいずれかが成立しなければ`needs_review`へ安全停止します。特定できた
+場合は、リンクボタンと同じ`_ensure_link_button_in_viewport()`でviewport
+内であることを確認し、`_assert_not_publish_action()`を適用したうえで
+通常の`click()`(短いタイムアウト)を行います。
+
+クリック直後にHTML/スクリーンショット/診断データを保存したうえで
+`UrlApplyObservationStop`(`UrlInputObservationStop`とはログ上で区別
+できる別のサブクラス)を送出して意図的に処理を止めます。`<a>`要素が
+実際に生成されたか、`href`が期待通りか、URL入力UIが消えるか等はまだ
+実機で確認できていないため、`_assert_links_match()`や下書き保存へは
+まだ進みません。`UrlInputObservationStop`はクラス自体を削除せず、
+「URL入力・read-backまでは確認できている」段階を明示する診断用の例外
+として残しています。`force=True`やJavaScriptによる直接の
+`element.click()`、Enterキー送信・Tabキー送信・意図的なフォーカス解除は
+引き続き一切使いません。次回の実機テストでこの観測データを取得したのち、
+URL確定の完了確認・後続処理を本実装する想定です。
 
 **検証方法(本文テキストとリンクの分離)**: `_assert_body_matches()`は
 引き続き「見えているテキスト」だけを検証します(商品リンク導入後も本文に
@@ -674,20 +712,28 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
 15. 商品リンクのURL入力欄が特定できない場合(0件・複数件・timeout・
     strict mode違反)は、リンクボタンのクリック処理と同様に推測せず
     `needs_review`へ安全停止する
-16. **URLの確定方法**(Enterキー送信・Tabキー送信・意図的なフォーカス
-    解除・確定ボタンのクリック・他要素のクリックのいずれも)はまだ実機で
-    確認できていないため、一切実装しない。診断データの取得
-    (`_capture_failure()`)自体もURL入力欄のフォーカスを奪う操作を含まない
-    ことを確認済みである。この制約は、次回の実機テストで取得した観測
-    データを元にURL確定方法の本実装を行うまで維持する
-17. 商品リンクのリンクボタンをクリックする前には、`bounding_box()`を実測
-    してviewportの範囲に完全に収まっていることを確認する
-    (`_ensure_link_button_in_viewport()`)。収まっていない場合は
+16. **URLの確定方法**のうち、Enterキー送信・Tabキー送信・意図的な
+    フォーカス解除・「URLの入力をやめる」ボタンのクリック・他要素の
+    クリックは、実機でその効果が未確認のため一切実装しない。診断データの
+    取得(`_capture_failure()`)自体もURL入力欄・ボタンのフォーカスを奪う
+    操作を含まないことを確認済みである。この制約は、次回の実機テストで
+    取得した観測データを元にURL確定の完了確認・後続処理を本実装する
+    まで維持する
+17. 商品リンクのリンクボタン・「適用」ボタンをクリックする前には、
+    `bounding_box()`を実測してviewportの範囲に完全に収まっていることを
+    確認する(`_ensure_link_button_in_viewport()`)。収まっていない場合は
     `force=True`(actionability checkの無効化)やJavaScriptによる直接の
     `element.click()`のような、実際にクリック可能かどうかの保証を失う
     手段には頼らず、`LinkButtonOutOfViewportError`で安全停止する。
     クリック自体のタイムアウトも既定の30秒ではなく短い上限
     (`_LINK_BUTTON_CLICK_TIMEOUT_MS`)にする
+18. 商品リンクの「適用」ボタンは、ページ全体からの文字列検索ではなく、
+    URL入力欄の特定に使ったのと同じアクティブなツールバーをスコープと
+    した`get_by_role("button", name="適用", exact=True)`で一意に特定する
+    (`_find_url_apply_button()`)。動的に生成されるid(Reactの`useId`等
+    由来と見られる`:r16:`のような値)はセレクタに使わない。クリック後は
+    `_assert_links_match()`や下書き保存へは進まず、`UrlApplyObservation
+    Stop`で安全停止する
 
 ## 12. Phase 1 実機検証記録
 
@@ -702,6 +748,7 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
 | `TEST-004`(ツールバーボタン方式・再実行) | ツールバーボタン方式の実機実行 | `needs_review`(「0件」判定が出現タイミングの非同期遅延によるものと判明。待機処理を追加。対応不要) |
 | `TEST-004`(URL入力欄の観測) | リンクボタンクリック後のURL入力UIの実DOM確認 | `needs_review`(URL入力欄のセレクタを確認し、URL入力→read-back確認までの観測専用実装・第2段階を追加。対応不要) |
 | `TEST-004`(リンクボタンクリック失敗) | ツールバーボタンクリック時のviewport外エラーの解析 | `needs_review`(クリックがviewport外で30秒timeoutすることが判明。クリック前のviewport確認・安全停止を追加。対応不要) |
+| `TEST-004`(URL入力・適用ボタン到達) | viewport確認追加後の実機実行、URL入力・read-back一致・「適用」ボタンの実DOM確認 | `needs_review`(`UrlInputObservationStop`まで到達を確認。「適用」ボタンクリックまでの観測専用実装・第4段階を追加。対応不要) |
 
 `TEST-003`(2026年8月28日)での確認事項:
 GitHub Actions=Success / Sheets status=`draft_created` / note_url正常記録 /
@@ -811,6 +858,21 @@ needed()`を試みたうえで`bounding_box()`を実測し、viewportに完全�
 今回は変更していない(まずscroll_into_view_if_needed()とbounding_box()
 検証だけで問題が解消するかを単独で確認するため)。この変更もローカル
 pytestでの確認のみで、まだ実際のGitHub Actions実行では検証していない。
+
+`TEST-004`(URL入力・適用ボタン到達)で判明した事項: クリック前のviewport
+確認を追加した状態で実機実行したところ、リンクボタンのクリックが成功し、
+`UrlInputObservationStop`まで正常に到達した(URLの入力・同じlocatorから
+のread-back完全一致を確認)。追加の実機Artifactから、URL入力欄と同じ
+フローティング編集ツールバー内に「適用」ボタン(`<button data-name=
+"Button" type="button" id=":r16:"><span>適用</span></button>`)が存在
+することを確認した。これを受けて`_find_url_apply_button()`
+(URL入力欄と同じアクティブなツールバーをスコープにした`get_by_role
+("button", name="適用", exact=True)`による特定)を追加し、「適用」ボタン
+クリックまでの観測専用実装・第4段階を実装した(詳細は「10. 商品リンク」)。
+`UrlInputObservationStop`はクラス自体を削除せず、「URL入力・read-back
+までは確認できている」段階を明示する診断用の例外として残している。この
+変更もローカルpytestでの確認のみで、まだ実際のGitHub Actions実行では
+検証していない。
 
 `ARTICLE-001`は人間が確認するまで`status`を`ready`に戻さない
 (対応済み・変更していない)。

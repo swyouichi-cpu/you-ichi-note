@@ -325,6 +325,34 @@ Errorで安全停止する。ただし**URLの確定方法**(Enterキー送信�
 である。呼び出し側(main.py)では他のNotePosterErrorと同様にneeds_
 reviewへ倒れ、下書き保存やSheetsのdraft_created化は一切行われない。
 
+なお、この第2段階を実機で実行した際にリンクボタン自体のクリックが
+viewport外で失敗する事象が発生し、クリック前にviewportを確認する仕組み
+(`_ensure_link_button_in_viewport()`、`LinkButtonOutOfViewportError`)を
+追加した(詳細は`_set_link_on_text_occurrence()`のdocstring内の「第3
+段階」を参照)。
+
+★観測専用実装であることについて・第4段階(2026年8月29日時点)★
+上記の第2・第3段階を実機で実行したところ、URL入力・read-back一致まで
+成功した。追加の実機Artifactから、URL入力欄と同じフローティング編集
+ツールバー内に「適用」ボタンが存在することが判明した
+(`_find_url_apply_button`)。「適用」ボタンの`id`(`:r16:`のような値)は
+Reactの`useId`等が生成する動的IDの可能性が高いためセレクタには使わず、
+ページ全体からの「適用」文字列検索でもなく、URL入力欄の特定に使ったのと
+同じアクティブなツールバーをスコープとして`get_by_role("button",
+name="適用", exact=True)`で一意に特定する。URL入力欄がそのツールバー内に
+ちょうど1件存在することも再確認し(URL入力欄と「適用」ボタンが同じ
+ツールバー内にあることを、DOM構造の推測やXPathでの祖先指定を使わずに、
+スコープそのもので保証する)、viewport確認(`_ensure_link_button_in_
+viewport()`の再利用)・`_assert_not_publish_action()`を経てからクリック
+する。クリック直後にHTML/スクリーンショット/診断データを保存したうえで
+`UrlApplyObservationStop`(`UrlInputObservationStop`とはログ上で区別
+できる別のサブクラス)を送出して処理を止める。`<a>`要素が実際に生成
+されたか、`href`が期待通りか、URL入力UIが消えるか等はまだ実機で確認
+できていないため、`_assert_links_match()`や下書き保存へはまだ進まない。
+`UrlInputObservationStop`自体はクラスとして削除せず、「URL入力・
+read-backまでは確認できている」段階を明示する診断用の例外として残して
+いる。
+
 ★本文テキスト検証とリンク検証の分離★
 _assert_body_matches()は引き続き「見えているテキスト」だけを検証する
 (商品リンク導入後も、本文には生URLが一切含まれないため、この検証で
@@ -531,18 +559,41 @@ class LinkButtonObservationStop(NotePosterError):
 
 class UrlInputObservationStop(NotePosterError):
     """商品導線リンクのURL入力欄にURLを入力し、read-backで一致を確認した
-    直後に、意図的に処理を安全停止する際に送出する
-    (観測専用実装・第2段階、2026年8月29日)。
+    直後の状態を表す例外(観測専用実装・第2段階、2026年8月29日)。
+
+    ★2026年8月29日時点の位置づけ★: 当初は、URL入力・read-back確認の
+    直後にこの例外を送出して処理を停止していた(観測専用実装・第2段階)。
+    その後、「適用」ボタンのクリックまで実装を進めた(第3段階、
+    `UrlApplyObservationStop`)ため、通常の成功パスの終端としてはこの
+    例外はもう送出されない。それでも、「URL入力・read-backまでは確認
+    できている」という段階を明示できる診断用の例外として、クラス自体は
+    削除せず残している(将来、「適用」ボタンの特定・クリックに失敗する
+    ケースの切り分けに再利用する可能性があるため)。
 
     URLの確定方法(Enterキー送信・確定ボタンのクリック等)はまだ実機で
-    確認できていないため、確定操作へは進まず、HTML/スクリーンショット/
-    診断データを保存したうえでここで停止する。`LinkButtonObservationStop`
-    (リンクボタンをクリックした直後の観測停止)とはログ上で明確に区別
-    できるよう、別の専用サブクラスにしている(ログを見れば「リンクボタン
-    クリック後の観測停止」なのか「URL入力後の観測停止」なのかが一目で
-    分かる)。read-backが不一致だった場合はこの例外ではなく、通常の
-    NotePosterErrorを送出する(観測が成功した上での意図的な停止ではなく、
-    実際に問題が起きたことを示すため)。
+    確認できていない段階を表すためのものであり、確定操作へは進まず、
+    HTML/スクリーンショット/診断データを保存したうえで停止する用途で
+    設計されている。`LinkButtonObservationStop`(リンクボタンをクリック
+    した直後の観測停止)とはログ上で明確に区別できるよう、別の専用
+    サブクラスにしている。read-backが不一致だった場合はこの例外では
+    なく、通常のNotePosterErrorを送出する(観測が成功した上での意図的な
+    停止ではなく、実際に問題が起きたことを示すため)。
+    """
+
+
+class UrlApplyObservationStop(NotePosterError):
+    """商品導線リンクのURL入力欄に対して「適用」ボタンをクリックした
+    直後に、意図的に処理を安全停止する際に送出する
+    (観測専用実装・第3段階、2026年8月29日)。
+
+    「適用」ボタンをクリックした後に実際に「→ 商品を見る」が`<a>`要素に
+    なるか、`href`が期待したURLと一致するか、URL入力UIが消えるか等は
+    まだ実機で確認できていない。そのため`_assert_links_match()`や下書き
+    保存へは進まず、HTML/スクリーンショット/診断データを保存したうえで
+    ここで停止する。`LinkButtonObservationStop`(リンクボタンクリック後の
+    観測停止)・`UrlInputObservationStop`(URL入力・read-back確認後の
+    観測停止)とはログ上で明確に区別できるよう、別の専用サブクラスに
+    している。
     """
 
 
@@ -1819,6 +1870,94 @@ class NotePoster:
             )
         return url_input
 
+    def _find_url_apply_button(
+        self, page: Page, timeout_ms: int = _URL_INPUT_APPEAR_TIMEOUT_MS
+    ) -> Locator:
+        """URL入力・read-back確認の後、noteのフローティング編集ツールバー
+        内で「適用」ボタンを一意に特定する。
+
+        実機のGitHub Actions実行(TEST-004)で、「適用」ボタンとURL入力欄
+        (textarea)は、リンクボタンの特定に使っているのと同じフローティング
+        編集ツールバー(`_ACTIVE_TOOLBAR_SELECTOR`)の内部に存在すること
+        が判明した。
+
+          <div data-active="true" role="toolbar" id="desktop-toolbar">
+            ...
+            <textarea inputmode="text" name="alt" placeholder="https://">
+            </textarea>
+            <button data-name="Button" type="button" id=":r16:">
+              <span>適用</span>
+            </button>
+            <button aria-label="URLの入力をやめる">...</button>
+            ...
+          </div>
+
+        「適用」ボタンの`id`(`:r16:`のような値)はReactの`useId`等が生成
+        する動的IDの可能性が高く、実行のたびに変わりうるためセレクタには
+        使わない。style属性内のclass名(styled-components由来のハッシュ)
+        にも依存しない。
+
+        代わりに、URL入力欄の特定(`_find_url_input_textarea`)と同じ
+        アクティブなツールバーをスコープとして使う。ページ全体から
+        「適用」という文字列を検索するのではなく、
+          1. `_ACTIVE_TOOLBAR_SELECTOR`がページ内にちょうど1件であること
+             を再確認する
+          2. そのツールバー内で`_URL_INPUT_SELECTOR`に一致するURL入力欄が
+             ちょうど1件であることを再確認する(URL入力欄と「適用」ボタン
+             が同じツールバー内にあることを、DOM構造の推測やXPathでの
+             祖先指定を使わずに、スコープそのもので保証する)
+          3. そのツールバー内で`get_by_role("button", name="適用",
+             exact=True)`に一致するボタンの出現を待ち、ちょうど1件で
+             あることを確認する
+        のいずれかが成立しない場合は、`.first()`/`.nth()`のような位置
+        ベースの推測に頼らず、NotePosterErrorを送出して安全停止する
+        (呼び出し側でneeds_reviewに倒れる)。
+        """
+        toolbar = page.locator(_ACTIVE_TOOLBAR_SELECTOR)
+        self._wait_for_locator_to_appear(toolbar, timeout_ms)
+        try:
+            toolbar_count = toolbar.count()
+        except PlaywrightTimeoutError:
+            toolbar_count = 0
+        if toolbar_count != 1:
+            self._capture_failure(page, "商品導線URL適用_ツールバー再確認")
+            raise NotePosterError(
+                f"「適用」ボタンを探す前のツールバー再確認で"
+                f"({_ACTIVE_TOOLBAR_SELECTOR})が{toolbar_count}件でした"
+                "(期待: 1件)。安全に特定できないため処理を中断します。"
+            )
+
+        url_input_in_toolbar = toolbar.locator(_URL_INPUT_SELECTOR)
+        try:
+            url_input_count = url_input_in_toolbar.count()
+        except PlaywrightTimeoutError:
+            url_input_count = 0
+        if url_input_count != 1:
+            self._capture_failure(page, "商品導線URL適用_URL入力欄再確認")
+            raise NotePosterError(
+                f"「適用」ボタンを探す前のURL入力欄再確認で"
+                f"({_URL_INPUT_SELECTOR})が同じツールバー内に"
+                f"{url_input_count}件でした(期待: 1件)。安全に特定できない"
+                "ため処理を中断します。"
+            )
+
+        apply_button = toolbar.get_by_role("button", name="適用", exact=True)
+        self._wait_for_locator_to_appear(apply_button, timeout_ms)
+        try:
+            apply_button_count = apply_button.count()
+        except PlaywrightTimeoutError:
+            apply_button_count = 0
+        if apply_button_count != 1:
+            self._capture_failure(page, "商品導線URL適用ボタン特定")
+            raise NotePosterError(
+                "ツールバー内の「適用」ボタン"
+                '(get_by_role("button", name="適用", exact=True))が'
+                f"{timeout_ms}ms待っても{apply_button_count}件でした"
+                "(期待: 1件)。ボタンを安全に特定できないため処理を"
+                "中断します。"
+            )
+        return apply_button
+
     def _set_link_on_text_occurrence(
         self, page: Page, block: Locator, link: ProductLink
     ) -> None:
@@ -1880,6 +2019,24 @@ class NotePoster:
         `LinkButtonOutOfViewportError`で安全停止する。クリック自体の
         タイムアウトも、既定の30秒ではなく短い上限
         (`_LINK_BUTTON_CLICK_TIMEOUT_MS`)に変更した。
+
+        ★「適用」ボタンクリック・第4段階(2026年8月29日時点、TEST-004の
+        追加実機実行を踏まえた修正)★
+        上記の第3段階を実機で実行したところ、URL入力・read-back一致まで
+        成功した。追加で取得した実機Artifactから、URL入力欄と同じ
+        フローティング編集ツールバー内に「適用」ボタンが存在することが
+        判明した(`_find_url_apply_button`)。そこでこの段階では、
+        read-backが一致した後、この「適用」ボタンをツールバーというスコープ
+        の中で一意に特定できた場合のみ、`_ensure_link_button_in_viewport()`
+        でviewport内であることを確認し、`_assert_not_publish_action()`を
+        適用したうえで通常の`click()`(短いタイムアウト)を行う。クリック
+        直後にHTML/スクリーンショット/診断データを保存したうえで
+        `UrlApplyObservationStop`(`UrlInputObservationStop`とはログ上で
+        区別できる別のサブクラス)を送出して処理を止める。`<a>`要素が
+        実際に生成されたか、`href`が期待通りか、URL入力UIが消えるか等は
+        まだ実機で確認できていないため、`_assert_links_match()`や下書き
+        保存へはまだ進まない。次回の実機テストでこの観測データを取得した
+        のち、URL確定の完了確認・後続処理を本実装する想定である。
         """
         self._select_product_link_text_in_block(page, block)
 
@@ -1925,12 +2082,24 @@ class NotePoster:
                 "安全のため処理を中断します。"
             )
 
-        self._capture_failure(page, "商品導線URL入力後の観測")
-        raise UrlInputObservationStop(
-            f"『{link.label}』のURL入力欄に{link.url!r}を入力し、"
-            "read-backで一致を確認しました。URLの確定方法(Enter送信・"
-            "Tab送信・意図的なフォーカス解除・確定ボタンのクリック等)は"
-            "まだ実機で確認できていないため、確定操作は行わず、観測のために"
+        apply_button = self._find_url_apply_button(page)
+        self._ensure_link_button_in_viewport(page, apply_button)
+        self._assert_not_publish_action(apply_button)
+        try:
+            apply_button.click(timeout=_LINK_BUTTON_CLICK_TIMEOUT_MS)
+        except PlaywrightError as exc:
+            self._capture_failure(page, "商品導線URL適用ボタンクリック失敗")
+            raise NotePosterError(
+                f"『{link.label}』の「適用」ボタンのクリックに失敗しました: {exc}"
+            ) from exc
+
+        self._capture_failure(page, "商品導線URL適用後の観測")
+        raise UrlApplyObservationStop(
+            f"『{link.label}』のURL入力欄に{link.url!r}を入力してread-back"
+            "で一致を確認したうえで、ツールバー内の「適用」ボタンをクリック"
+            "しました。<a>要素が実際に生成されたか、hrefが期待通りか、"
+            "URL入力UIが消えるか等はまだ実機で確認できていないため、"
+            "_assert_links_match()や下書き保存へは進まず、観測のために"
             "意図的にここで処理を停止します"
             "(HTML/スクリーンショット/診断データは保存済みです)。"
         )

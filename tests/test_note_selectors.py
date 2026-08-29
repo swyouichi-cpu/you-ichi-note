@@ -26,6 +26,7 @@ from src.note import (  # noqa: E402
     ProductLink,
     ProductLinkValidationError,
     TagValidationError,
+    UrlApplyObservationStop,
     UrlInputObservationStop,
     _bounding_box_within_viewport,
     _normalize_whitespace,
@@ -873,7 +874,9 @@ _LINK_TOOLBAR_HTML = """
   document.querySelector('#desktop-toolbar button[aria-label="リンク"]')
     .addEventListener('click', (e) => {
       e.target.setAttribute('data-clicked', 'true');
-      // 実機で確認できたURL入力欄(TEST-004の追加観測)を再現する。
+      // 実機で確認できたURL入力UI(TEST-004の追加観測)を、実機と同じく
+      // active toolbar(#desktop-toolbar)の内部に再現する。
+      const toolbar = document.getElementById('desktop-toolbar');
       const textarea = document.createElement('textarea');
       textarea.setAttribute('inputmode', 'text');
       textarea.setAttribute('name', 'alt');
@@ -881,10 +884,21 @@ _LINK_TOOLBAR_HTML = """
       textarea.addEventListener('keydown', (ev) => {
         window.__urlInputKeys.push(ev.key);
       });
+      const applyButton = document.createElement('button');
+      applyButton.setAttribute('data-name', 'Button');
+      applyButton.setAttribute('type', 'button');
+      applyButton.id = ':r16:';
+      const applySpan = document.createElement('span');
+      applySpan.textContent = '適用';
+      applyButton.appendChild(applySpan);
+      applyButton.addEventListener('click', (ev) => {
+        ev.target.closest('button').setAttribute('data-clicked', 'true');
+      });
       const cancelButton = document.createElement('button');
       cancelButton.setAttribute('aria-label', 'URLの入力をやめる');
-      document.body.appendChild(textarea);
-      document.body.appendChild(cancelButton);
+      toolbar.appendChild(textarea);
+      toolbar.appendChild(applyButton);
+      toolbar.appendChild(cancelButton);
     });
 </script>
 """
@@ -895,10 +909,11 @@ _ACTIVE_TOOLBAR_SELECTOR_FOR_TESTS = 'div[role="toolbar"][data-active="true"]'
 
 def test_apply_product_links_clicks_toolbar_button_and_inputs_url_then_stops_for_observation(page):
     # リンクボタンをクリックした先に出現するURL入力欄まで到達し、URLを
-    # 入力してread-backが一致することを確認したうえで、意図的に
-    # UrlInputObservationStopで安全停止する(観測専用実装・第2段階)。
-    # URLの確定操作(Enter/Tab/フォーカス解除/確定ボタン/他要素クリック)は
-    # 一切行わない。
+    # 入力してread-backが一致することを確認したうえで、ツールバー内の
+    # 「適用」ボタンをクリックし、意図的にUrlApplyObservationStopで安全
+    # 停止する(観測専用実装・第4段階)。URLの確定操作のうちEnter/Tab/
+    # フォーカス解除/他要素クリックは一切行わない(「適用」ボタンの
+    # クリックだけが、実機で確認できた確定操作の一部として実装されている)。
     page.set_content(_LINK_TOOLBAR_HTML)
     poster = _bare_poster()
     body_locator = page.locator(".editor")
@@ -906,24 +921,31 @@ def test_apply_product_links_clicks_toolbar_button_and_inputs_url_then_stops_for
         ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
     ]
 
-    with pytest.raises(UrlInputObservationStop):
+    with pytest.raises(UrlApplyObservationStop):
         poster._apply_product_links(page, body_locator, links)
 
-    button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
-    assert button.get_attribute("data-clicked") == "true"
+    link_button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
+    assert link_button.get_attribute("data-clicked") == "true"
 
     url_input = page.locator(_URL_INPUT_SELECTOR_FOR_TESTS)
     assert url_input.input_value() == links[0].url
-    # URL確定操作を一切行っていないため、<a>要素はまだ作られていない。
+
+    apply_button = page.locator("#desktop-toolbar").get_by_role(
+        "button", name="適用", exact=True
+    )
+    assert apply_button.get_attribute("data-clicked") == "true"
+    # <a href>の生成確認・_assert_links_match()・下書き保存にはまだ
+    # 進んでいないため、<a>要素はまだ作られていない。
     assert body_locator.locator("a").count() == 0
     # Enter/Tabを送信していないことを確認する(press_sequentially由来の
     # 文字キー以外が送られていないこと)。
     sent_keys = page.evaluate("() => window.__urlInputKeys")
     assert "Enter" not in sent_keys
     assert "Tab" not in sent_keys
-    # 診断処理(_capture_failure)自身がフォーカスを外していないことも
-    # 確認する(URL入力欄がactiveElementのままであること)。
-    assert page.evaluate("() => document.activeElement.tagName") == "TEXTAREA"
+    # 診断処理(_capture_failure)自身が意図しないフォーカス操作を行わない
+    # ことも確認する(直前にクリックした「適用」ボタンがactiveElementの
+    # ままであること)。
+    assert page.evaluate("() => document.activeElement.tagName") == "BUTTON"
 
 
 def test_apply_product_links_is_noop_when_no_links():
@@ -1404,20 +1426,27 @@ def test_set_link_on_text_occurrence_raises_when_block_has_no_matching_text_node
         )
 
 
-def test_set_link_on_text_occurrence_inputs_url_then_raises_url_input_observation_stop(page):
+def test_set_link_on_text_occurrence_inputs_url_and_clicks_apply_then_raises_apply_observation_stop(
+    page,
+):
     page.set_content(_LINK_TOOLBAR_HTML)
     poster = _bare_poster()
     block = page.locator(".editor p").nth(2)
     link = ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a")
 
-    with pytest.raises(UrlInputObservationStop):
+    with pytest.raises(UrlApplyObservationStop):
         poster._set_link_on_text_occurrence(page, block, link)
 
-    button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
-    assert button.get_attribute("data-clicked") == "true"
+    link_button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
+    assert link_button.get_attribute("data-clicked") == "true"
     url_input = page.locator(_URL_INPUT_SELECTOR_FOR_TESTS)
     assert url_input.input_value() == link.url
-    # URL確定操作は行っていないため、<a>要素はまだ作られていない。
+    apply_button = page.locator("#desktop-toolbar").get_by_role(
+        "button", name="適用", exact=True
+    )
+    assert apply_button.get_attribute("data-clicked") == "true"
+    # <a href>の生成確認・_assert_links_match()・下書き保存にはまだ
+    # 進んでいないため、<a>要素はまだ作られていない。
     assert page.locator(".editor a").count() == 0
 
 
@@ -1653,6 +1682,143 @@ def test_find_url_input_textarea_raises_when_multiple_appear(page):
         poster._find_url_input_textarea(page, timeout_ms=200)
 
 
+# -- _find_url_apply_button(実機Artifactで確認した「適用」ボタン構造) ------
+#
+# TEST-004の追加観測で、「適用」ボタンはURL入力欄と同じactive toolbar
+# (role="toolbar" data-active="true")の内部に存在することが判明した。
+#   <button data-name="Button" type="button" id=":r16:"><span>適用</span></button>
+# idはReactのuseId等が生成する動的な値の可能性が高いためセレクタには使わず、
+# ページ全体からの「適用」文字列検索でもなく、確認済みのactive toolbarを
+# スコープとしてget_by_role("button", name="適用", exact=True)で特定する。
+
+
+def _toolbar_with_url_input_and_apply_button_html(*, apply_button_html: str) -> str:
+    return (
+        '<div data-active="true" role="toolbar" id="desktop-toolbar">'
+        '<textarea inputmode="text" name="alt" placeholder="https://"></textarea>'
+        f"{apply_button_html}"
+        '<button aria-label="URLの入力をやめる"></button>'
+        "</div>"
+    )
+
+
+_TOOLBAR_WITH_APPLY_BUTTON_HTML = _toolbar_with_url_input_and_apply_button_html(
+    apply_button_html=(
+        '<button data-name="Button" type="button" id=":r16:"><span>適用</span></button>'
+    )
+)
+
+
+def test_find_url_apply_button_finds_the_button_scoped_to_the_toolbar(page):
+    page.set_content(_TOOLBAR_WITH_APPLY_BUTTON_HTML)
+    poster = _bare_poster()
+
+    apply_button = poster._find_url_apply_button(page)
+
+    assert apply_button.inner_text().strip() == "適用"
+
+
+def test_find_url_apply_button_raises_when_no_active_toolbar(page):
+    page.set_content("<div>本文</div>")
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_url_apply_button(page, timeout_ms=200)
+
+
+def test_find_url_apply_button_raises_when_url_input_missing_from_toolbar(page):
+    # ツールバーはあるがURL入力欄が見当たらない(構造の想定違い)場合は、
+    # 「適用」ボタンを探しに行かず安全停止する。
+    page.set_content(
+        '<div data-active="true" role="toolbar" id="desktop-toolbar">'
+        '<button data-name="Button" type="button"><span>適用</span></button>'
+        "</div>"
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_url_apply_button(page, timeout_ms=200)
+
+
+def test_find_url_apply_button_raises_when_button_missing(page):
+    page.set_content(
+        '<div data-active="true" role="toolbar" id="desktop-toolbar">'
+        '<textarea inputmode="text" name="alt" placeholder="https://"></textarea>'
+        "</div>"
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_url_apply_button(page, timeout_ms=200)
+
+
+def test_find_url_apply_button_raises_when_button_duplicated_in_toolbar(page):
+    page.set_content(
+        _toolbar_with_url_input_and_apply_button_html(
+            apply_button_html=(
+                '<button><span>適用</span></button><button><span>適用</span></button>'
+            )
+        )
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_url_apply_button(page, timeout_ms=200)
+
+
+def test_find_url_apply_button_ignores_apply_labeled_button_outside_toolbar(page):
+    # ツールバーの外にある同名の「適用」ボタンを誤って拾わないことを確認
+    # する(ページ全体の文字列検索ではなく、toolbarというスコープで一意に
+    # 特定していることの確認)。
+    page.set_content(
+        '<button><span>適用</span></button>'
+        + _toolbar_with_url_input_and_apply_button_html(apply_button_html="")
+    )
+    poster = _bare_poster()
+
+    with pytest.raises(NotePosterError):
+        poster._find_url_apply_button(page, timeout_ms=200)
+
+
+def test_find_url_apply_button_succeeds_when_it_appears_after_a_short_delay(page):
+    page.set_content(
+        '<div data-active="true" role="toolbar" id="desktop-toolbar">'
+        '<textarea inputmode="text" name="alt" placeholder="https://"></textarea>'
+        "</div>"
+        """
+        <script>
+          setTimeout(() => {
+            const btn = document.createElement('button');
+            const span = document.createElement('span');
+            span.textContent = '適用';
+            btn.appendChild(span);
+            document.getElementById('desktop-toolbar').appendChild(btn);
+          }, 300);
+        </script>
+        """
+    )
+    poster = _bare_poster()
+
+    apply_button = poster._find_url_apply_button(page, timeout_ms=2000)
+
+    assert apply_button.inner_text().strip() == "適用"
+
+
+def test_find_url_apply_button_does_not_use_dynamic_id_or_first_or_nth():
+    """「適用」ボタンの特定に、動的なid(:r16:等)や.first()/.nth()の
+    ような位置ベースの絞り込みを使っていないことをソースから確認する
+    回帰テスト。
+    """
+    import inspect
+
+    source = inspect.getsource(NotePoster._find_url_apply_button)
+    code_only = source.replace(NotePoster._find_url_apply_button.__doc__ or "", "")
+    assert ":r16:" not in code_only
+    assert "get_by_role" in code_only
+    assert ".first" not in code_only
+    assert ".nth(" not in code_only
+
+
 _LINK_TOOLBAR_HTML_WITH_MISBEHAVING_URL_INPUT = """
 <div class="editor" contenteditable="true">
   <p>本文</p>
@@ -1743,6 +1909,7 @@ def test_set_link_on_text_occurrence_source_has_no_positional_fallback_candidate
         NotePoster._set_link_on_text_occurrence,
         NotePoster._find_active_link_toolbar_button,
         NotePoster._find_url_input_textarea,
+        NotePoster._find_url_apply_button,
         NotePoster._find_product_link_block,
         NotePoster._select_product_link_text_in_block,
     ):
@@ -1751,18 +1918,21 @@ def test_set_link_on_text_occurrence_source_has_no_positional_fallback_candidate
 
 
 def test_set_link_on_text_occurrence_source_never_confirms_the_url():
-    """URL入力後の確定操作(Enter/Tab送信、確定ボタンのクリック等)を
-    まだ一切実装していないことをソースから確認する回帰テスト。
+    """URL入力後の確定操作のうち、Enter/Tab送信・意図的なフォーカス解除・
+    「URLの入力をやめる」ボタンのクリックはまだ実装していないことを
+    ソースから確認する回帰テスト。「適用」ボタンのクリックは実機で確認
+    できた確定操作の一部としてすでに実装済みのため、対象外とする。
     """
     import inspect
 
     source = inspect.getsource(NotePoster._set_link_on_text_occurrence)
-    assert 'press("Enter")' not in source
-    assert 'press("Tab")' not in source
-    assert "URLの入力をやめる" not in source
-    # url_input自身への操作(click/press_sequentially/input_value)以外の
-    # 要素をクリックしていないことも確認する(他の場所をクリックしない)。
-    assert source.count(".click()") == 2  # link_button.click() と url_input.click()
+    code_only = source.replace(NotePoster._set_link_on_text_occurrence.__doc__ or "", "")
+    assert 'press("Enter")' not in code_only
+    assert 'press("Tab")' not in code_only
+    assert "URLの入力をやめる" not in code_only
+    # クリックしているのはlink_button・url_input・apply_buttonの3箇所だけ
+    # であることを確認する(他の要素をクリックしていないことの確認)。
+    assert code_only.count(".click(") == 3
 
 
 def _product_trailer_html(entries: list[tuple[str, str | None]]) -> str:
