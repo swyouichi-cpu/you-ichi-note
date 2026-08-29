@@ -836,15 +836,18 @@ def test_publish_related_labels_are_never_used_as_click_selectors():
 # できていないため、ここでの疑似UIは「input[type=url]」という、
 # _open_link_input_via_shortcut が実際に試す候補の1つを模したものであり、
 # 実機と完全に一致する保証はない。
+#
+# 商品名(label)と「→ 商品を見る」のHTML構造は、実機のGitHub Actions実行
+# (TEST-004)で、noteのエディタが別々の<p>要素にはせず、同一の<p>要素内に
+# <br>を挟んで描画すること(<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>)が
+# 判明したため、以下のフィクスチャはすべてこの実機DOM構造を再現している。
 
 _LINK_SHORTCUT_HTML = """
 <div class="editor" contenteditable="true">
   <p>本文</p>
   <p>この記事に出てきた商品</p>
-  <p>TOY JAM 瀬戸内レモン</p>
-  <p>→ 商品を見る</p>
-  <p>TOY JAM 瀬戸内レモン月桂樹</p>
-  <p>→ 商品を見る</p>
+  <p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>
+  <p>TOY JAM 瀬戸内レモン月桂樹<br>→ 商品を見る</p>
 </div>
 <input type="url" id="url-input" style="display:none">
 <script>
@@ -878,127 +881,212 @@ _LINK_SHORTCUT_HTML = """
 def test_apply_product_links_sets_correct_href_on_each_occurrence(page):
     page.set_content(_LINK_SHORTCUT_HTML)
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
     links = [
         ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
         ProductLink(label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"),
     ]
 
-    poster._apply_product_links(page, links)
+    poster._apply_product_links(page, body_locator, links)
 
-    occurrences = page.get_by_text("→ 商品を見る", exact=True)
-    assert occurrences.nth(0).evaluate("el => el.tagName") == "A"
-    assert occurrences.nth(0).get_attribute("href") == links[0].url
-    assert occurrences.nth(1).evaluate("el => el.tagName") == "A"
-    assert occurrences.nth(1).get_attribute("href") == links[1].url
-    # 商品名自体はリンクされていない。
-    label_element = page.get_by_text("TOY JAM 瀬戸内レモン", exact=True).first
-    assert label_element.evaluate("el => el.tagName") != "A"
-    assert label_element.locator("a").count() == 0
+    editor_paragraphs = body_locator.locator("p")
+    block_a = editor_paragraphs.nth(2)
+    block_b = editor_paragraphs.nth(3)
+    # それぞれのブロックにちょうど1件の<a>要素があり、リンクテキストは
+    # 「→ 商品を見る」だけ(商品名は選択・リンクに含まれていない)。
+    assert block_a.locator("a").count() == 1
+    assert block_a.locator("a").first.inner_text().strip() == "→ 商品を見る"
+    assert block_a.locator("a").first.get_attribute("href") == links[0].url
+    assert block_b.locator("a").count() == 1
+    assert block_b.locator("a").first.inner_text().strip() == "→ 商品を見る"
+    assert block_b.locator("a").first.get_attribute("href") == links[1].url
 
 
 def test_apply_product_links_is_noop_when_no_links():
     poster = _bare_poster()
     # ページを用意せずとも、product_links が空なら何もせず正常終了するはず。
-    poster._apply_product_links(page=None, product_links=[])  # 例外が出なければOK
+    poster._apply_product_links(
+        page=None, body_locator=None, product_links=[]
+    )  # 例外が出なければOK
 
 
-def test_apply_product_links_raises_when_occurrence_count_mismatches(page):
-    # 「→ 商品を見る」が本文中に1件しか無いのに、2件のproduct_linksを
-    # 渡した場合、どちらがどちらに対応するか一意に定まらないため安全停止する。
+def test_apply_product_links_raises_when_label_block_not_found(page):
+    # product_linksに商品Bが含まれているのに、本文中に商品Bを含むブロックが
+    # 存在しない場合、どのブロックがどのリンクに対応するか一意に定まらない
+    # ため安全停止する。
     page.set_content(
         '<div class="editor" contenteditable="true">'
         "<p>この記事に出てきた商品</p>"
-        "<p>商品A</p>"
-        "<p>→ 商品を見る</p>"
+        "<p>商品A<br>→ 商品を見る</p>"
         "</div>"
     )
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
     links = [
         ProductLink(label="商品A", url="https://example.com/a"),
         ProductLink(label="商品B", url="https://example.com/b"),
     ]
 
     with pytest.raises(NotePosterError):
-        poster._apply_product_links(page, links)
+        poster._apply_product_links(page, body_locator, links)
 
 
-# -- _resolve_link_target_for_label(商品名との位置関係による一意特定) -------
+# -- _find_product_link_block(商品名を含むブロックの一意特定、TEST-004対応) --
 #
-# 「ページ全体でN番目に出現するか」という一覧インデックスだけに頼るのでは
-# なく、商品名(label)の直後にある兄弟要素という、build_product_links_
-# trailer()自身が生成したDOM構造との対応関係を使って一意に特定する。
+# 実機DOM(TEST-004)で、商品名(label)と「→ 商品を見る」が別々の<p>では
+# なく同一の<p>内に<br>を挟んで存在することが判明したため、「商品名の
+# 直後の兄弟要素」ではなく「商品名と『→ 商品を見る』の両方を含む
+# ブロック」として一意に特定する方式に変更した。
 
 
-def test_resolve_link_target_for_label_finds_the_paragraph_right_after_label(page):
+def test_find_product_link_block_finds_the_correct_block_for_each_label(page):
     page.set_content(
         '<div class="editor" contenteditable="true">'
         "<p>この記事に出てきた商品</p>"
-        "<p>商品A</p>"
-        "<p>→ 商品を見る</p>"
-        "<p>商品B</p>"
-        "<p>→ 商品を見る</p>"
+        "<p>商品A<br>→ 商品を見る</p>"
+        "<p>商品B<br>→ 商品を見る</p>"
         "</div>"
     )
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
 
-    target_a = poster._resolve_link_target_for_label(
-        page, ProductLink(label="商品A", url="https://example.com/a")
+    block_a = poster._find_product_link_block(
+        page, body_locator, ProductLink(label="商品A", url="https://example.com/a")
     )
-    target_b = poster._resolve_link_target_for_label(
-        page, ProductLink(label="商品B", url="https://example.com/b")
+    block_b = poster._find_product_link_block(
+        page, body_locator, ProductLink(label="商品B", url="https://example.com/b")
     )
 
-    assert target_a.inner_text().strip() == "→ 商品を見る"
-    assert target_b.inner_text().strip() == "→ 商品を見る"
-    assert poster._same_element(page, target_a, target_b) is False
+    assert block_a.inner_text().strip() == "商品A\n→ 商品を見る"
+    assert block_b.inner_text().strip() == "商品B\n→ 商品を見る"
+    assert poster._same_element(page, block_a, block_b) is False
 
 
-def test_resolve_link_target_for_label_raises_when_label_appears_multiple_times(page):
-    # 商品名が本文中に偶然複数回出現する場合、どちらが商品導線の行かを
+def test_find_product_link_block_raises_when_label_appears_in_multiple_blocks(page):
+    # 商品名が本文中に偶然複数回出現する場合、どのブロックが商品導線かを
     # 安全に一意特定できないため中断する。
     page.set_content(
         '<div class="editor" contenteditable="true">'
         "<p>商品A</p>"
         "<p>この記事に出てきた商品</p>"
-        "<p>商品A</p>"
-        "<p>→ 商品を見る</p>"
+        "<p>商品A<br>→ 商品を見る</p>"
         "</div>"
     )
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
 
     with pytest.raises(NotePosterError):
-        poster._resolve_link_target_for_label(
-            page, ProductLink(label="商品A", url="https://example.com/a")
+        poster._find_product_link_block(
+            page, body_locator, ProductLink(label="商品A", url="https://example.com/a")
         )
 
 
-def test_resolve_link_target_for_label_raises_when_next_sibling_is_not_link_text(page):
-    # labelの直後の要素が「→ 商品を見る」ではない(構造が想定と異なる)場合、
-    # 推測せず中断する。
+def test_find_product_link_block_raises_when_block_has_no_link_text(page):
+    # 商品名を含むブロックはあるが、その中に「→ 商品を見る」が無い
+    # (構造が想定と異なる)場合は推測せず中断する。
     page.set_content(
         '<div class="editor" contenteditable="true">'
         "<p>この記事に出てきた商品</p>"
         "<p>商品A</p>"
-        "<p>関係ない文章</p>"
         "</div>"
     )
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
 
     with pytest.raises(NotePosterError):
-        poster._resolve_link_target_for_label(
-            page, ProductLink(label="商品A", url="https://example.com/a")
+        poster._find_product_link_block(
+            page, body_locator, ProductLink(label="商品A", url="https://example.com/a")
         )
 
 
-def test_resolve_link_target_for_label_raises_when_label_is_the_last_element(page):
-    # labelの直後に兄弟要素が無い場合も安全に一意特定できないため中断する。
-    page.set_content('<div class="editor" contenteditable="true"><p>商品A</p></div>')
+def test_find_product_link_block_raises_when_link_text_appears_twice_in_block(page):
+    # 同一ブロック内に「→ 商品を見る」が複数回出現する場合も、どちらを
+    # 対象にすべきか一意に定まらないため中断する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>商品A<br>→ 商品を見る<br>→ 商品を見る</p>"
+        "</div>"
+    )
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
 
     with pytest.raises(NotePosterError):
-        poster._resolve_link_target_for_label(
-            page, ProductLink(label="商品A", url="https://example.com/a")
+        poster._find_product_link_block(
+            page, body_locator, ProductLink(label="商品A", url="https://example.com/a")
         )
+
+
+def test_find_product_link_block_raises_when_block_has_unexpected_extra_line(page):
+    # ブロック内の行構成が [label, リンク対象] のちょうど2行と異なる場合
+    # (余計な行がある等)、構造が想定と異なるため推測せず中断する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>商品A<br>→ 商品を見る<br>おまけ</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    with pytest.raises(NotePosterError):
+        poster._find_product_link_block(
+            page, body_locator, ProductLink(label="商品A", url="https://example.com/a")
+        )
+
+
+def test_find_product_link_block_raises_when_no_block_contains_the_label(page):
+    # 商品名を含むブロックがそもそも本文editor内に1つも無い場合。
+    page.set_content('<div class="editor" contenteditable="true"></div>')
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    with pytest.raises(NotePosterError):
+        poster._find_product_link_block(
+            page, body_locator, ProductLink(label="商品A", url="https://example.com/a")
+        )
+
+
+# -- _select_product_link_text_in_block(ブロック内の対象テキストだけを選択) --
+
+
+def test_select_product_link_text_in_block_selects_only_the_link_text(page):
+    page.set_content(
+        '<div class="editor" contenteditable="true"><p>商品A<br>→ 商品を見る</p></div>'
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").first
+
+    poster._select_product_link_text_in_block(page, block)
+
+    selected = page.evaluate("() => window.getSelection().toString()")
+    assert selected.strip() == "→ 商品を見る"
+
+
+def test_select_product_link_text_in_block_raises_when_no_matching_text_node(page):
+    # 「→ 商品を見る」がブロックの直接の子テキストノードとして存在しない
+    # (別の文言しかない)場合は推測で選択せず中断する。
+    page.set_content(
+        '<div class="editor" contenteditable="true"><p>商品A<br>違う文言</p></div>'
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").first
+
+    with pytest.raises(NotePosterError):
+        poster._select_product_link_text_in_block(page, block)
+
+
+def test_select_product_link_text_in_block_raises_when_link_text_appears_twice(page):
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>商品A<br>→ 商品を見る<br>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").first
+
+    with pytest.raises(NotePosterError):
+        poster._select_product_link_text_in_block(page, block)
 
 
 # -- _open_link_input_via_shortcut(Control+K / Meta+Kの2変種を順に試す) ------
@@ -1007,8 +1095,8 @@ def test_resolve_link_target_for_label_raises_when_label_is_the_last_element(pag
 def test_open_link_input_via_shortcut_succeeds_with_control_k(page):
     page.set_content(_LINK_SHORTCUT_HTML)
     poster = _bare_poster()
-    target = page.get_by_text("→ 商品を見る", exact=True).first
-    target.select_text()
+    block = page.locator(".editor p").nth(2)
+    poster._select_product_link_text_in_block(page, block)
 
     url_input = poster._open_link_input_via_shortcut(page)
 
@@ -1050,16 +1138,16 @@ def test_open_link_input_via_shortcut_raises_when_neither_modifier_works(page):
         poster._open_link_input_via_shortcut(page)
 
 
-def test_set_link_on_text_occurrence_raises_when_selection_does_not_match_expected_text(page):
-    # target.select_text() で選択されるはずのテキストが、意図した
-    # 「→ 商品を見る」と異なる場合(構造の想定違い)は安全停止する。
+def test_set_link_on_text_occurrence_raises_when_block_has_no_matching_text_node(page):
+    # ブロック内に「→ 商品を見る」と完全一致する直接の子テキストノードが
+    # 無い(構造の想定違い)場合は安全停止する。
     page.set_content('<div class="editor" contenteditable="true"><p>違う文言</p></div>')
     poster = _bare_poster()
-    target = page.locator(".editor p").first
+    block = page.locator(".editor p").first
 
     with pytest.raises(NotePosterError):
         poster._set_link_on_text_occurrence(
-            page, target, ProductLink(label="商品A", url="https://example.com/a")
+            page, block, ProductLink(label="商品A", url="https://example.com/a")
         )
 
 
@@ -1072,7 +1160,8 @@ def test_set_link_on_text_occurrence_source_has_no_positional_fallback_candidate
     for func in (
         NotePoster._set_link_on_text_occurrence,
         NotePoster._open_link_input_via_shortcut,
-        NotePoster._resolve_link_target_for_label,
+        NotePoster._find_product_link_block,
+        NotePoster._select_product_link_text_in_block,
     ):
         source = inspect.getsource(func)
         assert "最終手段" not in source
@@ -1081,13 +1170,15 @@ def test_set_link_on_text_occurrence_source_has_no_positional_fallback_candidate
 def _product_trailer_html(entries: list[tuple[str, str | None]]) -> str:
     """(label, href_or_None) のリストから商品導線部分のHTMLを組み立てる。
 
-    hrefがNoneの場合はリンクされていないプレーンテキストのままにする
-    (「リンクが設定されていない」ケースの再現用)。
+    実機DOM(TEST-004)に合わせ、商品名と「→ 商品を見る」を同一の<p>要素内に
+    <br>を挟んで並べる。hrefがNoneの場合は「→ 商品を見る」をリンクされて
+    いないプレーンテキストのままにする(「リンクが設定されていない」ケースの
+    再現用)。
     """
     parts = []
     for label, href in entries:
         link_html = f'<a href="{href}">→ 商品を見る</a>' if href is not None else "→ 商品を見る"
-        parts.append(f"<p>{label}</p><p>{link_html}</p>")
+        parts.append(f"<p>{label}<br>{link_html}</p>")
     return (
         '<div class="editor" contenteditable="true">'
         "<p>この記事に出てきた商品</p>" + "".join(parts) + "</div>"
@@ -1098,46 +1189,72 @@ def test_assert_links_match_passes_when_all_links_correct(page):
     links = [ProductLink(label="商品A", url="https://example.com/a")]
     page.set_content(_product_trailer_html([("商品A", "https://example.com/a")]))
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
 
-    poster._assert_links_match(page, links, stage="保存前")  # 例外が出なければOK
+    poster._assert_links_match(page, body_locator, links, stage="保存前")  # 例外が出なければOK
 
 
 def test_assert_links_match_passes_when_no_links_expected():
     poster = _bare_poster()
-    poster._assert_links_match(page=None, product_links=[], stage="保存前")  # 例外が出なければOK
+    poster._assert_links_match(
+        page=None, body_locator=None, product_links=[], stage="保存前"
+    )  # 例外が出なければOK
 
 
 def test_assert_links_match_raises_on_href_mismatch(page):
     links = [ProductLink(label="商品A", url="https://example.com/a")]
     page.set_content(_product_trailer_html([("商品A", "https://example.com/WRONG")]))
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
 
     with pytest.raises(NotePosterError, match="不一致"):
-        poster._assert_links_match(page, links, stage="保存前")
+        poster._assert_links_match(page, body_locator, links, stage="保存前")
 
 
 def test_assert_links_match_raises_when_link_missing(page):
     links = [ProductLink(label="商品A", url="https://example.com/a")]
     page.set_content(_product_trailer_html([("商品A", None)]))
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
 
     with pytest.raises(NotePosterError):
-        poster._assert_links_match(page, links, stage="保存前")
+        poster._assert_links_match(page, body_locator, links, stage="保存前")
 
 
-def test_assert_links_match_raises_when_label_itself_is_linked(page):
+def test_assert_links_match_raises_when_label_is_included_in_link_range(page):
+    # 商品名までリンク範囲に含まれてしまった場合(1つの<a>が商品名と
+    # 「→ 商品を見る」の両方を包んでいる)、アンカーのテキストが
+    # 「→ 商品を見る」と完全一致しなくなるため失敗として検出する。
     links = [ProductLink(label="商品A", url="https://example.com/a")]
     page.set_content(
         '<div class="editor" contenteditable="true">'
         "<p>この記事に出てきた商品</p>"
-        '<p><a href="https://example.com/a">商品A</a></p>'
-        '<p><a href="https://example.com/a">→ 商品を見る</a></p>'
+        '<p><a href="https://example.com/a">商品A<br>→ 商品を見る</a></p>'
         "</div>"
     )
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
 
     with pytest.raises(NotePosterError):
-        poster._assert_links_match(page, links, stage="保存前")
+        poster._assert_links_match(page, body_locator, links, stage="保存前")
+
+
+def test_assert_links_match_raises_when_label_has_its_own_separate_link(page):
+    # 商品名自体にも別のリンクが付いてしまった場合(ブロック内の<a>要素が
+    # 2件になる)も失敗として検出する。
+    links = [ProductLink(label="商品A", url="https://example.com/a")]
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        '<p><a href="https://example.com/a">商品A</a><br>'
+        '<a href="https://example.com/a">→ 商品を見る</a></p>'
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    with pytest.raises(NotePosterError):
+        poster._assert_links_match(page, body_locator, links, stage="保存前")
 
 
 def test_assert_links_match_raises_when_occurrence_count_mismatches(page):
@@ -1147,9 +1264,54 @@ def test_assert_links_match_raises_when_occurrence_count_mismatches(page):
     ]
     page.set_content(_product_trailer_html([("商品A", "https://example.com/a")]))
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
 
     with pytest.raises(NotePosterError):
-        poster._assert_links_match(page, links, stage="保存前")
+        poster._assert_links_match(page, body_locator, links, stage="保存前")
+
+
+def test_assert_links_match_passes_with_multiple_products(page):
+    # 複数商品のケース。それぞれのブロックが商品名で正しく特定され、
+    # 対応するhrefだけが一致していることを確認する。
+    links = [
+        ProductLink(label="商品A", url="https://example.com/a"),
+        ProductLink(label="商品B", url="https://example.com/b"),
+    ]
+    page.set_content(
+        _product_trailer_html(
+            [
+                ("商品A", "https://example.com/a"),
+                ("商品B", "https://example.com/b"),
+            ]
+        )
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    poster._assert_links_match(page, body_locator, links, stage="保存前")  # 例外が出なければOK
+
+
+def test_assert_links_match_raises_when_hrefs_are_swapped_between_products(page):
+    # 複数商品で、それぞれのブロックには正しくリンクが付いているものの、
+    # href同士が入れ替わってしまっている(取り違え)場合を検出できることを
+    # 確認する。
+    links = [
+        ProductLink(label="商品A", url="https://example.com/a"),
+        ProductLink(label="商品B", url="https://example.com/b"),
+    ]
+    page.set_content(
+        _product_trailer_html(
+            [
+                ("商品A", "https://example.com/b"),  # 本来は商品Aのurlのはず
+                ("商品B", "https://example.com/a"),  # 本来は商品Bのurlのはず
+            ]
+        )
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    with pytest.raises(NotePosterError, match="不一致"):
+        poster._assert_links_match(page, body_locator, links, stage="保存前")
 
 
 def test_assert_links_match_ignores_unrelated_links_elsewhere_in_body(page):
@@ -1160,13 +1322,13 @@ def test_assert_links_match_ignores_unrelated_links_elsewhere_in_body(page):
         '<div class="editor" contenteditable="true">'
         '<p>本文中に<a href="https://reference.example.com">参考リンク</a>があります</p>'
         "<p>この記事に出てきた商品</p>"
-        "<p>商品A</p>"
-        '<p><a href="https://example.com/a">→ 商品を見る</a></p>'
+        '<p>商品A<br><a href="https://example.com/a">→ 商品を見る</a></p>'
         "</div>"
     )
     poster = _bare_poster()
+    body_locator = page.locator(".editor")
 
-    poster._assert_links_match(page, links, stage="保存前")  # 例外が出なければOK
+    poster._assert_links_match(page, body_locator, links, stage="保存前")  # 例外が出なければOK
 
 
 def test_assert_body_matches_detects_card_like_extra_content_in_product_trailer(page):

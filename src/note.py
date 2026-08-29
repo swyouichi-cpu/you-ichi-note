@@ -169,30 +169,56 @@ URLを自動的に商品カード(画像・商品名・価格・説明・購入�
 
 というプレーンテキストの導線セクションを組み立てて本文に追記し
 (build_product_links_trailer())、その後で「→ 商品を見る」という
-固定文言(_PRODUCT_LINK_TEXT)だけに、商品名(label)との位置関係で一意に
-特定した対象へリンクを設定する(_apply_product_links())。ECの生URLは
-本文の文字列としては一切登場せず、href属性としてのみ設定される。
-`product_links`が空または`[]`の場合は導線セクション自体を追加しない
-(タグ0件時の設計と同じ)。不正なJSON・必須フィールド欠落・不正なURL
-形式は、タグの内部空白と同じ思想で自動修正せずProductLinkValidationError
-を送出してneeds_reviewへ倒す(ARTICLE-001に限らず、どの記事にも同じ
-ロジックが適用される)。
+固定文言(_PRODUCT_LINK_TEXT)だけに、商品名(label)を含むブロックとの
+対応関係で一意に特定した対象へリンクを設定する(_apply_product_links())。
+ECの生URLは本文の文字列としては一切登場せず、href属性としてのみ設定
+される。`product_links`が空または`[]`の場合は導線セクション自体を
+追加しない(タグ0件時の設計と同じ)。不正なJSON・必須フィールド欠落・
+不正なURL形式は、タグの内部空白と同じ思想で自動修正せず
+ProductLinkValidationError を送出してneeds_reviewへ倒す(ARTICLE-001に
+限らず、どの記事にも同じロジックが適用される)。
 
-★リンク対象の特定は位置ベースフォールバックではない★
-「→ 商品を見る」というテキストは複数の商品がある場合、本文中に複数回
-出現する。当初は「ページ全体でN番目の出現」という一覧インデックスで
-`product_links[N]`と対応付けていたが、より安全な一意特定方法として、
-_resolve_link_target_for_label() で「商品名(label)の直後にある兄弟要素」
-という、build_product_links_trailer()自身が生成したDOM構造(label行の
-直後に必ずリンク対象行が来る)との対応関係を使う方式に変更した
-(2026年8月29日)。これは _fill_body() で撤去した「画面上に見えるN番目の
-contenteditable要素」のような構造推測とは性質が異なる。ここでの特定は、
-noteのDOM構造を推測しているのではなく、**このコード自身が直前に生成した
-既知の構造(label→リンク対象行という順序)**を根拠にしている。
-labelのテキストが本文中にちょうど1件だけ存在し、かつその直後の兄弟要素の
-テキストが「→ 商品を見る」と完全一致することを確認したうえで対象を返し、
-いずれか一方でも成立しなければ推測せずneeds_reviewへ安全停止する
-(例えば、人間が書いた本文に偶然同じlabelや同じ文言が含まれていた場合)。
+★実機DOM(TEST-004)で判明した構造とリンク対象の特定方法★
+当初は「label行」と「→ 商品を見る」行が別々の<p>要素になり、商品名の
+直後にある兄弟要素として一意特定できる想定だった
+(_resolve_link_target_for_label()、2026年8月29日時点の実装)。
+しかし実機のGitHub Actions実行(TEST-004)で、build_product_links_
+trailer()が生成する「{label}\\n{_PRODUCT_LINK_TEXT}」という1つの
+テキストの塊は、noteのエディタでは別々の<p>要素にはならず、**同一の
+<p>要素内で<br>を挟んで描画される**ことが判明した。
+
+  <p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>
+
+このため、label単体を含む要素も「→ 商品を見る」単体を含む要素も、
+そもそも本文中に単独では存在せず、`exact=True`のテキスト完全一致検索は
+常に0件になる。これが原因で、商品導線のプレーンテキスト生成自体は
+成功していたにもかかわらず、リンク設定が「対象テキストが0件」として
+安全停止していた(TEST-004で判明した不具合)。
+
+これを受けて_find_product_link_block()に置き換えた(2026年8月29日)。
+本文editor(body_locator、ProseMirrorの実DOM)にスコープを絞ったうえで、
+  1. 商品名(label)を含むブロック要素(<p>)が本文editor内にちょうど
+     1件だけ存在すること
+  2. そのブロックのテキストを行単位に分解すると、ちょうど
+     [label, _PRODUCT_LINK_TEXT] の2行になっていること
+     (=商品名の行の直後に「→ 商品を見る」の行が続いている)
+を確認したうえで、そのブロック要素(<p>)自体を返す。いずれかが成立
+しない場合(labelを含むブロックが0件・複数件、ブロック内の行構成が
+想定と異なる等)は推測せずneeds_reviewへ安全停止する。これは
+_fill_body() で撤去した「画面上に見えるN番目のcontenteditable要素」の
+ような構造推測とは性質が異なる。noteのDOM構造そのものを推測している
+のではなく、**このコード自身が直前に生成した既知の構造(label行→
+リンク対象行という順序)**を、本文editorという明確なスコープの中で
+確認しているだけである。
+
+ブロック要素が特定できても、そのブロックをまるごと選択してリンクを
+設定するわけではない(それでは商品名までリンク範囲に含まれてしまう)。
+_select_product_link_text_in_block() が、ブロックの直接の子ノードの
+うち「→ 商品を見る」と完全一致するテキストノードだけをブラウザの
+Selection/Range API(`document.createRange()` / `window.getSelection()`)
+で明示的に選択する。ブロックが上記の2行構造であることは既に確認済み
+だが、念のためここでも一致するテキストノードの件数を数え、ちょうど
+1件でなければ推測で選択せず安全停止する。
 
 ★リンク設定操作: note公式ショートカット(Control+K / Meta+K)★
 当初はフローティングツールバーのリンクボタンをrole/aria属性(推測ベースの
@@ -209,8 +235,9 @@ navigator.platformに応じてMeta/Ctrlいずれかのキーを見ている可�
 実機ではどちらが効くかまだ確認できていないため、Control+K→Meta+Kの順に
 試し、実際にURL入力欄が現れた方を採用する(これも位置ベースフォールバック
 ではなく、公式ショートカットの2つのプラットフォーム変種を順に試すだけ)。
-選択直後には実際の選択内容(`window.getSelection().toString()`)が意図した
-文字列と一致することも確認してからショートカットを送る。
+_select_product_link_text_in_block()での選択直後には、実際の選択内容
+(`window.getSelection().toString()`)が意図した文字列と一致することも
+確認してからショートカットを送る。
 
 ★リンクURL入力欄のセレクタについて(未確定・要実機検証)★
 本文editorのセレクタ(ProseMirror)とは異なり、ショートカット送信後に現れる
@@ -230,12 +257,19 @@ _assert_body_matches()は引き続き「見えているテキスト」だけを�
 商品カード化が起きていないことも同時に確認できる。カード化が万一発生
 すれば、カードの追加テキストによって文字数が期待値からずれ、この検証が
 不一致として検出する)。これとは別に、_assert_links_match()が本文editor
-内の商品導線部分だけを対象に、リンク(<a>要素)のhref・アンカーテキストを
-個別に検証する。本文中に将来ふつうの参考リンク等が入る可能性があるため、
-本文editor内の<a>要素の総数を数える検証は行わない(商品導線として
-自分自身が生成した「→ 商品を見る」の出現箇所だけをスコープに検証する)。
-どちらか一方でも失敗すれば成功扱いにせず、下書き保存の前後両方で
-この2つの検証を行う。
+(body_locator)内の商品導線部分だけを対象に、_find_product_link_block()
+で商品ごとのブロックを再特定したうえで、そのブロック内のリンク(<a>要素)
+のhref・アンカーテキストを個別に検証する。本文中に将来ふつうの参考リンク
+等が入る可能性があるため、本文editor内の<a>要素の総数を数える検証は行わ
+ない(商品導線として自分自身が生成したブロックだけをスコープに検証する)。
+
+ブロック内の<a>要素がちょうど1件で、かつそのテキストが「→ 商品を見る」
+と完全一致することを確認する。この1つのチェックだけで、リンクが
+設定されていない場合(<a>要素0件)・余計なリンクが付いた場合(<a>要素
+2件以上)・商品名までリンク範囲に含まれてしまった場合(<a>要素のテキスト
+が「label\n→ 商品を見る」のように商品名を含んでしまい完全一致しない)の
+いずれも検出できる。どちらか一方でも失敗すれば成功扱いにせず、下書き
+保存の前後両方でこの2つの検証を行う。
 
 ★ログイン方式★
 メールアドレス・パスワードを直接入力させる方式は、note側のreCAPTCHA
@@ -871,7 +905,10 @@ class NotePoster:
         ECの生URLは本文の文字列としては一切登場させず(自動カード化を
         誘発するため)、「→ 商品を見る」という固定文言だけに、note公式の
         リンク挿入ショートカット(Control+K / Meta+K)経由でインライン
-        リンクを設定する(_apply_product_links)。
+        リンクを設定する(_apply_product_links)。商品名と「→ 商品を見る」は
+        実機DOM上では同一のブロック要素内に<br>を挟んで存在するため、
+        本文editor(body_locator)にスコープを絞ったブロック単位の特定
+        (_find_product_link_block)を経由してリンク対象を選択する。
 
         本文入力欄は、タイトル入力欄と同一のDOM要素を誤って掴んでいない
         ことを確認したうえで使用し(_same_element)、実際に入力に使った
@@ -925,7 +962,7 @@ class NotePoster:
             self._run_step(
                 page,
                 "商品導線リンク設定",
-                lambda: self._apply_product_links(page, product_links),
+                lambda: self._apply_product_links(page, body_locator, product_links),
             )
             self._screenshot(page, "04_product_links_applied")
 
@@ -940,7 +977,9 @@ class NotePoster:
         self._run_step(
             page,
             "商品導線リンク確認(保存前)",
-            lambda: self._assert_links_match(page, product_links, stage="保存前"),
+            lambda: self._assert_links_match(
+                page, body_locator, product_links, stage="保存前"
+            ),
         )
 
         logger.info("自動保存の完了を確認")
@@ -964,7 +1003,9 @@ class NotePoster:
         self._run_step(
             page,
             "商品導線リンク確認(保存後)",
-            lambda: self._assert_links_match(page, product_links, stage="保存後"),
+            lambda: self._assert_links_match(
+                page, body_locator, product_links, stage="保存後"
+            ),
         )
 
         note_url = page.url
@@ -1195,94 +1236,143 @@ class NotePoster:
 
     # -- 商品導線(本文末尾のテキストリンク) ------------------------------------
 
-    def _apply_product_links(self, page: Page, product_links: list[ProductLink]) -> None:
+    def _apply_product_links(
+        self, page: Page, body_locator: Locator, product_links: list[ProductLink]
+    ) -> None:
         """本文末尾の商品導線セクションにある「→ 商品を見る」だけに、
         対応するURLをインラインリンクとして設定する。
 
-        本文editorには既に build_product_links_trailer() が生成した
-        プレーンテキスト(ECの生URLを含まない)が入力済みであることが前提。
-        まず「→ 商品を見る」の出現数がproduct_linksの件数と一致するかを
-        大まかに確認し(一致しない場合は本文中に同じ文字列が意図せず
-        含まれている可能性があるため安全停止する)、各リンクの実際の対象
-        要素は _resolve_link_target_for_label() で商品名(label)との
-        位置関係から一意に特定する(詳細はそちらのdocstringを参照)。
+        本文editor(body_locator)には既に build_product_links_trailer() が
+        生成したプレーンテキスト(ECの生URLを含まない)が入力済みである
+        ことが前提。各商品の実際の対象ブロックは _find_product_link_block()
+        で商品名(label)を含むブロックとして一意に特定する
+        (詳細はそちらのdocstringを参照)。
         """
         if not product_links:
             return
 
-        occurrences = page.get_by_text(_PRODUCT_LINK_TEXT, exact=True)
-        actual_count = occurrences.count()
-        if actual_count != len(product_links):
-            self._capture_failure(page, "商品導線リンク設定")
-            raise NotePosterError(
-                f"商品導線のリンク対象テキスト('{_PRODUCT_LINK_TEXT}')が本文中に"
-                f"{actual_count}件見つかりましたが、期待した件数は"
-                f"{len(product_links)}件でした。本文中に同じ文字列が意図せず"
-                "含まれている可能性があり、商品導線を安全にスコープできない"
-                "ため、誤ったリンク設定を避けて処理を中断します。"
-            )
-
         for link in product_links:
-            target = self._resolve_link_target_for_label(page, link)
-            self._set_link_on_text_occurrence(page, target, link)
+            block = self._find_product_link_block(page, body_locator, link)
+            self._set_link_on_text_occurrence(page, block, link)
 
-    def _resolve_link_target_for_label(self, page: Page, link: ProductLink) -> Locator:
-        """商品名(label)から、その直後にある「→ 商品を見る」の段落を一意に特定する。
+    def _find_product_link_block(
+        self, page: Page, body_locator: Locator, link: ProductLink
+    ) -> Locator:
+        """商品名(label)と「→ 商品を見る」が同一ブロック内に存在するブロックを、
+        本文editor(body_locator)内から一意に特定する。
 
-        「→ 商品を見る」という文言はproduct_linksが複数件あると本文中に
-        複数回出現しうる。これを「ページ全体でN番目に出現するか」という
-        一覧のインデックスだけに頼るのではなく、build_product_links_trailer()
-        が「{label}\\n→ 商品を見る」という順序で生成していることを利用し、
-        各商品の名前(label)の直後にある兄弟要素として一意に特定する
-        (このコード自身が生成したDOM構造との対応関係を使った特定であり、
-        DOM構造を推測しているわけではない)。
-
-        以下のいずれかが成立しない場合は、安全に一意特定できないと判断し、
-        推測せずNotePosterErrorを送出する(呼び出し側でneeds_reviewに倒れる)。
-          - labelのテキストが本文中にちょうど1件だけ存在する
-          - その直後の兄弟要素がちょうど1件存在する
-          - その兄弟要素のテキストが「→ 商品を見る」と完全一致する
+        実機のGitHub Actions実行(TEST-004)で判明した通り、noteのエディタは
+        「{label}\\n→ 商品を見る」という1つのテキストの塊を、別々の<p>要素
+        にはせず、同一の<p>要素内で<br>を挟んで描画する
+        (<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>)。そのため商品名を
+        「直後の兄弟要素」として探すのではなく、本文editor内の各ブロック
+        要素(<p>)を対象に、以下のいずれかが成立しない場合は安全に一意
+        特定できないと判断し、推測せずNotePosterErrorを送出する
+        (呼び出し側でneeds_reviewに倒れる)。
+          - 商品名(label)を含むブロックが本文editor内にちょうど1件だけ存在する
+          - そのブロックのテキストを行単位に分解すると、ちょうど
+            [label, _PRODUCT_LINK_TEXT] の2行になっている
+            (=商品名の行の直後に「→ 商品を見る」の行が続いている)
         """
-        label_locator = page.get_by_text(link.label, exact=True)
-        label_count = label_locator.count()
-        if label_count != 1:
-            self._capture_failure(page, "商品導線ラベル特定")
+        blocks = body_locator.locator("p")
+        try:
+            total = blocks.count()
+        except PlaywrightTimeoutError:
+            total = 0
+
+        label_match_indices: list[int] = []
+        for i in range(total):
+            block = blocks.nth(i)
+            try:
+                text = block.inner_text()
+            except PlaywrightTimeoutError:
+                continue
+            lines = [line.strip() for line in text.split("\n")]
+            if link.label in lines:
+                label_match_indices.append(i)
+
+        if len(label_match_indices) != 1:
+            self._capture_failure(page, "商品導線ブロック特定")
             raise NotePosterError(
-                f"商品名『{link.label}』のテキストが本文中に{label_count}件"
-                "見つかりました(期待: 1件)。商品導線を安全にスコープできない"
-                "ため処理を中断します。"
+                f"商品名『{link.label}』を含むブロックが本文editor内に"
+                f"{len(label_match_indices)}件見つかりました(期待: 1件)。"
+                "商品導線を安全にスコープできないため処理を中断します。"
             )
 
-        sibling = label_locator.first.locator("xpath=following-sibling::*[1]")
+        block = blocks.nth(label_match_indices[0])
         try:
-            sibling_count = sibling.count()
+            lines = [line.strip() for line in block.inner_text().split("\n")]
         except PlaywrightTimeoutError:
-            sibling_count = 0
-        if sibling_count != 1:
-            self._capture_failure(page, "商品導線ラベル特定")
+            lines = []
+
+        if lines.count(_PRODUCT_LINK_TEXT) != 1:
+            self._capture_failure(page, "商品導線ブロック特定")
             raise NotePosterError(
-                f"商品名『{link.label}』の直後にある要素を特定できませんでした"
-                f"({sibling_count}件)。商品導線の構造が想定と異なるため"
+                f"商品名『{link.label}』を含むブロック内に"
+                f"「{_PRODUCT_LINK_TEXT}」が{lines.count(_PRODUCT_LINK_TEXT)}件"
+                "見つかりました(期待: 1件)。商品導線の構造が想定と異なるため"
                 "処理を中断します。"
             )
 
-        try:
-            sibling_text = (sibling.inner_text() or "").strip()
-        except PlaywrightTimeoutError:
-            sibling_text = ""
-        if sibling_text != _PRODUCT_LINK_TEXT:
-            self._capture_failure(page, "商品導線ラベル特定")
+        if lines != [link.label, _PRODUCT_LINK_TEXT]:
+            self._capture_failure(page, "商品導線ブロック特定")
             raise NotePosterError(
-                f"商品名『{link.label}』の直後の要素のテキストが"
-                f"{sibling_text!r}でした(期待: {_PRODUCT_LINK_TEXT!r})。"
+                f"商品名『{link.label}』を含むブロックの行構成が"
+                f"{lines!r}でした(期待: {[link.label, _PRODUCT_LINK_TEXT]!r})。"
                 "商品導線の構造が想定と異なるため処理を中断します。"
             )
-        return sibling
+        return block
+
+    def _select_product_link_text_in_block(self, page: Page, block: Locator) -> None:
+        """ブロック内の直接の子テキストノードのうち、「→ 商品を見る」と完全一致
+        するものだけをブラウザのSelection/Range APIで選択する(商品名は
+        選択範囲に含めない)。
+
+        _find_product_link_block() で、このブロックのテキストが行単位で
+        ちょうど [label, _PRODUCT_LINK_TEXT] であることを確認済みであり、
+        その構造(テキストノード - <br> - テキストノード)を前提に、
+        「→ 商品を見る」に一致する直接の子テキストノードだけを検索して
+        選択する。一致するテキストノードがちょうど1件でない場合は、
+        推測で選択せずNotePosterErrorを送出する。
+        """
+        try:
+            result = block.evaluate(
+                """
+                (el, linkText) => {
+                    const matches = Array.from(el.childNodes).filter(
+                        (node) => node.nodeType === Node.TEXT_NODE
+                            && node.textContent.trim() === linkText
+                    );
+                    if (matches.length !== 1) {
+                        return { ok: false, count: matches.length };
+                    }
+                    const range = document.createRange();
+                    range.selectNodeContents(matches[0]);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    return { ok: true, count: 1 };
+                }
+                """,
+                _PRODUCT_LINK_TEXT,
+            )
+        except PlaywrightTimeoutError:
+            result = None
+
+        if not result or not result.get("ok"):
+            count = result.get("count") if result else "不明"
+            self._capture_failure(page, "商品導線テキスト選択")
+            raise NotePosterError(
+                f"「{_PRODUCT_LINK_TEXT}」に一致する直接の子テキストノードが"
+                f"{count}件でした(期待: 1件)。ブロックの構造が想定と異なる"
+                "ため、推測で選択せず処理を中断します。"
+            )
 
     def _set_link_on_text_occurrence(
-        self, page: Page, target: Locator, link: ProductLink
+        self, page: Page, block: Locator, link: ProductLink
     ) -> None:
-        """指定した段落を選択し、noteの公式リンク挿入ショートカットでリンクを設定する。
+        """指定したブロック内の「→ 商品を見る」だけを選択し、noteの公式
+        リンク挿入ショートカットでリンクを設定する。
 
         note公式の「エディタのガイド」に、リンク挿入のショートカットとして
         Mac: ⌘+K が明記されており、実機で人間が「→ 商品を見る」を選択して
@@ -1301,11 +1391,12 @@ class NotePoster:
         公式ショートカットのプラットフォーム変種を順に試すだけであり、
         位置ベースフォールバックとは異なる)。
 
-        選択操作の直後、実際の選択内容が意図した文字列と一致することを
-        確認してからショートカットを送る(意図しない範囲を選択したまま
-        リンクを設定してしまう事故を防ぐため)。
+        選択操作(_select_product_link_text_in_block)の直後、実際の選択
+        内容が意図した文字列と一致することを確認してからショートカットを
+        送る(意図しない範囲を選択したままリンクを設定してしまう事故を
+        防ぐため)。
         """
-        target.select_text()
+        self._select_product_link_text_in_block(page, block)
 
         try:
             selected_text = page.evaluate(
@@ -1369,6 +1460,7 @@ class NotePoster:
     def _assert_links_match(
         self,
         page: Page,
+        body_locator: Locator,
         product_links: list[ProductLink],
         *,
         stage: str,
@@ -1377,65 +1469,30 @@ class NotePoster:
 
         本文editor内の<a>要素を総数で数える検証は行わない(本文には
         将来ふつうの参考リンク等が入る可能性があるため)。代わりに、
-        _resolve_link_target_for_label() で自分自身が生成した商品導線の
-        各エントリ(label直後の段落)だけをスコープに、以下を個別に確認する。
-          - 対応する商品名(label)自体にはリンクが付いていないこと
-          - 対応する「→ 商品を見る」の段落にちょうど1件の<a>要素があること
-            (余計なリンクが生成されていないこと)
+        _find_product_link_block() で自分自身が生成した商品導線の各ブロック
+        だけをスコープに、以下を確認する。
+          - そのブロック内にちょうど1件の<a>要素があること
+            (リンクが設定されていない・余計なリンクが付いている、を検出)
           - その<a>要素のテキストが「→ 商品を見る」と完全一致すること
+            (商品名までリンク範囲に含まれてしまった場合、<a>要素のテキストは
+            「label\\n→ 商品を見る」のようになり完全一致しなくなるため、
+            この1つの比較だけで検出できる)
           - その<a>要素のhrefが期待したURLと一致すること
-        商品導線をこの方法で安全にスコープできない場合(labelが複数件・
-        0件見つかる等)も、推測はせずneeds_reviewへ安全停止する。
+        商品導線をこの方法で安全にスコープできない場合(labelを含むブロックが
+        複数件・0件見つかる等)も、推測はせずneeds_reviewへ安全停止する。
         """
         if not product_links:
             return
 
-        link_text_occurrences = page.get_by_text(_PRODUCT_LINK_TEXT, exact=True)
-        actual_count = link_text_occurrences.count()
-        if actual_count != len(product_links):
-            self._capture_failure(page, f"商品導線リンク確認_{stage}")
-            raise NotePosterError(
-                f"商品導線リンクの確認({stage})で、リンク対象テキスト"
-                f"('{_PRODUCT_LINK_TEXT}')が{actual_count}件見つかりました"
-                f"(期待: {len(product_links)}件)。商品導線を安全にスコープ"
-                "できないため処理を中断します。"
-            )
-
         mismatches: list[str] = []
         for link in product_links:
-            label_locator = page.get_by_text(link.label, exact=True)
-            if label_locator.count() != 1:
-                mismatches.append(
-                    f"『{link.label}』: 商品名のテキストが"
-                    f"{label_locator.count()}件でした(期待: 1件)"
-                )
-            else:
-                # get_by_text(exact=True)は完全一致テキストを持つ最も内側の
-                # 要素を返すため、商品名自体がリンクになっている場合は
-                # a要素自身が返る(その子にはa要素が無いため、子要素だけ
-                # 見ても誤ってリンク無しと判定してしまう)。
-                try:
-                    label_tag_name = (
-                        label_locator.first.evaluate("el => el.tagName") or ""
-                    ).upper()
-                except PlaywrightTimeoutError:
-                    label_tag_name = ""
-                label_anchor_count = (
-                    1 if label_tag_name == "A" else label_locator.first.locator("a").count()
-                )
-                if label_anchor_count != 0:
-                    mismatches.append(
-                        f"『{link.label}』: 商品名自体に{label_anchor_count}件の"
-                        "リンクが付いています(意図しないリンク)"
-                    )
-
             try:
-                paragraph = self._resolve_link_target_for_label(page, link)
+                block = self._find_product_link_block(page, body_locator, link)
             except NotePosterError as exc:
                 mismatches.append(f"『{link.label}』: {exc}")
                 continue
 
-            anchors = paragraph.locator("a")
+            anchors = block.locator("a")
             anchor_count = anchors.count()
             if anchor_count != 1:
                 mismatches.append(
@@ -1453,7 +1510,8 @@ class NotePoster:
             if actual_text != _PRODUCT_LINK_TEXT:
                 mismatches.append(
                     f"『{link.label}』: リンクのテキストが{actual_text!r}でした"
-                    f"(期待: {_PRODUCT_LINK_TEXT!r})"
+                    f"(期待: {_PRODUCT_LINK_TEXT!r})。商品名までリンク範囲に"
+                    "含まれている可能性があります"
                 )
             if actual_href != link.url:
                 mismatches.append(
