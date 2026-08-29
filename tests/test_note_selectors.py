@@ -896,6 +896,32 @@ _LINK_TOOLBAR_HTML = """
       applyButton.appendChild(applySpan);
       applyButton.addEventListener('click', (ev) => {
         ev.target.closest('button').setAttribute('data-clicked', 'true');
+        // 実機Artifact(TEST-004、「適用」クリック後の観測)で確認できた
+        // 完成後のDOM(<a href="..."><span class="highlight">→ 商品を見る
+        // </span></a>)をローカルで再現する。「適用」クリック後はURL入力欄
+        // と「適用」ボタン自体もDOMから消え、通常の選択ツールバーへ戻る。
+        const url = textarea.value;
+        const targetP = Array.from(
+          document.querySelectorAll('.editor p')
+        ).find((el) => el.textContent.includes('瀬戸内レモン'));
+        const textNode = targetP && Array.from(targetP.childNodes).find(
+          (node) => node.nodeType === Node.TEXT_NODE
+            && node.textContent.trim() === '→ 商品を見る'
+        );
+        if (textNode) {
+          const a = document.createElement('a');
+          a.setAttribute('href', url);
+          a.setAttribute('target', '_blank');
+          a.setAttribute('rel', 'noopener');
+          const span = document.createElement('span');
+          span.className = 'highlight';
+          span.textContent = '→ 商品を見る';
+          a.appendChild(span);
+          textNode.replaceWith(a);
+        }
+        textarea.remove();
+        applyButton.remove();
+        cancelButton.remove();
       });
       const cancelButton = document.createElement('button');
       cancelButton.setAttribute('aria-label', 'URLの入力をやめる');
@@ -910,13 +936,14 @@ _URL_INPUT_SELECTOR_FOR_TESTS = 'textarea[placeholder="https://"][inputmode="tex
 _ACTIVE_TOOLBAR_SELECTOR_FOR_TESTS = 'div[role="toolbar"][data-active="true"]'
 
 
-def test_apply_product_links_clicks_toolbar_button_and_inputs_url_then_stops_for_observation(page):
+def test_apply_product_links_clicks_toolbar_button_and_inputs_url_then_applies_link(page):
     # リンクボタンをクリックした先に出現するURL入力欄まで到達し、URLを
     # 入力してread-backが一致することを確認したうえで、ツールバー内の
-    # 「適用」ボタンをクリックし、意図的にUrlApplyObservationStopで安全
-    # 停止する(観測専用実装・第4段階)。URLの確定操作のうちEnter/Tab/
-    # フォーカス解除/他要素クリックは一切行わない(「適用」ボタンの
-    # クリックだけが、実機で確認できた確定操作の一部として実装されている)。
+    # 「適用」ボタンをクリックし、実際に<a>要素が対象ブロック内へ反映
+    # されるまで待ってから正常終了することを確認する(完成実装・第6段階、
+    # 2026年8月29日)。URLの確定操作のうちEnter/Tab/フォーカス解除/他要素
+    # クリックは一切行わない(「適用」ボタンのクリックだけが、実機で
+    # 確認できた確定操作の一部として実装されている)。
     page.set_content(_LINK_TOOLBAR_HTML)
     poster = _bare_poster()
     body_locator = page.locator(".editor")
@@ -924,31 +951,27 @@ def test_apply_product_links_clicks_toolbar_button_and_inputs_url_then_stops_for
         ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
     ]
 
-    with pytest.raises(UrlApplyObservationStop):
-        poster._apply_product_links(page, body_locator, links)
+    poster._apply_product_links(page, body_locator, links)  # 例外が出なければOK
 
     link_button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
     assert link_button.get_attribute("data-clicked") == "true"
 
-    url_input = page.locator(_URL_INPUT_SELECTOR_FOR_TESTS)
-    assert url_input.input_value() == links[0].url
-
-    apply_button = page.locator("#desktop-toolbar").get_by_role(
-        "button", name="適用", exact=True
+    anchor = body_locator.locator("a")
+    assert anchor.count() == 1
+    assert anchor.inner_text().strip() == "→ 商品を見る"
+    assert anchor.get_attribute("href") == links[0].url
+    # 「適用」クリック後、実機と同様にURL入力欄・「適用」ボタンはDOMから
+    # 消えていること。
+    assert page.locator(_URL_INPUT_SELECTOR_FOR_TESTS).count() == 0
+    assert (
+        page.locator("#desktop-toolbar").get_by_role("button", name="適用", exact=True).count()
+        == 0
     )
-    assert apply_button.get_attribute("data-clicked") == "true"
-    # <a href>の生成確認・_assert_links_match()・下書き保存にはまだ
-    # 進んでいないため、<a>要素はまだ作られていない。
-    assert body_locator.locator("a").count() == 0
     # Enter/Tabを送信していないことを確認する(press_sequentially由来の
     # 文字キー以外が送られていないこと)。
     sent_keys = page.evaluate("() => window.__urlInputKeys")
     assert "Enter" not in sent_keys
     assert "Tab" not in sent_keys
-    # 診断処理(_capture_failure)自身が意図しないフォーカス操作を行わない
-    # ことも確認する(直前にクリックした「適用」ボタンがactiveElementの
-    # ままであること)。
-    assert page.evaluate("() => document.activeElement.tagName") == "BUTTON"
 
 
 def test_apply_product_links_logs_url_input_stage_diagnostics_through_healthy_flow(page, caplog):
@@ -964,8 +987,7 @@ def test_apply_product_links_logs_url_input_stage_diagnostics_through_healthy_fl
     ]
 
     with caplog.at_level("INFO"):
-        with pytest.raises(UrlApplyObservationStop):
-            poster._apply_product_links(page, body_locator, links)
+        poster._apply_product_links(page, body_locator, links)  # 例外が出なければOK
 
     for stage in (
         "A_URL入力直前",
@@ -1457,7 +1479,7 @@ def test_set_link_on_text_occurrence_raises_when_block_has_no_matching_text_node
         )
 
 
-def test_set_link_on_text_occurrence_inputs_url_and_clicks_apply_then_raises_apply_observation_stop(
+def test_set_link_on_text_occurrence_inputs_url_and_clicks_apply_then_applies_link(
     page,
 ):
     page.set_content(_LINK_TOOLBAR_HTML)
@@ -1465,20 +1487,21 @@ def test_set_link_on_text_occurrence_inputs_url_and_clicks_apply_then_raises_app
     block = page.locator(".editor p").nth(2)
     link = ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a")
 
-    with pytest.raises(UrlApplyObservationStop):
-        poster._set_link_on_text_occurrence(page, block, link)
+    poster._set_link_on_text_occurrence(page, block, link)  # 例外が出なければOK
 
     link_button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
     assert link_button.get_attribute("data-clicked") == "true"
-    url_input = page.locator(_URL_INPUT_SELECTOR_FOR_TESTS)
-    assert url_input.input_value() == link.url
-    apply_button = page.locator("#desktop-toolbar").get_by_role(
-        "button", name="適用", exact=True
+    # 「適用」クリック後、実機と同様にURL入力欄・「適用」ボタンはDOMから
+    # 消えていること。
+    assert page.locator(_URL_INPUT_SELECTOR_FOR_TESTS).count() == 0
+    assert (
+        page.locator("#desktop-toolbar").get_by_role("button", name="適用", exact=True).count()
+        == 0
     )
-    assert apply_button.get_attribute("data-clicked") == "true"
-    # <a href>の生成確認・_assert_links_match()・下書き保存にはまだ
-    # 進んでいないため、<a>要素はまだ作られていない。
-    assert page.locator(".editor a").count() == 0
+    anchor = page.locator(".editor a")
+    assert anchor.count() == 1
+    assert anchor.inner_text().strip() == "→ 商品を見る"
+    assert anchor.get_attribute("href") == link.url
 
 
 # -- _bounding_box_within_viewport(viewport境界判定の純粋関数) -------------
@@ -1599,6 +1622,7 @@ def test_ensure_link_button_in_viewport_does_not_use_force_or_javascript_click()
         NotePoster._ensure_link_button_in_viewport,
         NotePoster._set_link_on_text_occurrence,
         NotePoster._log_url_input_diagnostics,
+        NotePoster._wait_for_product_link_applied,
     ):
         source = inspect.getsource(func)
         # docstring本文(説明文中の "force=True" 等の言及)を除いた、実際の
@@ -1849,6 +1873,97 @@ def test_find_url_apply_button_does_not_use_dynamic_id_or_first_or_nth():
     assert "get_by_role" in code_only
     assert ".first" not in code_only
     assert ".nth(" not in code_only
+
+
+# -- _wait_for_product_link_applied(「適用」クリック後の<a>反映待ち) --------
+
+
+def test_wait_for_product_link_applied_succeeds_when_anchor_already_present(page):
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        '<p>商品A<br><a href="https://example.com/a">→ 商品を見る</a></p>'
+        "</div>"
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").first
+    link = ProductLink(label="商品A", url="https://example.com/a")
+
+    poster._wait_for_product_link_applied(page, block, link, timeout_ms=300)  # 例外が出なければOK
+
+
+def test_wait_for_product_link_applied_succeeds_when_anchor_appears_after_a_short_delay(page):
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true">
+          <p id="target">商品A<br>→ 商品を見る</p>
+        </div>
+        <script>
+          setTimeout(() => {
+            const p = document.getElementById('target');
+            const textNode = Array.from(p.childNodes).find(
+              (node) => node.nodeType === Node.TEXT_NODE
+                && node.textContent.trim() === '→ 商品を見る'
+            );
+            const a = document.createElement('a');
+            a.href = 'https://example.com/a';
+            a.textContent = '→ 商品を見る';
+            textNode.replaceWith(a);
+          }, 300);
+        </script>
+        """
+    )
+    poster = _bare_poster()
+    block = page.locator("#target")
+    link = ProductLink(label="商品A", url="https://example.com/a")
+
+    poster._wait_for_product_link_applied(page, block, link, timeout_ms=2000)  # 例外が出なければOK
+
+
+def test_wait_for_product_link_applied_raises_when_anchor_never_appears(page):
+    # 「適用」をクリックしても対象ブロック内にリンクが反映されない
+    # (0件のまま)場合は、推測で先へ進まずneeds_reviewへ安全停止する。
+    page.set_content(
+        '<div class="editor" contenteditable="true"><p>商品A<br>→ 商品を見る</p></div>'
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").first
+    link = ProductLink(label="商品A", url="https://example.com/a")
+
+    with pytest.raises(NotePosterError):
+        poster._wait_for_product_link_applied(page, block, link, timeout_ms=200)
+
+
+def test_wait_for_product_link_applied_raises_when_anchor_appears_twice(page):
+    # 対象ブロック内に「→ 商品を見る」というアクセシブルネームを持つリンクが
+    # 2件出現した場合(strict mode違反)も、位置ベースで1件を選ばず安全停止する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        '<p>商品A<br>'
+        '<a href="https://example.com/a">→ 商品を見る</a>'
+        '<a href="https://example.com/a">→ 商品を見る</a>'
+        "</p></div>"
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").first
+    link = ProductLink(label="商品A", url="https://example.com/a")
+
+    with pytest.raises(NotePosterError):
+        poster._wait_for_product_link_applied(page, block, link, timeout_ms=200)
+
+
+def test_wait_for_product_link_applied_saves_failure_artifact_when_anchor_missing(page, caplog):
+    page.set_content(
+        '<div class="editor" contenteditable="true"><p>商品A<br>→ 商品を見る</p></div>'
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").first
+    link = ProductLink(label="商品A", url="https://example.com/a")
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(NotePosterError):
+            poster._wait_for_product_link_applied(page, block, link, timeout_ms=200)
+
+    assert "商品導線URL適用後のリンク未反映" in caplog.text
 
 
 _LINK_TOOLBAR_HTML_WITH_MISBEHAVING_URL_INPUT = """
@@ -2132,6 +2247,7 @@ def test_set_link_on_text_occurrence_source_has_no_positional_fallback_candidate
         NotePoster._find_url_apply_button,
         NotePoster._find_product_link_block,
         NotePoster._select_product_link_text_in_block,
+        NotePoster._wait_for_product_link_applied,
     ):
         source = inspect.getsource(func)
         assert "最終手段" not in source
@@ -2317,6 +2433,83 @@ def test_assert_links_match_ignores_unrelated_links_elsewhere_in_body(page):
     body_locator = page.locator(".editor")
 
     poster._assert_links_match(page, body_locator, links, stage="保存前")  # 例外が出なければOK
+
+
+def test_assert_links_match_passes_with_real_dom_span_wrapped_anchor_text(page):
+    # 実機Artifact(TEST-004、「適用」クリック後の観測)で確認できた実際の
+    # DOM構造(<a href="..."><span class="highlight">→ 商品を見る</span></a>、
+    # <a>にtarget="_blank" rel="noopener"付き)に対しても、既存の
+    # _assert_links_match()がコード変更なしでそのまま正しく判定できる
+    # ことを確認する(2026年8月29日、完成実装ラウンドでの実機DOM監査)。
+    links = [
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    ]
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        '<p class="paragraph">TOY JAM 瀬戸内レモン<br>'
+        '<a href="https://you-ichi.jp/?pid=192116331" target="_blank" rel="noopener">'
+        '<span class="highlight">→ 商品を見る</span></a></p>'
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    poster._assert_links_match(page, body_locator, links, stage="保存前")  # 例外が出なければOK
+
+
+def test_apply_product_links_stops_before_second_link_when_first_link_never_applies(page):
+    # 複数のproduct_linksのうち1件でもリンク反映を確認できなければ、
+    # 後続の商品の処理には進まず例外を送出することを確認する(呼び出し元の
+    # create_draft()では_run_stepがNotePosterErrorをそのまま再送出するため、
+    # 下書き保存(_save_draft)へは進まない)。
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true">
+          <p>この記事に出てきた商品</p>
+          <p>商品A<br>→ 商品を見る</p>
+          <p>商品B<br>→ 商品を見る</p>
+        </div>
+        <div data-active="true" role="toolbar" id="desktop-toolbar">
+          <button aria-label="リンク">リンク</button>
+        </div>
+        <script>
+          document.querySelector('#desktop-toolbar button[aria-label="リンク"]')
+            .addEventListener('click', () => {
+              const toolbar = document.getElementById('desktop-toolbar');
+              const textarea = document.createElement('textarea');
+              textarea.setAttribute('inputmode', 'text');
+              textarea.setAttribute('name', 'alt');
+              textarea.setAttribute('placeholder', 'https://');
+              const applyButton = document.createElement('button');
+              const span = document.createElement('span');
+              span.textContent = '適用';
+              applyButton.appendChild(span);
+              // 意図的に、「適用」クリックしても<a>要素を生成しない
+              // (=リンクが反映されないケースを再現する)。
+              applyButton.addEventListener('click', () => {
+                textarea.remove();
+                applyButton.remove();
+              });
+              toolbar.appendChild(textarea);
+              toolbar.appendChild(applyButton);
+            });
+        </script>
+        """
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+    links = [
+        ProductLink(label="商品A", url="https://example.com/a"),
+        ProductLink(label="商品B", url="https://example.com/b"),
+    ]
+
+    with pytest.raises(NotePosterError):
+        poster._apply_product_links(page, body_locator, links)
+
+    # 商品Bのブロックには一切触れていない(商品Aの反映確認で安全停止した)
+    # ことを確認する。
+    assert page.locator(".editor a").count() == 0
 
 
 def test_assert_body_matches_detects_card_like_extra_content_in_product_trailer(page):

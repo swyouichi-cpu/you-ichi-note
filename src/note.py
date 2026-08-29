@@ -482,6 +482,12 @@ _ACTIVE_TOOLBAR_SELECTOR = 'div[role="toolbar"][data-active="true"]'
 # へ倒す。
 _LINK_BUTTON_CLICK_TIMEOUT_MS = 5000
 
+# 「適用」ボタンをクリックしてから、実際に<a>要素が対象ブロック内へ
+# 反映されるまでの非同期の遅延を吸収するための待機上限(2026年8月29日、
+# TEST-004で「適用」クリック後に<a>要素が生成されることを実機確認した後に
+# 追加)。固定sleep()は使わず、Playwrightのlocator待機と組み合わせる。
+_PRODUCT_LINK_APPLY_TIMEOUT_MS = 3000
+
 # 診断データが際限なく増えないよう、記録件数の上限を設ける。
 _MAX_DIAG_ENTRIES = 300
 
@@ -583,17 +589,22 @@ class UrlInputObservationStop(NotePosterError):
 
 class UrlApplyObservationStop(NotePosterError):
     """商品導線リンクのURL入力欄に対して「適用」ボタンをクリックした
-    直後に、意図的に処理を安全停止する際に送出する
-    (観測専用実装・第3段階、2026年8月29日)。
+    直後に、意図的に処理を安全停止する際に送出していた例外
+    (観測専用実装・第4段階、2026年8月29日)。
 
-    「適用」ボタンをクリックした後に実際に「→ 商品を見る」が`<a>`要素に
-    なるか、`href`が期待したURLと一致するか、URL入力UIが消えるか等は
-    まだ実機で確認できていない。そのため`_assert_links_match()`や下書き
-    保存へは進まず、HTML/スクリーンショット/診断データを保存したうえで
-    ここで停止する。`LinkButtonObservationStop`(リンクボタンクリック後の
-    観測停止)・`UrlInputObservationStop`(URL入力・read-back確認後の
-    観測停止)とはログ上で明確に区別できるよう、別の専用サブクラスに
-    している。
+    ★2026年8月29日時点の位置づけ★: 当初は、「適用」ボタンをクリックした
+    後に実際に「→ 商品を見る」が`<a>`要素になるか、`href`が期待したURLと
+    一致するか等がまだ実機で確認できていなかったため、この例外を送出して
+    意図的に処理を停止していた(観測専用実装・第4段階)。その後、実機
+    Artifactの解析で「適用」クリック後に実際に`<a>`要素が正しく生成される
+    ことを確認できたため、`_wait_for_product_link_applied()`による
+    locator待機と`_assert_links_match()`による検証を経て下書き保存まで
+    進む完成実装に置き換えた(第6段階)。通常の処理経路ではこの例外は
+    もう送出されないが、「リンクボタン→URL入力→read-back→『適用』
+    クリック」までは確認できているという段階を明示できる診断用の例外
+    として、クラス自体は削除せず残している。`LinkButtonObservationStop`・
+    `UrlInputObservationStop`とはログ上で明確に区別できるよう、別の
+    専用サブクラスにしている。
     """
 
 
@@ -1165,13 +1176,17 @@ class NotePoster:
         ため、本文editor(body_locator)にスコープを絞ったブロック単位の
         特定(_find_product_link_block)を経由してリンク対象を選択する。
 
-        ★現時点では観測専用実装であることに注意★
-        リンクボタンをクリックした直後に出現するURL入力UIの構造がまだ
-        実機で確認できていないため、_apply_product_links はボタンを
-        クリックした時点で意図的に LinkButtonObservationStop を送出して
-        処理を中断する(URL入力・確定操作は行わない)。したがって
-        product_links が指定された記事は、現時点では必ず needs_review へ
-        安全停止し、draft_created にはならない。
+        ★商品リンク設定は完成実装(2026年8月29日、TEST-004で「適用」
+        クリック後に<a>要素が実際に生成されることを確認したことを受けて
+        完成)★
+        _apply_product_links は各商品ごとに、対象ブロックの特定→
+        「→ 商品を見る」の選択→リンクボタンのクリック→URL入力欄への
+        入力→read-back確認→「適用」ボタンのクリック→<a>要素が実際に
+        反映されるまでの待機、までを行う(_set_link_on_text_occurrence)。
+        いずれかの段階で一意に特定できない・read-backが不一致・反映が
+        確認できない等の場合は、推測せずNotePosterErrorを送出して安全
+        停止する(呼び出し側でneeds_reviewに倒れる)。1件でも失敗すれば
+        後続の商品の処理には進まず、下書き保存へも進まない。
 
         本文入力欄は、タイトル入力欄と同一のDOM要素を誤って掴んでいない
         ことを確認したうえで使用し(_same_element)、実際に入力に使った
@@ -2182,6 +2197,45 @@ class NotePoster:
         Errorとして例外の内容を含めて報告する(「read-backした値が
         `None`だった」という曖昧な扱いはしない)。`press_sequentially()`
         自体や「適用」ボタン以降の処理は変更していない。
+
+        ★「適用」クリック後の完成実装・第6段階(2026年8月29日時点、
+        TEST-004で「適用」クリック後の完成DOMを確認したことを踏まえた
+        修正)★
+        上記の第4・第5段階を実機で実行したところ、URL入力・read-back
+        一致・「適用」ボタンクリックまで安定して成功するようになった。
+        取得した実機Artifact(`_capture_failure()`が保存したHTML)を解析
+        したところ、「適用」クリック後は対象ブロック内に実際に
+
+          <p ...>TOY JAM 瀬戸内レモン<br>
+            <a href="https://you-ichi.jp/?pid=192116331" target="_blank"
+               rel="noopener"><span class="highlight">→ 商品を見る</span>
+            </a>
+          </p>
+
+        という`<a>`要素が生成されており、hrefは入力したURLと完全一致、
+        アンカーテキストは(`<span class="highlight">`でラップされて
+        いるが)「→ 商品を見る」と一致していた。フローティング編集
+        ツールバーはURL入力欄・「適用」ボタンが消え、通常の選択ツール
+        バー(見出し/太字/リンク/引用等)へ戻っていたが、DOM上の`data-
+        active`属性自体は`"true"`のままだった(=ツールバーの存在自体で
+        「まだ処理中か」を判定するのは不確実)。
+
+        この観測結果を受けて、意図的な`UrlApplyObservationStop`による
+        停止を撤去し、代わりに`_wait_for_product_link_applied()`で
+        対象ブロック内に`<a>`要素(`get_by_role("link", name=
+        _PRODUCT_LINK_TEXT, exact=True)`)が実際に出現するのを、固定
+        `time.sleep()`ではなくPlaywrightのlocator待機(`wait_for(state=
+        "visible")`)で待つように変更した。待っても出現しなければ推測
+        せず`NotePosterError`で安全停止する。出現を確認できた場合は
+        正常終了し、呼び出し元の`_apply_product_links()`のループへ
+        戻る(複数の`product_links`がある場合、続けて次の商品のリンク
+        設定に進む)。実際の件数・テキスト完全一致・href一致の検証は
+        ここでは行わず、既存の`_assert_links_match()`(本ラウンドでは
+        変更していない)に委ねる。`UrlInputObservationStop`・
+        `UrlApplyObservationStop`のクラス自体は削除せず、それぞれの
+        段階まで実機で確認できたことを示す診断用の例外として残して
+        いるが、この完成実装以降はどちらも通常の処理経路では送出され
+        ない。
         """
         self._select_product_link_text_in_block(page, block)
 
@@ -2269,16 +2323,57 @@ class NotePoster:
                 f"『{link.label}』の「適用」ボタンのクリックに失敗しました: {exc}"
             ) from exc
 
-        self._capture_failure(page, "商品導線URL適用後の観測")
-        raise UrlApplyObservationStop(
-            f"『{link.label}』のURL入力欄に{link.url!r}を入力してread-back"
-            "で一致を確認したうえで、ツールバー内の「適用」ボタンをクリック"
-            "しました。<a>要素が実際に生成されたか、hrefが期待通りか、"
-            "URL入力UIが消えるか等はまだ実機で確認できていないため、"
-            "_assert_links_match()や下書き保存へは進まず、観測のために"
-            "意図的にここで処理を停止します"
-            "(HTML/スクリーンショット/診断データは保存済みです)。"
-        )
+        self._wait_for_product_link_applied(page, block, link)
+
+    def _wait_for_product_link_applied(
+        self,
+        page: Page,
+        block: Locator,
+        link: ProductLink,
+        timeout_ms: int = _PRODUCT_LINK_APPLY_TIMEOUT_MS,
+    ) -> None:
+        """「適用」ボタンをクリックした直後、実際に<a>要素が対象ブロック内へ
+        反映されるまで、固定sleepではなくPlaywrightのlocator待機で待つ
+        (2026年8月29日、実機Artifactで「適用」クリック後の完成DOMを確認した
+        ことを受けて追加)。
+
+        実機Artifact(TEST-004)を解析したところ、「適用」クリック後は
+        URL入力欄と「適用」ボタンがDOMから消え、フローティング編集
+        ツールバーは通常の選択ツールバー(見出し/太字/リンク/引用...)へ
+        戻る一方、対象ブロック内には
+
+          <p ...><br><a href="https://you-ichi.jp/?pid=192116331"
+             target="_blank" rel="noopener">
+            <span class="highlight">→ 商品を見る</span>
+          </a></p>
+
+        のように<a>要素が実際に生成されており、hrefは入力したURLと完全に
+        一致し、アンカーテキストは(<span>でラップされてはいるが)
+        「→ 商品を見る」と一致していた。
+
+        ここでは`block.get_by_role("link", name=_PRODUCT_LINK_TEXT,
+        exact=True)`というアクセシブルロールベースのlocatorを対象ブロック
+        にスコープして待機に使う(role="link"はネイティブの<a href>に
+        自動的に付与され、アクセシブルネームは内部に<span>があっても
+        テキスト全体から自動計算されるため、<span>でラップされているか
+        どうかに依存しない)。このメソッドの責務は「反映されるまで待つ」
+        ことだけであり、件数・テキスト完全一致・href一致といった実際の
+        検証は行わない(それらは`_assert_links_match()`に委ねる。二重に
+        同じ検証を実装しないことで、検証ロジックを1箇所に保つ)。
+
+        上限`timeout_ms`(既定`_PRODUCT_LINK_APPLY_TIMEOUT_MS`)以内に
+        リンクが反映されたことを確認できない場合は、推測で先へ進まず
+        `NotePosterError`を送出して安全停止する(呼び出し側で
+        `needs_review`に倒れる)。
+        """
+        anchor = block.get_by_role("link", name=_PRODUCT_LINK_TEXT, exact=True)
+        if not self._wait_for_locator_to_appear(anchor, timeout_ms):
+            self._capture_failure(page, "商品導線URL適用後のリンク未反映")
+            raise NotePosterError(
+                f"『{link.label}』の「適用」ボタンをクリックしましたが、"
+                f"タイムアウト({timeout_ms}ms)以内に対象ブロック内へのリンク"
+                "反映を確認できませんでした。安全のため処理を中断します。"
+            )
 
     def _assert_links_match(
         self,

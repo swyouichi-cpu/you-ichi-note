@@ -363,8 +363,9 @@ URLを自動的に**商品カード**(画像・商品名・価格・説明・購
 (下記フォーマット)から、本文末尾に以下のようなプレーンテキストの商品導線
 セクションを追記し、「→ 商品を見る」という固定文言だけに、noteのフロー
 ティング編集ツールバーの「リンク」ボタン(下記参照)経由でインライン
-リンクを設定しようとします。**現時点ではボタンをクリックした直後に
-意図的に安全停止する観測専用実装です**(詳細は後述)。
+リンクを設定します。2026年8月29日に「適用」クリック後の実機Artifactで
+`<a>`要素の生成を確認できたため、下書き保存・保存後read-back確認まで
+一連の流れとして実装済みです(詳細は後述)。
 
 ```
 この記事に出てきた商品
@@ -500,21 +501,20 @@ action()`を適用したうえで`click()`します。このクリック自体�
 処理(既存のまま)に加え、クリック対象のボタンに対しても既存の
 `_assert_not_publish_action()`を必ず適用してから`click()`します。
 
-**★観測専用実装であること★**: リンクボタンをクリックした後に実際に
-どのようなURL入力UI(ポップオーバーかモーダルか、`input`要素か
-`contenteditable`か等)が出現するかは、まだ一度も実機で観測できていません。
-この状態でURL入力欄のセレクタを推測実装すると、旧ショートカット方式の
-ときと同じ「未確認のDOM構造を前提にした実装」を繰り返すことになります。
-そのため`_set_link_on_text_occurrence()`は、リンクボタンをクリックした
-直後に意図的にHTML/スクリーンショット/診断データを保存したうえで、
-`LinkButtonObservationStop`(`NotePosterError`のサブクラス。通常の
-「リンク設定に失敗した」という意味の例外とログ上で明確に区別するための
-専用クラス)を送出して処理を止めます。**URL入力欄を探す・URLを入力する・
-Enterを押す・確定ボタンを押す、という操作は一切行いません。** 次回の実機
-テストでこの観測データを取得したのち、URL入力UIの自動化を本実装する想定
-です。`product_links`が指定された記事は、この観測専用実装が本実装に
-置き換わるまで、必ず`needs_review`へ安全停止し、`draft_created`には
-なりません(`note_url`も確定しません)。
+**★リンクボタンクリック後の観測専用実装だった段階(現在は完成実装に
+置き換え済み)★**: 当初、リンクボタンをクリックした後に実際にどのような
+URL入力UI(ポップオーバーかモーダルか、`input`要素か`contenteditable`か
+等)が出現するかは一度も実機で観測できておらず、この状態でURL入力欄の
+セレクタを推測実装すると旧ショートカット方式のときと同じ「未確認のDOM
+構造を前提にした実装」を繰り返すことになるため、リンクボタンをクリック
+した直後に意図的にHTML/スクリーンショット/診断データを保存したうえで
+`LinkButtonObservationStop`(`NotePosterError`のサブクラス)を送出して
+処理を止める観測専用実装にしていました。以降の実機テストでURL入力欄・
+「適用」ボタンの実DOMを段階的に確認できたため、現在はこの停止は行わず
+(通常の処理経路では`LinkButtonObservationStop`は送出されません)、
+下記の通りURL入力・「適用」ボタンクリック・リンク反映確認・下書き保存
+まで一連の流れとして実装済みです。`LinkButtonObservationStop`のクラス
+自体は削除せず、診断用の例外として残しています。
 
 **`product_links`列のフォーマット**(JSON配列):
 
@@ -608,9 +608,8 @@ to_appear()`で出現・可視化を待ってから、改めて`count()`を取�
 保存したうえで)通常の`NotePosterError`で安全停止します。
 
 **「適用」ボタンのクリック(実機確認済み)**: read-backが一致した後、
-実機Artifactで確認できた「適用」ボタンをクリックするところまで実装を
-進めています。実DOMは以下の通り、URL入力欄と同じフローティング編集
-ツールバーの内部に存在します。
+実機Artifactで確認できた「適用」ボタンをクリックします。実DOMは以下の
+通り、URL入力欄と同じフローティング編集ツールバーの内部に存在します。
 
 ```html
 <div data-active="true" role="toolbar" id="desktop-toolbar">
@@ -642,17 +641,52 @@ to_appear()`で出現・可視化を待ってから、改めて`count()`を取�
 内であることを確認し、`_assert_not_publish_action()`を適用したうえで
 通常の`click()`(短いタイムアウト)を行います。
 
-クリック直後にHTML/スクリーンショット/診断データを保存したうえで
-`UrlApplyObservationStop`(`UrlInputObservationStop`とはログ上で区別
-できる別のサブクラス)を送出して意図的に処理を止めます。`<a>`要素が
-実際に生成されたか、`href`が期待通りか、URL入力UIが消えるか等はまだ
-実機で確認できていないため、`_assert_links_match()`や下書き保存へは
-まだ進みません。`UrlInputObservationStop`はクラス自体を削除せず、
-「URL入力・read-backまでは確認できている」段階を明示する診断用の例外
-として残しています。`force=True`やJavaScriptによる直接の
-`element.click()`、Enterキー送信・Tabキー送信・意図的なフォーカス解除は
-引き続き一切使いません。次回の実機テストでこの観測データを取得したのち、
-URL確定の完了確認・後続処理を本実装する想定です。
+`force=True`やJavaScriptによる直接の`element.click()`、Enterキー送信・
+Tabキー送信・意図的なフォーカス解除は引き続き一切使いません。
+
+**「適用」クリック後の完成実装(2026年8月29日)**: 「適用」ボタンを
+クリックした実機Artifact(HTML)を解析したところ、対象ブロック内に
+実際に
+
+```html
+<p ...>TOY JAM 瀬戸内レモン<br>
+  <a href="https://you-ichi.jp/?pid=192116331" target="_blank"
+     rel="noopener"><span class="highlight">→ 商品を見る</span></a>
+</p>
+```
+
+という`<a>`要素が生成されており、hrefは入力したURLと完全一致、アンカー
+テキストは(`<span class="highlight">`でラップされているが)「→ 商品を
+見る」と一致していることを確認できました。フローティング編集ツール
+バーはURL入力欄・「適用」ボタンが消え、通常の選択ツールバー(見出し/
+太字/リンク/引用等)へ戻っていましたが、`data-active`属性自体は
+`"true"`のままでした。
+
+この観測結果を受けて、それまで意図的に行っていた`UrlApplyObservation
+Stop`による停止を撤去し、`_wait_for_product_link_applied()`で対象
+ブロック内に`<a>`要素(`get_by_role("link", name=_PRODUCT_LINK_TEXT,
+exact=True)`)が実際に出現するのを、固定`sleep()`ではなくPlaywrightの
+locator待機(`wait_for(state="visible")`)で待つように変更しました。
+待っても出現しなければ推測せず`NotePosterError`で安全停止します。
+出現を確認できた場合は正常終了し、複数の`product_links`があれば続けて
+次の商品のリンク設定に進みます(`_apply_product_links()`のループ)。
+実際の件数・テキスト完全一致・href一致の検証はこの待機処理では行わず、
+既存の`_assert_links_match()`(この完成実装では変更していません)に
+委ねます。`UrlInputObservationStop`・`UrlApplyObservationStop`のクラス
+自体は削除せず、それぞれの段階まで実機で確認できたことを示す診断用の
+例外として残していますが、通常の処理経路ではどちらも送出されなく
+なりました。
+
+以上により、`create_draft()`は本文入力→商品導線リンク設定→本文・
+リンクのread-back確認(保存前)→自動保存完了待ち→下書き保存→保存完了
+待ち→本文・リンクのread-back確認(保存後)、まで一連の流れとして
+実行されます(この一連の流れ自体は本ラウンドより前から実装済みで
+あり、`_apply_product_links()`が例外を送出せず正常終了するように
+なったことで、初めて商品リンク付きの記事も`draft_created`まで到達
+できるようになりました)。商品リンクのいずれか1件でも一意特定・
+read-back一致・リンク反映のいずれかに失敗すれば、その時点で
+`NotePosterError`が送出され、後続の商品の処理にも下書き保存にも
+進みません。
 
 **URL入力〜read-back区間の診断強化(2026年8月29日)**: 上記の第4段階を
 実機実行したところ、ある回はURL入力・read-back一致・「適用」ボタン
@@ -743,21 +777,17 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
     (`textarea[placeholder="https://"][inputmode="text"][name="alt"]`)は
     実機Artifactで構造を確認できたため、一意に特定できた場合のみURLを
     入力し、入力に使った同じlocatorから`input_value()`でread-backして
-    完全一致を確認する。一致した場合はHTML/スクリーンショット/診断
-    データを保存したうえで、意図的に`UrlInputObservationStop`を送出して
-    処理を停止する(現時点では**観測専用実装**、`_set_link_on_text_
-    occurrence()`)。read-backが不一致の場合も(可能な限り)診断データを
+    完全一致を確認する。read-backが不一致の場合(可能な限り)診断データを
     保存したうえで通常の`NotePosterError`で安全停止する
 15. 商品リンクのURL入力欄が特定できない場合(0件・複数件・timeout・
     strict mode違反)は、リンクボタンのクリック処理と同様に推測せず
     `needs_review`へ安全停止する
 16. **URLの確定方法**のうち、Enterキー送信・Tabキー送信・意図的な
     フォーカス解除・「URLの入力をやめる」ボタンのクリック・他要素の
-    クリックは、実機でその効果が未確認のため一切実装しない。診断データの
-    取得(`_capture_failure()`)自体もURL入力欄・ボタンのフォーカスを奪う
-    操作を含まないことを確認済みである。この制約は、次回の実機テストで
-    取得した観測データを元にURL確定の完了確認・後続処理を本実装する
-    まで維持する
+    クリックは、実機で確認できた「適用」ボタンのクリック以外は一切
+    実装しない。診断データの取得(`_capture_failure()`・`_log_url_
+    input_diagnostics()`)自体もURL入力欄・ボタンのフォーカスを奪う
+    操作を含まないことを確認済みである
 17. 商品リンクのリンクボタン・「適用」ボタンをクリックする前には、
     `bounding_box()`を実測してviewportの範囲に完全に収まっていることを
     確認する(`_ensure_link_button_in_viewport()`)。収まっていない場合は
@@ -770,9 +800,7 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
     URL入力欄の特定に使ったのと同じアクティブなツールバーをスコープと
     した`get_by_role("button", name="適用", exact=True)`で一意に特定する
     (`_find_url_apply_button()`)。動的に生成されるid(Reactの`useId`等
-    由来と見られる`:r16:`のような値)はセレクタに使わない。クリック後は
-    `_assert_links_match()`や下書き保存へは進まず、`UrlApplyObservation
-    Stop`で安全停止する
+    由来と見られる`:r16:`のような値)はセレクタに使わない
 19. 商品リンクのURL入力後、`press_sequentially()`完了直後に同じセレクタ
     で`count()`を再確認する。1件でなければ(URL入力欄が消失・増減した
     可能性があるため)read-backを続行せず、`UrlInputDisappeared
@@ -782,6 +810,17 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
     「read-backした値が`None`だった」という曖昧な扱いはしない。この
     区間の診断ログ取得(`_log_url_input_diagnostics()`)自体も、クリック・
     フォーカス・blur等の操作を一切行わない読み取り専用とする
+20. 商品リンクの「適用」ボタンをクリックした後、対象ブロック内に実際に
+    `<a>`要素が反映されるまで、固定`sleep()`ではなくPlaywrightのlocator
+    待機(`get_by_role("link", name=_PRODUCT_LINK_TEXT, exact=True).
+    wait_for(state="visible")`)で待つ(`_wait_for_product_link_
+    applied()`)。上限時間内に反映を確認できない場合(0件のまま・
+    strict mode違反となる複数件のいずれも)は`needs_review`へ安全停止
+    する。反映を確認できた場合も件数・テキスト完全一致・href一致の実際の
+    検証はここでは行わず、既存の`_assert_links_match()`に委ねる
+    (二重に検証ロジックを実装しない)。複数の`product_links`がある場合、
+    1件でも反映を確認できなければ後続の商品の処理には進まず、下書き
+    保存へも進まない
 
 ## 12. Phase 1 実機検証記録
 
@@ -798,6 +837,7 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
 | `TEST-004`(リンクボタンクリック失敗) | ツールバーボタンクリック時のviewport外エラーの解析 | `needs_review`(クリックがviewport外で30秒timeoutすることが判明。クリック前のviewport確認・安全停止を追加。対応不要) |
 | `TEST-004`(URL入力・適用ボタン到達) | viewport確認追加後の実機実行、URL入力・read-back一致・「適用」ボタンの実DOM確認 | `needs_review`(`UrlInputObservationStop`まで到達を確認。「適用」ボタンクリックまでの観測専用実装・第4段階を追加。対応不要) |
 | `TEST-004`(URL入力欄消失・同一commitでの再現性差異) | 第4段階と同一commitでの再実行、URL入力後read-back直前でのURL入力欄消失の解析 | `needs_review`(同一commitで成功/失敗の両方を確認。コード回帰ではないと判断し、診断強化と消失検知の安全停止を追加。対応不要) |
+| `TEST-004`(「適用」クリック後の完成DOM確認) | 診断強化後の実機実行、URL入力欄消失は再現せず`UrlApplyObservationStop`まで到達、「適用」クリック後の完成DOM確認 | `needs_review`(意図的な観測停止。`<a>`要素の生成を確認し、下書き保存まで進む完成実装に変更。対応不要) |
 
 `TEST-003`(2026年8月28日)での確認事項:
 GitHub Actions=Success / Sheets status=`draft_created` / note_url正常記録 /
@@ -945,6 +985,27 @@ read-back直前・消失検知時・read-back成功後)の読み取り専用の�
 `press_sequentially()`自体や「適用」ボタン以降の処理は変更していない。
 URL入力欄が正常であれば、これまで通り1回の呼び出しの中で「適用」ボタン
 クリック(`UrlApplyObservationStop`)まで自動的に到達する。この変更も
+ローカルpytestでの確認のみで、まだ実際のGitHub Actions実行では検証して
+いない。
+
+`TEST-004`(「適用」クリック後の完成DOM確認)で判明した事項: 上記の診断
+強化後に実機で再実行したところ、URL入力欄の消失は再現せず、「→ 商品を
+見る」の選択・リンクボタンのクリック・URL入力欄の出現・URL入力・
+read-back一致・「適用」ボタンのクリックまで安定して成功し、意図的な
+`UrlApplyObservationStop`まで到達した。`_capture_failure()`が保存した
+HTMLを解析したところ、対象ブロック内に実際に`<a href="https://you-ichi.
+jp/?pid=192116331" target="_blank" rel="noopener"><span class="highlight">
+→ 商品を見る</span></a>`という`<a>`要素が生成されており、hrefは入力した
+URLと完全一致、アンカーテキストは`<span class="highlight">`でラップ
+されているものの「→ 商品を見る」と一致していた。フローティング編集
+ツールバーはURL入力欄・「適用」ボタンが消え、通常の選択ツールバーへ
+戻っていた。既存の`_assert_links_match()`(`inner_text()`でアンカーの
+テキストを読み取る設計)は、この`<span>`でラップされた実DOMに対しても
+コード変更なしでそのまま正しく判定できることを、実DOMを再現したテスト
+で確認した。これを受けて、意図的な`UrlApplyObservationStop`による停止を
+撤去し、`_wait_for_product_link_applied()`による`<a>`要素反映のlocator
+待機→`_assert_links_match()`による検証→下書き保存→保存後read-back確認、
+までを一連の流れとして実装した(詳細は「10. 商品リンク」)。この変更も
 ローカルpytestでの確認のみで、まだ実際のGitHub Actions実行では検証して
 いない。
 
