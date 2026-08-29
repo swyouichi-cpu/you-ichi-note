@@ -280,6 +280,19 @@ styled-components由来のハッシュには一切依存しない)。いずれ�
 `needs_review`へ安全停止する。セレクタ自体(`role`/`data-active`/
 `aria-label`)は変更していない。
 
+(5) 上記(4)の初回実装では`_wait_for_locator_to_appear()`が内部で
+`locator.first.wait_for(...)`という形で`.first`を使っていた。これは
+「複数件でも待機自体はできるように」という意図だったが、位置ベースの
+要素選択(`.first`/`.nth()`)を一切使わないという安全要件に反していると
+指摘を受け、`locator.first`ではなく**locatorそのもの**に対して
+`wait_for(state="visible")`を呼ぶ形に修正した。Playwrightのlocatorは
+「1件に一致する前提の操作」(`wait_for`を含む)を、実際に2件以上へ
+一致した場合はstrict mode違反として即座に例外(`playwright.sync_api.
+Error`。`TimeoutError`もこのサブクラス)を送出する。この例外も
+「一意に特定できない」ケースとして扱い、位置ベースで1件を選んで先に
+進むことはしない(`_wait_for_locator_to_appear()`はこの場合Falseを返し、
+呼び出し側が改めて`count()`で具体的な件数を確認してから安全停止する)。
+
 ★観測専用実装であることについて(2026年8月29日時点)★
 ボタンをクリックした後に実際にどのようなURL入力UI(ポップオーバーか
 モーダルか、`input`要素か`contenteditable`か等)が出現するかは、まだ
@@ -362,6 +375,7 @@ from urllib.parse import urlsplit
 from playwright.sync_api import (
     Browser,
     BrowserContext,
+    Error as PlaywrightError,
     Locator,
     Page,
     TimeoutError as PlaywrightTimeoutError,
@@ -1445,15 +1459,27 @@ class NotePoster:
             )
 
     def _wait_for_locator_to_appear(self, locator: Locator, timeout_ms: int) -> bool:
-        """locatorが指す要素が出現しvisibleになるのを、上限timeout_ms
-        (ミリ秒)だけ待つ。固定sleep()は使わず、Playwrightの自動待機
-        (`wait_for(state="visible")`)を使う。出現しないまま時間切れに
-        なった場合はFalseを返す(呼び出し側で安全停止の判断に使う)。
+        """locator自体(意味のあるCSSセレクタで絞り込んだ、複数件を許容
+        しうるLocator)が出現しvisibleになるのを、上限timeout_ms
+        (ミリ秒)だけ待つ。
+
+        `.first`や`.nth()`のような位置ベースの絞り込みは一切行わず、
+        locatorそのものに対して`wait_for(state="visible")`を呼ぶ
+        (Playwrightの自動待機の仕組みであり、固定`time.sleep()`は
+        使わない)。Playwrightのstrict modeにより、待機中にlocatorが
+        2件以上の要素に一致した場合はTimeoutErrorとは別の例外
+        (`playwright.sync_api.Error`)が送出されるが、これも「一意に
+        特定できない」ケースとして扱いFalseを返す(位置ベースで1件を
+        選んで先に進むことはしない)。出現しないまま時間切れになった
+        場合(`TimeoutError`。`Error`のサブクラス)も同様にFalseを返す。
+        Falseが返った場合、呼び出し側は改めて`count()`を取り直して
+        具体的な件数(0件なのか複数件なのか)を確認し、安全停止の
+        メッセージに反映する。
         """
         try:
-            locator.first.wait_for(state="visible", timeout=timeout_ms)
+            locator.wait_for(state="visible", timeout=timeout_ms)
             return True
-        except PlaywrightTimeoutError:
+        except PlaywrightError:
             return False
 
     def _find_active_link_toolbar_button(

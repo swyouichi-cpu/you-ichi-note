@@ -1149,8 +1149,12 @@ def test_find_active_link_toolbar_button_raises_when_toolbar_never_appears(page)
 
 
 def test_find_active_link_toolbar_button_raises_when_multiple_toolbars_appear(page):
-    # 出現を待った後に改めてcount()を取り直し、複数件なら安全停止する
-    # ことを確認する(出現後の一意性の再検証)。
+    # 出現を待っている最中にlocatorが2件以上に一致すると、Playwrightの
+    # strict modeにより例外(TimeoutErrorとは別のError)が送出される。
+    # _wait_for_locator_to_appear()はこれも「一意に特定できない」ケースと
+    # して扱い、.first()等で1件を選んで先に進んだりしない。呼び出し側は
+    # 改めてcount()を取り直し、複数件なら安全停止することを確認する
+    # (出現後の一意性の再検証)。
     page.set_content(
         """
         <div class="editor" contenteditable="true"><p>本文</p></div>
@@ -1174,6 +1178,37 @@ def test_find_active_link_toolbar_button_raises_when_multiple_toolbars_appear(pa
 
     with pytest.raises(NotePosterError):
         poster._find_active_link_toolbar_button(page, timeout_ms=2000)
+
+
+def test_wait_for_locator_to_appear_returns_false_on_strict_mode_violation(page):
+    # _wait_for_locator_to_appear() 単体でも、locatorが最初から複数件に
+    # 一致する場合にstrict mode違反を安全に吸収してFalseを返す
+    # (例外を外へ漏らさず、.first()等で位置ベースに1件を選ばない)ことを
+    # 直接確認する。
+    page.set_content(
+        """
+        <button aria-label="リンク">1</button>
+        <button aria-label="リンク">2</button>
+        """
+    )
+    poster = _bare_poster()
+    duplicated = page.locator('button[aria-label="リンク"]')
+
+    result = poster._wait_for_locator_to_appear(duplicated, timeout_ms=500)
+
+    assert result is False
+    # strict mode違反後もcount()自体は正常に実際の件数を返す。
+    assert duplicated.count() == 2
+
+
+def test_wait_for_locator_to_appear_succeeds_without_first_or_nth(page):
+    page.set_content('<button aria-label="リンク">1</button>')
+    poster = _bare_poster()
+    unique = page.locator('button[aria-label="リンク"]')
+
+    result = poster._wait_for_locator_to_appear(unique, timeout_ms=500)
+
+    assert result is True
 
 
 def test_find_active_link_toolbar_button_ignores_inactive_toolbar(page):
@@ -1292,6 +1327,33 @@ def test_find_active_link_toolbar_button_does_not_use_fixed_sleep():
         # 実際のコード部分だけを検査対象にする。
         code_only = source.replace(func.__doc__ or "", "")
         assert re.search(r"\bsleep\s*\(", code_only) is None
+
+
+def test_wait_for_locator_functions_have_no_first_or_nth_in_code():
+    """待機処理(_wait_for_locator_to_appear / _find_active_link_toolbar_
+    button)のコード部分に、位置ベースの要素選択(.first / .nth())が
+    一切使われていないことを確認する。
+
+    待機目的であっても .first()/.nth() は使わない、という安全要件の
+    ための回帰テスト。当初の実装は _wait_for_locator_to_appear() 内で
+    `locator.first.wait_for(...)` を使っており、この要件に反していた
+    (指摘を受けてlocator自体を待機対象にする実装へ修正した)。
+    docstring中の説明文言("`.first`や`.nth()`のような…"等)は対象外とし、
+    実際のコード部分だけを検査する。
+    """
+    import inspect
+    import re
+
+    for func in (
+        NotePoster._wait_for_locator_to_appear,
+        NotePoster._find_active_link_toolbar_button,
+    ):
+        source = inspect.getsource(func)
+        code_only = source.replace(func.__doc__ or "", "")
+        assert ".first" not in code_only, f"{func.__name__} に .first が含まれています"
+        assert re.search(r"\.nth\s*\(", code_only) is None, (
+            f"{func.__name__} に .nth( が含まれています"
+        )
 
 
 # -- _set_link_on_text_occurrence(観測専用実装: クリック後は必ず安全停止) -----

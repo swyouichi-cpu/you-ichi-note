@@ -445,6 +445,17 @@ toolbar_button()`に`_wait_for_locator_to_appear()`を組み込み、ツール
 `needs_review`へ安全停止します。セレクタ自体(`role`/`data-active`/
 `aria-label`)は変更していません。
 
+**待機処理でも`.first()`/`.nth()`は使いません**: `_wait_for_locator_to_
+appear()`の当初の実装は`locator.first.wait_for(...)`という形で`.first`を
+使っていましたが、これは「待機目的であっても位置ベースの要素選択は
+使わない」という安全要件に反するとの指摘を受け、`locator.first`ではなく
+**locatorそのもの**に対して`wait_for(state="visible")`を呼ぶ形に修正
+しました。Playwrightのlocatorは、待機中に実際に2件以上へ一致すると
+strict mode違反として例外(`playwright.sync_api.Error`。`TimeoutError`も
+このサブクラス)を送出しますが、これも「一意に特定できない」ケースとして
+扱い、位置ベースで1件を選んで先に進むことはしません(`count()`を改めて
+取り直してから安全停止します)。
+
 クリックの前には、`_select_product_link_text_in_block()`で対象の
 「→ 商品を見る」だけを選択し、`window.getSelection().toString()`を
 読み取って選択内容が期待通り「→ 商品を見る」そのものであることを確認する
