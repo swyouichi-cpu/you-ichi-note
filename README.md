@@ -495,6 +495,26 @@ action()`を適用したうえで`click()`します。このクリック自体�
 確認を通過した状態でclick()が長時間ブロックする状況は本来起きないはずで
 あり、想定外の場合でも早期に`needs_review`へ倒すためです。
 
+**pre-selection scroll(2026年8月29日、ARTICLE-001の長文記事での実機
+実行を踏まえた修正)**: 上記の「クリック前のviewport確認」だけでは、
+`ARTICLE-001`のように商品導線が本文のかなり下にある長文記事で
+`LinkButtonOutOfViewportError`が発生しました。原因は、クリック対象の
+フローティング編集ツールバーが`position: fixed`であり、CSSの仕様上
+ページをスクロールしても画面上の位置が変化しないため、ツールバーが
+**出現した後**に`scroll_into_view_if_needed()`を試みても解決できない
+ことでした。そこで「浮動ツールバーを後からスクロールで直す」のではなく
+「浮動ツールバーの元になる選択(selection)を、最初から画面内で作る」
+方針に変更しました。`_select_product_link_text_in_block()`でテキストを
+選択する**前**に、`_ensure_product_link_block_in_viewport()`で商品導線
+ブロック自体を`scroll_into_view_if_needed()`し、`bounding_box()`が
+viewportの範囲に完全に収まっていることを確認します(商品導線ブロックは
+「商品名」「→ 商品を見る」の2行だけの小さなブロックであり、viewportより
+はるかに小さいため、完全包含での判定を要求しても不必要に厳しくは
+なりません)。収まっていない場合はテキスト選択へ進まず`ProductLinkBlock
+OutOfViewportError`で安全停止します。この事前確認は追加のみであり、
+上記のリンクボタン自体のviewport確認は変更せずそのまま維持しています
+(二重の安全確認)。
+
 クリックの前には、`_select_product_link_text_in_block()`で対象の
 「→ 商品を見る」だけを選択し、`window.getSelection().toString()`を
 読み取って選択内容が期待通り「→ 商品を見る」そのものであることを確認する
@@ -866,6 +886,16 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
     (二重に検証ロジックを実装しない)。複数の`product_links`がある場合、
     1件でも反映を確認できなければ後続の商品の処理には進まず、下書き
     保存へも進まない
+21. 商品導線テキスト(「→ 商品を見る」)を選択する**前**に、商品導線
+    ブロック自体を`scroll_into_view_if_needed()`し、`bounding_box()`が
+    viewportの範囲に完全に収まっていることを確認する
+    (`_ensure_product_link_block_in_viewport()`)。収まっていない場合は
+    テキスト選択へは進まず`ProductLinkBlockOutOfViewportError`で安全
+    停止する。フローティング編集ツールバーの`style`/`top`を書き換える、
+    JavaScriptで強制的に移動する、といった手段は使わない。この事前
+    確認は追加のみであり、リンクボタン自体の従来のviewport確認
+    (`_ensure_link_button_in_viewport()`)は変更せず維持する(二重の
+    安全確認)
 
 ## 12. Phase 1 実機検証記録
 
@@ -888,6 +918,7 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
 | `ARTICLE-001`(direct child scopeへの限定) | 実機HTMLダンプの直接解析(ユーザーによる) | 真因は探索範囲がdescendantまで及んでいたこと(隣接2行判定自体は正しかった)。`:scope > p`でdirect childのみに限定。対応不要 |
 | `ARTICLE-001`(全文完全一致への厳密化) | direct child限定後の実機再実行Artifactの直接解析(ユーザーによる) | 真因は巨大なdirect-child `<p>`の途中にも同じ2行が含まれ候補になっていたこと。候補条件をブロック全文の完全一致へ厳密化。対応不要 |
 | `ARTICLE-001`(commit c6c3526での再実行) | 商品導線ブロック特定を突破した後の実機再実行 | 商品導線ブロックの誤判定は解消。次段階の`LinkButtonOutOfViewportError`で`needs_review`。原因は`position: fixed`要素にscroll_into_view_if_needed()が効かないこと。診断強化を追加。対応不要 |
+| `ARTICLE-001`(pre-selection scrollへの設計変更) | 診断強化(commit 7c8d810)を踏まえた原因確定・修正 | 「浮動ツールバーを後から直す」のではなく「テキスト選択前に商品導線ブロック自体をviewport内へscroll」する設計に変更。`LinkButtonOutOfViewportError`の実際の解消を狙う修正。対応不要(実機再実行は未実施) |
 
 `TEST-003`(2026年8月28日)での確認事項:
 GitHub Actions=Success / Sheets status=`draft_created` / note_url正常記録 /
@@ -1145,6 +1176,29 @@ viewport()`で`LinkButtonOutOfViewportError`が発生し`needs_review`へ
 自体の判定・安全停止の挙動・viewportサイズ(1280x800)は変更していない。
 この変更もローカルpytestでの確認のみで、まだ実際のGitHub Actions実行
 (`ARTICLE-001`の再実行)では検証していない。
+
+`ARTICLE-001`(pre-selection scrollへの設計変更)で判明した事項: 上記の
+診断強化(`position: fixed`祖先の検知)だけでは判定ロジック自体を変更して
+いないため、原因(浮動ツールバーが出現した後にスクロールしても解決
+できないこと)を実際に解消する変更にはなっていなかった。そこで、
+「浮動ツールバーを後からスクロールで直す」のではなく「浮動ツールバーの
+元になる選択(selection)を、最初から画面内で作る」設計に変更した。
+`_select_product_link_text_in_block()`でテキストを選択する前に、
+`_ensure_product_link_block_in_viewport()`で商品導線ブロック自体を
+`scroll_into_view_if_needed()`し、`bounding_box()`がviewportの範囲に
+完全に収まっていることを確認する。収まっていなければテキスト選択へ進まず
+`ProductLinkBlockOutOfViewportError`で安全停止する(詳細は「10. 商品
+リンク」)。フローティングツールバーのstyle/topを書き換える、JavaScriptで
+強制移動する、viewportを巨大化して問題を隠す、といった手段は一切
+使っていない。商品導線ブロック特定ロジック(`_find_product_link_block()`)
+・URL入力/「適用」/href read-backロジックは今回変更していない。長文の
+ARTICLE-001相当の構造(商品導線ブロックが文書のかなり下にあり、浮動
+ツールバーの位置が選択範囲のviewport相対位置から動的に計算される)を
+ローカルで再現したテストで、pre-selection scrollにより選択・ツールバー
+出現・リンクボタンのクリック・URL入力・「適用」・`<a>`要素の反映まで
+viewport内で完了できることを確認した。この変更もローカルpytestでの
+確認のみで、まだ実際のGitHub Actions実行(`ARTICLE-001`の再実行)では
+検証していない。
 
 `ARTICLE-001`は人間が確認するまで`status`を`ready`に戻さない
 (対応済み・変更していない)。

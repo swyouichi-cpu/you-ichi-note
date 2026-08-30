@@ -488,6 +488,12 @@ _LINK_BUTTON_CLICK_TIMEOUT_MS = 5000
 # 追加)。固定sleep()は使わず、Playwrightのlocator待機と組み合わせる。
 _PRODUCT_LINK_APPLY_TIMEOUT_MS = 3000
 
+# 商品導線テキストを選択する前に、商品導線ブロック自体をscroll_into_view_
+# if_needed()する際のタイムアウト上限(2026年8月29日、ARTICLE-001の実機
+# 実行でリンクボタンのフローティングツールバーがposition: fixedのため
+# 出現後のスクロールでは解決できないと判明したことを受けて追加)。
+_PRODUCT_LINK_BLOCK_SCROLL_TIMEOUT_MS = 5000
+
 # 診断データが際限なく増えないよう、記録件数の上限を設ける。
 _MAX_DIAG_ENTRIES = 300
 
@@ -677,6 +683,38 @@ class LinkButtonOutOfViewportError(NotePosterError):
     needs_reviewへ安全停止する。通常のNotePosterErrorではなく専用の
     サブクラスにしているのは、「リンクボタンがviewport外にあったために
     クリックしなかった」ことをログから明確に区別できるようにするため。
+    """
+
+
+class ProductLinkBlockOutOfViewportError(NotePosterError):
+    """商品導線ブロック(商品名と「→ 商品を見る」を含む`<p>`)自体を、
+    テキスト選択の前にviewport内へ移動できなかった場合に送出する
+    (2026年8月29日、ARTICLE-001の実機実行を踏まえた修正)。
+
+    実機のGitHub Actions実行(ARTICLE-001)で、`_ensure_link_button_in_
+    viewport()`が`LinkButtonOutOfViewportError`で安全停止する事象が
+    発生した。原因を調べたところ、クリック対象のフローティング編集
+    ツールバーは`position: fixed`(`<div class="... fixed left-0 top-0
+    z-50 size-full">`)であり、CSSの仕様上ページをスクロールしても画面上の
+    位置が変化しないため、ツールバーが出現した**後**に`scroll_into_view_
+    if_needed()`を試みても解決できないと判明した(`LinkButtonOutOfViewport
+    Error`のdocstringを参照)。
+
+    そこで、「浮動ツールバーをスクロールで直す」のではなく、「浮動ツール
+    バーの元になる選択(selection)を、最初から画面内で作る」方針に変更
+    した。`_select_product_link_text_in_block()`で商品導線テキストを選択
+    する**前**に、商品導線ブロック(`<p>`)自体を`scroll_into_view_if_
+    needed()`し、`bounding_box()`が実際にviewportの範囲に完全に収まって
+    いることを確認する。商品導線ブロックは「商品名」「→ 商品を見る」の
+    2行だけの小さなブロックであり、viewport(1280x800)よりはるかに小さい
+    ため、完全包含での判定を要求しても不必要に厳しくはならない。
+
+    収まっていない場合は、テキスト選択へは進まず、`force=True`や
+    JavaScriptによる直接のscroll操作(要素のstyle/topを書き換える等)の
+    ような、実際の表示状態の保証を失う手段には頼らず、この例外を送出して
+    needs_reviewへ安全停止する。`LinkButtonOutOfViewportError`(リンク
+    ボタン自体のクリック前確認)とはログ上で明確に区別できるよう、別の
+    専用サブクラスにしている。
     """
 
 
@@ -1890,6 +1928,110 @@ class NotePoster:
             )
         return link_button
 
+    def _ensure_product_link_block_in_viewport(
+        self,
+        page: Page,
+        block: Locator,
+        link: ProductLink,
+        timeout_ms: int = _PRODUCT_LINK_BLOCK_SCROLL_TIMEOUT_MS,
+    ) -> None:
+        """商品導線テキストを選択する**前**に、商品導線ブロック(`<p>`)
+        自体をviewport内へ移動し、実際に収まっていることを確認する
+        (2026年8月29日、ARTICLE-001の実機実行を踏まえた修正)。
+
+        timeout_ms はテストで待機時間を短縮するために公開している引数
+        であり、実際の呼び出し(`_set_link_on_text_occurrence`)では常に
+        デフォルト値(`_PRODUCT_LINK_BLOCK_SCROLL_TIMEOUT_MS`)を使う。
+
+        ★「浮動ツールバーを後から直す」から「selectionを最初から画面内で
+        作る」への設計変更(ARTICLE-001の実機実行を踏まえた修正)★
+        実機のGitHub Actions実行(ARTICLE-001)で、`_ensure_link_button_
+        in_viewport()`が`LinkButtonOutOfViewportError`で安全停止した。
+        原因を調べたところ、クリック対象のフローティング編集ツールバーは
+        `position: fixed`であり、CSSの仕様上ページをスクロールしても
+        画面上の位置が変化しないため、ツールバーが**出現した後**に
+        `scroll_into_view_if_needed()`を試みても解決できないと判明した
+        (詳細は`LinkButtonOutOfViewportError`・`ProductLinkBlockOutOf
+        ViewportError`のdocstringを参照)。
+
+        ARTICLE-001のように長文で商品導線が本文のかなり下にある場合、
+        「→ 商品を見る」を選択した時点でのスクロール位置によって、
+        note側がフローティングツールバーをviewport外の座標に配置して
+        しまう。そこで、テキストを選択してツールバーを出現させる前に、
+        選択の元になる商品導線ブロック自体をあらかじめviewport内へ
+        `scroll_into_view_if_needed()`し、`bounding_box()`で実際に
+        viewportの範囲に完全に収まっていることを確認してから選択に進む
+        設計に変更した。商品導線ブロックは「商品名」「→ 商品を見る」の
+        2行だけの小さなブロックであり、viewport(1280x800)よりはるかに
+        小さいため、`_bounding_box_within_viewport()`による完全包含の
+        判定を要求しても(記事本文全体のような大きなブロックとは異なり)
+        不必要に厳しくはならない。
+
+        `bounding_box()`が取得できない場合、またはviewportに完全には
+        収まっていない場合は、`_select_product_link_text_in_block()`
+        (テキスト選択)へは進まず、`force=True`やJavaScriptによる直接の
+        scroll操作(要素のstyle/topを書き換える、フローティングツールバー
+        を強制移動する等)のような、実際の表示状態の保証を失う手段には
+        頼らず、`_capture_failure()`でHTML/スクリーンショット/診断
+        データを保存したうえで`ProductLinkBlockOutOfViewportError`を
+        送出して安全停止する(呼び出し側でneeds_reviewに倒れる)。
+
+        この事前スクロール・確認を追加した後も、ツールバー出現後の
+        `_find_active_link_toolbar_button()`→`_ensure_link_button_in_
+        viewport()`(リンクボタン自体の従来通りのviewport確認)は変更せず
+        そのまま維持する(二重の安全確認)。
+        """
+        try:
+            viewport_size = page.viewport_size
+        except PlaywrightError:
+            viewport_size = None
+        try:
+            block_box_before = block.bounding_box()
+        except PlaywrightError:
+            block_box_before = None
+        logger.info(
+            "商品導線ブロック pre-selection scroll前診断: label=%r "
+            "viewport=%s block_bbox(scroll前)=%s",
+            link.label,
+            viewport_size,
+            block_box_before,
+        )
+
+        try:
+            block.scroll_into_view_if_needed(timeout=timeout_ms)
+        except PlaywrightError:
+            # scroll自体が失敗・timeoutしても、この後の実測bounding_box()
+            # で最終的にviewport内に収まったかどうかを判定するため、
+            # ここでは中断しない。
+            pass
+
+        try:
+            block_box_after = block.bounding_box()
+        except PlaywrightError:
+            block_box_after = None
+
+        if block_box_after is None or viewport_size is None:
+            self._capture_failure(page, "商品導線ブロックpre-selection viewport確認")
+            raise ProductLinkBlockOutOfViewportError(
+                f"『{link.label}』の商品導線ブロックの位置(bounding_box)"
+                f"またはviewportサイズを取得できませんでした"
+                f"(block_bbox={block_box_after!r}, viewport="
+                f"{viewport_size!r})。安全に選択可能な状態を確認できない"
+                "ため処理を中断します。"
+            )
+
+        if not _bounding_box_within_viewport(block_box_after, viewport_size):
+            self._capture_failure(page, "商品導線ブロックpre-selection viewport確認")
+            raise ProductLinkBlockOutOfViewportError(
+                f"『{link.label}』の商品導線ブロックをscroll_into_view_"
+                "if_needed()した後も、"
+                f"表示範囲(viewport {viewport_size['width']}x"
+                f"{viewport_size['height']})に完全には収まっていません"
+                f"(bounding_box(scroll後)={block_box_after!r}、"
+                f"bounding_box(scroll前)={block_box_before!r})。安全に"
+                "選択できる状態を確認できないため処理を中断します。"
+            )
+
     def _ensure_link_button_in_viewport(
         self,
         page: Page,
@@ -2423,7 +2565,38 @@ class NotePoster:
         段階まで実機で確認できたことを示す診断用の例外として残して
         いるが、この完成実装以降はどちらも通常の処理経路では送出され
         ない。
+
+        ★pre-selection scroll・第7段階(2026年8月29日時点、ARTICLE-001の
+        実機実行を踏まえた修正)★
+        上記の完成実装をARTICLE-001(長文で商品導線が本文のかなり下に
+        ある記事)で実機実行したところ、`LinkButtonOutOfViewportError`で
+        安全停止した。原因を調べたところ、クリック対象のフローティング
+        編集ツールバーは`position: fixed`であり、CSSの仕様上ページを
+        スクロールしても画面上の位置が変化しないため、ツールバーが
+        **出現した後**に`scroll_into_view_if_needed()`を試みても解決
+        できないと判明した(詳細は`ProductLinkBlockOutOfViewportError`の
+        docstringを参照)。
+
+        そこで、「浮動ツールバーを後からスクロールで直す」のではなく、
+        「浮動ツールバーの元になる選択(selection)を、最初から画面内で
+        作る」方針に変更した。`_select_product_link_text_in_block()`で
+        テキストを選択する**前**に、`_ensure_product_link_block_in_
+        viewport()`で商品導線ブロック(`block`)自体を`scroll_into_view_
+        if_needed()`し、`bounding_box()`が実際にviewportの範囲に完全に
+        収まっていることを確認する。収まっていなければテキスト選択へは
+        進まず`ProductLinkBlockOutOfViewportError`で安全停止する
+        (`needs_review`に倒れる)。ブロックがviewport内に収まった場合の
+        みテキスト選択・リンクボタンのクリックへ進む。
+
+        この事前スクロール・確認は追加のみであり、それ以降の処理
+        (active toolbar一意特定→link button一意特定→`_ensure_link_
+        button_in_viewport()`によるボタン自体のviewport確認→
+        `_assert_not_publish_action()`→通常の`click()`)は一切変更して
+        いない(二重の安全確認になる)。商品導線ブロック特定ロジック
+        (`_find_product_link_block()`)・URL入力/「適用」/href read-back
+        ロジックも今回は変更していない。
         """
+        self._ensure_product_link_block_in_viewport(page, block, link)
         self._select_product_link_text_in_block(page, block)
 
         try:

@@ -26,6 +26,7 @@ from src.note import (  # noqa: E402
     NotePoster,
     NotePosterError,
     ProductLink,
+    ProductLinkBlockOutOfViewportError,
     ProductLinkValidationError,
     TagValidationError,
     UrlApplyObservationStop,
@@ -2060,6 +2061,288 @@ def test_set_link_on_text_occurrence_inputs_url_and_clicks_apply_then_applies_li
     assert anchor.get_attribute("href") == link.url
 
 
+# -- _ensure_product_link_block_in_viewport(pre-selection scroll、ARTICLE-001 --
+# の実機実行を踏まえた修正、2026年8月29日)
+#
+# フローティング編集ツールバーはposition: fixedであり、出現した後に
+# scroll_into_view_if_needed()しても画面上の位置は変化しない
+# (LinkButtonOutOfViewportErrorのdocstring・実機Artifactで確認済み)。
+# そこで「浮動ツールバーを後から直す」のではなく、「浮動ツールバーの元に
+# なる選択(selection)を、最初から画面内で作る」設計に変更した。
+# _select_product_link_text_in_block()でテキストを選択する前に、商品導線
+# ブロック自体をscroll_into_view_if_needed()し、viewport内に収まっている
+# ことを確認する。
+
+
+def test_ensure_product_link_block_in_viewport_scrolls_block_into_view(page):
+    # 画面下方にある商品ブロックを、selection前にscrollしてviewport内へ
+    # 入れられることを確認する。
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        """
+        <div style="height: 3000px;"></div>
+        <div class="editor" contenteditable="true">
+          <p>この記事に出てきた商品</p>
+          <p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(1)
+    link = ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a")
+
+    box_before = block.bounding_box()
+    assert box_before["y"] > 600  # scroll前はまだviewport外
+
+    poster._ensure_product_link_block_in_viewport(page, block, link)  # 例外が出なければOK
+
+    box_after = block.bounding_box()
+    assert 0 <= box_after["y"]
+    assert box_after["y"] + box_after["height"] <= 600
+
+
+def test_ensure_product_link_block_in_viewport_succeeds_when_already_in_view(page):
+    # ブロックが最初からviewport内にある(短文記事、TEST-004相当)場合も、
+    # 余計な問題を起こさず正常終了することを確認する。
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(1)
+    link = ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a")
+
+    poster._ensure_product_link_block_in_viewport(page, block, link)  # 例外が出なければOK
+
+
+def test_ensure_product_link_block_in_viewport_raises_when_still_out_of_viewport_after_scroll(
+    page,
+):
+    # position: fixedでviewportの高さを超えるtopを持つブロックは、
+    # window単位のスクロールでは絶対にviewport内へ入らない。選択処理へは
+    # 進まず安全停止することを確認する。
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true">
+          <p>この記事に出てきた商品</p>
+          <p style="position: fixed; top: 900px; left: 10px;">
+            TOY JAM 瀬戸内レモン<br>→ 商品を見る
+          </p>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(1)
+    link = ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a")
+
+    with pytest.raises(ProductLinkBlockOutOfViewportError):
+        poster._ensure_product_link_block_in_viewport(page, block, link, timeout_ms=300)
+
+
+def test_ensure_product_link_block_in_viewport_raises_when_bounding_box_is_none(page):
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        '<p style="display:none;">TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>'
+        "</div>"
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(1)
+    link = ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a")
+
+    with pytest.raises(ProductLinkBlockOutOfViewportError):
+        poster._ensure_product_link_block_in_viewport(page, block, link, timeout_ms=300)
+
+
+def test_ensure_product_link_block_in_viewport_saves_failure_artifact(page, caplog):
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        """
+        <div class="editor" contenteditable="true">
+          <p>この記事に出てきた商品</p>
+          <p style="position: fixed; top: 900px; left: 10px;">
+            TOY JAM 瀬戸内レモン<br>→ 商品を見る
+          </p>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(1)
+    link = ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a")
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(ProductLinkBlockOutOfViewportError):
+            poster._ensure_product_link_block_in_viewport(page, block, link, timeout_ms=300)
+
+    assert "商品導線ブロックpre-selection viewport確認" in caplog.text
+
+
+def test_set_link_on_text_occurrence_runs_pre_selection_scroll_before_text_selection(
+    page, monkeypatch
+):
+    # pre-selection scroll(_ensure_product_link_block_in_viewport)が
+    # _select_product_link_text_in_block()より前に実行されることを、
+    # 選択が実行される時点で既にブロックがviewport内に収まっていることを
+    # 確認することで検証する。
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        """
+        <div style="height: 3000px;"></div>
+        <div class="editor" contenteditable="true">
+          <p>この記事に出てきた商品</p>
+          <p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>
+        </div>
+        <div data-active="true" role="toolbar" id="desktop-toolbar">
+          <button aria-label="リンク">リンク</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(1)
+    link = ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a")
+
+    observed: dict = {}
+    original = NotePoster._select_product_link_text_in_block
+
+    def spy(self, page_arg, block_arg):
+        observed["box_at_selection_time"] = block_arg.bounding_box()
+        return original(self, page_arg, block_arg)
+
+    monkeypatch.setattr(NotePoster, "_select_product_link_text_in_block", spy)
+
+    # この簡易fixtureにはURL入力欄が無いため、リンクボタンクリック以降の
+    # どこかでNotePosterError(のサブクラス)が発生して止まるが、
+    # _select_product_link_text_in_block()自体は必ず呼ばれるため、
+    # そこでのbounding_boxを検証すれば順序の確認としては十分。
+    with pytest.raises(NotePosterError):
+        poster._set_link_on_text_occurrence(page, block, link)
+
+    assert "box_at_selection_time" in observed
+    box = observed["box_at_selection_time"]
+    assert box is not None
+    assert 0 <= box["y"]
+    assert box["y"] + box["height"] <= 600
+
+
+_LONG_ARTICLE001_STYLE_HTML = """
+<div style="height: 3000px;">spacer</div>
+<div class="editor" contenteditable="true">
+  <p>この記事に出てきた商品</p>
+  <p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>
+</div>
+<div data-active="false" role="toolbar" id="desktop-toolbar"
+     style="position: fixed; display: none;">
+  <button aria-label="リンク">リンク</button>
+</div>
+<script>
+  window.__urlInputKeys = [];
+  // 実機のnoteと同様、フローティング編集ツールバーの位置は「選択範囲の
+  // 現在のviewport相対位置」から計算される(position: fixedで、selection
+  // が変わるたびに再配置される)ことをローカルで再現する。事前にブロック
+  // 自体をviewport内へscrollしてから選択すれば、ここで計算されるtopは
+  // viewport内に収まる。逆に、scrollせずに選択すればtopはviewport外の
+  // 大きな値になる。
+  document.addEventListener('selectionchange', () => {
+    const sel = window.getSelection();
+    if (!sel || sel.toString().trim() !== '→ 商品を見る') return;
+    const range = sel.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    const toolbar = document.getElementById('desktop-toolbar');
+    toolbar.style.top = Math.max(0, rect.top - 50) + 'px';
+    toolbar.style.left = Math.max(0, rect.left) + 'px';
+    toolbar.style.display = 'block';
+    toolbar.setAttribute('data-active', 'true');
+  });
+  document.querySelector('#desktop-toolbar button[aria-label="リンク"]')
+    .addEventListener('click', (e) => {
+      e.target.setAttribute('data-clicked', 'true');
+      const toolbar = document.getElementById('desktop-toolbar');
+      const textarea = document.createElement('textarea');
+      textarea.setAttribute('inputmode', 'text');
+      textarea.setAttribute('name', 'alt');
+      textarea.setAttribute('placeholder', 'https://');
+      textarea.addEventListener('keydown', (ev) => {
+        window.__urlInputKeys.push(ev.key);
+      });
+      const applyButton = document.createElement('button');
+      applyButton.setAttribute('data-name', 'Button');
+      applyButton.setAttribute('type', 'button');
+      const applySpan = document.createElement('span');
+      applySpan.textContent = '適用';
+      applyButton.appendChild(applySpan);
+      applyButton.addEventListener('click', (ev) => {
+        ev.target.closest('button').setAttribute('data-clicked', 'true');
+        const url = textarea.value;
+        const targetP = Array.from(
+          document.querySelectorAll('.editor p')
+        ).find((el) => el.textContent.includes('瀬戸内レモン'));
+        const textNode = targetP && Array.from(targetP.childNodes).find(
+          (node) => node.nodeType === Node.TEXT_NODE
+            && node.textContent.trim() === '→ 商品を見る'
+        );
+        if (textNode) {
+          const a = document.createElement('a');
+          a.setAttribute('href', url);
+          a.setAttribute('target', '_blank');
+          a.setAttribute('rel', 'noopener');
+          const span = document.createElement('span');
+          span.className = 'highlight';
+          span.textContent = '→ 商品を見る';
+          a.appendChild(span);
+          textNode.replaceWith(a);
+        }
+        textarea.remove();
+        applyButton.remove();
+        cancelButton.remove();
+      });
+      const cancelButton = document.createElement('button');
+      cancelButton.setAttribute('aria-label', 'URLの入力をやめる');
+      toolbar.appendChild(textarea);
+      toolbar.appendChild(applyButton);
+      toolbar.appendChild(cancelButton);
+    });
+</script>
+"""
+
+
+def test_apply_product_links_succeeds_for_long_article001_style_page_with_block_far_below(
+    page,
+):
+    # ARTICLE-001相当の回帰テスト: 商品導線ブロックが文書のかなり下に
+    # あり、フローティング編集ツールバーの位置が選択範囲のviewport相対
+    # 位置から動的に計算される(position: fixed)長文記事でも、
+    # pre-selection scrollにより選択・ツールバー出現・リンクボタンの
+    # クリック・URL入力・「適用」・<a>要素の反映まで、実際にviewport内で
+    # 完了できることを確認する。
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.set_content(_LONG_ARTICLE001_STYLE_HTML)
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+    links = [
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    ]
+
+    poster._apply_product_links(page, body_locator, links)  # 例外が出なければOK
+
+    anchor = body_locator.locator("a")
+    assert anchor.count() == 1
+    assert anchor.inner_text().strip() == "→ 商品を見る"
+    assert anchor.get_attribute("href") == links[0].url
+
+    # 実際にリンクボタン・「適用」ボタンのクリックがviewport内で行われた
+    # (安全停止せず完了した)ことの確認。
+    link_button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
+    assert link_button.get_attribute("data-clicked") == "true"
+    sent_keys = page.evaluate("() => window.__urlInputKeys")
+    assert "Enter" not in sent_keys
+    assert "Tab" not in sent_keys
+
+
 # -- _bounding_box_within_viewport(viewport境界判定の純粋関数) -------------
 #
 # _ensure_link_button_in_viewport() から座標計算部分だけを切り出した純粋
@@ -2312,6 +2595,7 @@ def test_ensure_link_button_in_viewport_does_not_use_force_or_javascript_click()
 
     for func in (
         NotePoster._ensure_link_button_in_viewport,
+        NotePoster._ensure_product_link_block_in_viewport,
         NotePoster._set_link_on_text_occurrence,
         NotePoster._log_url_input_diagnostics,
         NotePoster._wait_for_product_link_applied,
