@@ -1146,6 +1146,161 @@ def test_find_product_link_block_raises_when_no_block_contains_the_label(page):
         )
 
 
+# -- ARTICLE-001の実機実行で判明した、商品名が別商品名のprefixになっている ---
+# ケースの回帰テスト(2026年8月29日)。「TOY JAM 瀬戸内レモン」と「TOY JAM
+# 瀬戸内レモン月桂樹」のように、一方の商品名がもう一方の商品名の先頭部分と
+# 完全に一致する場合でも、行単位の完全一致判定により誤って両方にマッチしない
+# ことを確認する。
+
+
+def test_find_product_link_block_does_not_match_when_label_is_a_prefix_of_another_products_name(
+    page,
+):
+    # ARTICLE-001相当のケース: 短い商品名が、別の商品(長い商品名)の
+    # ブロックの1行目の先頭部分と一致していても、行単位の完全一致でなければ
+    # そのブロックを誤って候補にしないことを確認する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"
+        "<p>TOY JAM 瀬戸内レモン月桂樹<br>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    block = poster._find_product_link_block(
+        page,
+        body_locator,
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    )
+
+    assert block.inner_text().strip() == "TOY JAM 瀬戸内レモン\n→ 商品を見る"
+
+
+def test_find_product_link_block_resolves_each_label_to_its_own_block_when_one_is_a_prefix(
+    page,
+):
+    # ARTICLE-001相当のケース: 2商品それぞれについて_find_product_link_
+    # block()を呼んだとき、それぞれ正しい(取り違えていない)ブロックが
+    # 返ることを確認する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"
+        "<p>TOY JAM 瀬戸内レモン月桂樹<br>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    block_short = poster._find_product_link_block(
+        page,
+        body_locator,
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    )
+    block_long = poster._find_product_link_block(
+        page,
+        body_locator,
+        ProductLink(
+            label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"
+        ),
+    )
+
+    assert block_short.inner_text().strip() == "TOY JAM 瀬戸内レモン\n→ 商品を見る"
+    assert block_long.inner_text().strip() == "TOY JAM 瀬戸内レモン月桂樹\n→ 商品を見る"
+    assert poster._same_element(page, block_short, block_long) is False
+
+
+def test_find_product_link_block_matches_exact_label_with_surrounding_whitespace(page):
+    # ブロック側のテキストに前後の空白が含まれていても(strip()で吸収)、
+    # 完全一致判定できることを確認する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>  TOY JAM 瀬戸内レモン  <br>  → 商品を見る  </p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    block = poster._find_product_link_block(
+        page,
+        body_locator,
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    )
+
+    assert block is not None
+
+
+def test_assert_links_match_resolves_article001_style_prefix_labels_to_correct_urls(page):
+    # ARTICLE-001相当のケース: 2商品(片方がもう片方の商品名のprefix)の
+    # それぞれについて、_assert_links_match()がリンク先を取り違えずに
+    # 検証できることを確認する(_find_product_link_blockの修正が実際の
+    # 検証フローでも機能することのend-to-end確認)。
+    links = [
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+        ProductLink(
+            label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"
+        ),
+    ]
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        '<p>TOY JAM 瀬戸内レモン<br><a href="https://you-ichi.jp/?pid=192116331">'
+        "→ 商品を見る</a></p>"
+        '<p>TOY JAM 瀬戸内レモン月桂樹<br><a href="https://you-ichi.jp/?pid=191552342">'
+        "→ 商品を見る</a></p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    poster._assert_links_match(page, body_locator, links, stage="保存前")  # 例外が出なければOK
+
+
+def test_assert_links_match_detects_swapped_hrefs_with_article001_style_prefix_labels(page):
+    # ARTICLE-001相当のケースで、万一hrefが取り違えられていた場合は
+    # 従来通り不一致として検出できることを確認する。
+    links = [
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+        ProductLink(
+            label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"
+        ),
+    ]
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        '<p>TOY JAM 瀬戸内レモン<br><a href="https://you-ichi.jp/?pid=191552342">'
+        "→ 商品を見る</a></p>"
+        '<p>TOY JAM 瀬戸内レモン月桂樹<br><a href="https://you-ichi.jp/?pid=192116331">'
+        "→ 商品を見る</a></p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    with pytest.raises(NotePosterError, match="不一致"):
+        poster._assert_links_match(page, body_locator, links, stage="保存前")
+
+
+def test_find_product_link_block_source_uses_exact_line_equality_not_substring():
+    """商品名の一致判定が、部分一致・前方一致ではなく行単位の完全一致
+    (`in` によるリストの要素との等価判定)であることをソースから確認する
+    回帰テスト(2026年8月29日、ARTICLE-001の修正)。
+    """
+    import inspect
+
+    source = inspect.getsource(NotePoster._find_product_link_block)
+    code_only = source.replace(NotePoster._find_product_link_block.__doc__ or "", "")
+    assert "link.label in lines" in code_only
+    # `.startswith(` や `label in text` (行に分解する前の生文字列に対する
+    # 部分一致)のような、部分一致・前方一致に相当するコードが無いことを
+    # 確認する。
+    assert ".startswith(" not in code_only
+    assert "label in text" not in code_only
+
+
 # -- _select_product_link_text_in_block(ブロック内の対象テキストだけを選択) --
 
 

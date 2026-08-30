@@ -1551,6 +1551,29 @@ class NotePoster:
           - そのブロックのテキストを行単位に分解すると、ちょうど
             [label, _PRODUCT_LINK_TEXT] の2行になっている
             (=商品名の行の直後に「→ 商品を見る」の行が続いている)
+
+        ★商品名の行単位の完全一致(2026年8月29日、ARTICLE-001の実機実行を
+        踏まえた修正)★
+        `product_links`に2件以上の商品があり、片方の商品名がもう片方の
+        商品名の先頭部分と一致する場合(例:「TOY JAM 瀬戸内レモン」と
+        「TOY JAM 瀬戸内レモン月桂樹」)、実機のGitHub Actions実行
+        (ARTICLE-001)で商品名を含むブロックが2件見つかったと誤判定され、
+        `needs_review`へ安全停止する事象が発生した。商品名の一致判定は
+        `text.splitlines()`で行単位に分解した各行との**完全一致**
+        (`link.label == line`)であり、`in`演算子による判定も部分一致・
+        前方一致ではなく「行のリストの中にlabelと完全に等しい要素がある
+        か」という厳密な一致であることを、改めて明示的にテストで固定した
+        (空行はここで`if line.strip()`により除外してから比較する)。
+
+          - 一致させない: label=`TOY JAM 瀬戸内レモン`、
+            block=`TOY JAM 瀬戸内レモン月桂樹\\n→ 商品を見る`
+            (1行目が`TOY JAM 瀬戸内レモン月桂樹`であり、labelとは完全に
+            等しくないため)
+          - 一致させる: block=`TOY JAM 瀬戸内レモン\\n→ 商品を見る`
+            (1行目がlabelと完全に等しいため)
+
+        商品名の前後の空白は`strip()`で吸収するが、部分一致・前方一致・
+        曖昧一致には一切戻さない。
         """
         blocks = body_locator.locator("p")
         try:
@@ -1565,7 +1588,7 @@ class NotePoster:
                 text = block.inner_text()
             except PlaywrightTimeoutError:
                 continue
-            lines = [line.strip() for line in text.split("\n")]
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
             if link.label in lines:
                 label_match_indices.append(i)
 
@@ -1579,7 +1602,9 @@ class NotePoster:
 
         block = blocks.nth(label_match_indices[0])
         try:
-            lines = [line.strip() for line in block.inner_text().split("\n")]
+            lines = [
+                line.strip() for line in block.inner_text().splitlines() if line.strip()
+            ]
         except PlaywrightTimeoutError:
             lines = []
 
