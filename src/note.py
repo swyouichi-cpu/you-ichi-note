@@ -1618,6 +1618,30 @@ class NotePoster:
         ならず、隣接2行判定・行構成の最終チェックはそのままdirect child
         の候補だけに対して行われる。`.first()`/`.nth()`による位置依存の
         回避(例えば「2件なら後ろを採用する」)は行っていない。
+
+        ★ブロック全文の完全一致への厳密化(2026年8月29日、ARTICLE-001の
+        実機再実行Artifactを踏まえた再修正)★
+        direct child(`:scope > p`)への限定後も、実機のGitHub Actions
+        実行(ARTICLE-001)で商品名を含むブロックが2件見つかる事象が
+        再現した。ユーザーが実機のHTMLダンプを直接解析した結果、本文
+        editorの直接の子である`<p>`の中に、(A)記事本文ほぼ全体を
+        `inner_text()`として含む巨大な`<p>`と、(B)実際の商品導線専用の
+        `<p>`の両方が存在することが判明した。巨大な`<p>`(A)の
+        `inner_text()`を行単位に分解した`lines`の**途中**にも
+        `[label, _PRODUCT_LINK_TEXT]`という隣接2行がたまたま含まれて
+        いたため、「ブロック内のどこかに隣接2行が存在すれば候補」という
+        従来の判定では、(A)(B)の両方が候補になっていた。
+
+        そこで候補条件を、「ブロック内のどこかに隣接2行が存在するか」
+        ではなく、「そのブロックの`lines`全体が`[label,
+        _PRODUCT_LINK_TEXT]`という**ちょうど2行だけ**で構成されているか」
+        (`lines == [link.label, _PRODUCT_LINK_TEXT]`)に厳密化した。これに
+        より、商品導線専用の`<p>`(B)だけが候補になり、本文の一部として
+        たまたま同じ2行を内部に含む巨大な`<p>`(A)は、他にも本文の地の文
+        を含み`lines`がちょうど2行にはならないため候補にならない。
+        部分一致・前方一致・「ブロック内のどこかに存在すれば良い」という
+        判定には一切戻さない。候補が0件または2件以上であれば、これまで
+        通り推測せず`needs_review`へ安全停止する。
         """
         blocks = body_locator.locator(":scope > p")
         try:
@@ -1625,6 +1649,7 @@ class NotePoster:
         except PlaywrightTimeoutError:
             total = 0
 
+        expected_lines = [link.label, _PRODUCT_LINK_TEXT]
         label_match_indices: list[int] = []
         label_match_lines: list[list[str]] = []
         for i in range(total):
@@ -1634,11 +1659,7 @@ class NotePoster:
             except PlaywrightTimeoutError:
                 continue
             lines = [line.strip() for line in text.splitlines() if line.strip()]
-            has_adjacent_pair = any(
-                lines[j] == link.label and lines[j + 1] == _PRODUCT_LINK_TEXT
-                for j in range(len(lines) - 1)
-            )
-            if has_adjacent_pair:
+            if lines == expected_lines:
                 label_match_indices.append(i)
                 label_match_lines.append(lines)
 
@@ -1655,10 +1676,10 @@ class NotePoster:
         if len(label_match_indices) != 1:
             self._capture_failure(page, "商品導線ブロック特定")
             raise NotePosterError(
-                f"商品名『{link.label}』の行の直後に「{_PRODUCT_LINK_TEXT}」の"
-                f"行が続くブロックが本文editor内に{len(label_match_indices)}件"
-                "見つかりました(期待: 1件)。商品導線を安全にスコープできない"
-                "ため処理を中断します。"
+                f"商品名『{link.label}』と「{_PRODUCT_LINK_TEXT}」の2行だけで"
+                f"構成されるブロックが本文editor内(直接の子)に"
+                f"{len(label_match_indices)}件見つかりました(期待: 1件)。"
+                "商品導線を安全にスコープできないため処理を中断します。"
             )
 
         block = blocks.nth(label_match_indices[0])

@@ -1447,6 +1447,166 @@ def test_find_product_link_block_source_scopes_to_direct_children_only():
     assert match.group(1) == '":scope > p"'
 
 
+# -- ブロック全文の完全一致への厳密化(ARTICLE-001の実機再実行Artifactを ------
+# 踏まえた再修正、2026年8月29日)。direct child(:scope > p)への限定後も、
+# 記事本文ほぼ全体を含む巨大なdirect-child <p>の**途中**に商品導線と同じ
+# [label, "→ 商品を見る"]の隣接2行がたまたま含まれていたため、「ブロック内
+# のどこかに隣接2行が存在すれば候補」という判定では巨大なpも候補になって
+# しまっていた。候補条件を「ブロックのlines全体がちょうど[label, "→ 商品を
+# 見る"]の2行だけで構成されているか」に厳密化した。
+
+
+def test_find_product_link_block_ignores_huge_block_that_merely_contains_the_pair_midway(page):
+    # ARTICLE-001相当のケース: 記事本文ほぼ全体を含む巨大なdirect-child <p>
+    # の途中に[label, CTA]の隣接2行が含まれていても、そのブロック全体は
+    # [label, CTA]の2行だけでは構成されていないため候補にせず、商品導線
+    # 専用の別ブロックだけを一意に特定できることを確認する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>記事本文の書き出しです。<br>"
+        "TOY JAM 瀬戸内レモン<br>"
+        "→ 商品を見る<br>"
+        "締めの文章です。</p>"
+        "<p>この記事に出てきた商品</p>"
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    block = poster._find_product_link_block(
+        page,
+        body_locator,
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    )
+
+    assert block.inner_text().strip() == "TOY JAM 瀬戸内レモン\n→ 商品を見る"
+
+
+def test_find_product_link_block_raises_when_only_the_huge_block_contains_the_pair(page):
+    # 巨大なdirect-child <p>の途中にしか[label, CTA]が存在せず、商品導線
+    # 専用のブロックが存在しない場合は、候補0件として安全停止することを
+    # 確認する(巨大なpを誤って候補にしない=巨大pを商品導線として採用
+    # しないことの確認)。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>記事本文の書き出しです。<br>"
+        "TOY JAM 瀬戸内レモン<br>"
+        "→ 商品を見る<br>"
+        "締めの文章です。</p>"
+        "<p>この記事に出てきた商品</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    with pytest.raises(NotePosterError):
+        poster._find_product_link_block(
+            page,
+            body_locator,
+            ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a"),
+        )
+
+
+def test_find_product_link_block_tolerates_blank_lines_around_the_dedicated_block(page):
+    # 商品導線専用ブロックの前後に空行(<br><br>による空行)があっても、
+    # if line.strip()による空行除外を通じて正常に1件として判定できる
+    # ことを確認する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p><br>TOY JAM 瀬戸内レモン<br>→ 商品を見る<br></p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    block = poster._find_product_link_block(
+        page,
+        body_locator,
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    )
+
+    assert block.inner_text().strip() == "TOY JAM 瀬戸内レモン\n→ 商品を見る"
+
+
+def test_find_product_link_block_resolves_article001_full_structure_with_huge_block_and_two_products(
+    page,
+):
+    # ARTICLE-001相当の完全な構造の回帰テスト: 巨大なdirect-child <p>内に
+    # 記事本文があり、その途中に瀬戸内レモン・月桂樹の両方の[label, CTA]が
+    # 含まれている。さらに別途、両商品それぞれの専用direct-child <p>が
+    # 存在する。このとき、瀬戸内レモン・月桂樹それぞれについて、専用の
+    # ブロックだけを1件ずつ正しく特定できることを確認する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>記事本文の書き出しです。<br>"
+        "今日はジャムの話をします。<br>"
+        "TOY JAM 瀬戸内レモン<br>"
+        "→ 商品を見る<br>"
+        "続きの文章です。<br>"
+        "TOY JAM 瀬戸内レモン月桂樹<br>"
+        "→ 商品を見る<br>"
+        "締めの文章です。</p>"
+        "<p>この記事に出てきた商品</p>"
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"
+        "<p>TOY JAM 瀬戸内レモン月桂樹<br>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    block_short = poster._find_product_link_block(
+        page,
+        body_locator,
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    )
+    block_long = poster._find_product_link_block(
+        page,
+        body_locator,
+        ProductLink(
+            label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"
+        ),
+    )
+
+    assert block_short.inner_text().strip() == "TOY JAM 瀬戸内レモン\n→ 商品を見る"
+    assert block_long.inner_text().strip() == "TOY JAM 瀬戸内レモン月桂樹\n→ 商品を見る"
+    assert poster._same_element(page, block_short, block_long) is False
+
+
+def test_assert_links_match_resolves_article001_full_structure_end_to_end(page):
+    # 上記のARTICLE-001相当の完全な構造で、_assert_links_match()による
+    # end-to-endの検証(href・アンカーテキストの照合)も正しく行えることを
+    # 確認する。
+    links = [
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+        ProductLink(
+            label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"
+        ),
+    ]
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>記事本文の書き出しです。<br>"
+        "今日はジャムの話をします。<br>"
+        "TOY JAM 瀬戸内レモン<br>"
+        "→ 商品を見る<br>"
+        "続きの文章です。<br>"
+        "TOY JAM 瀬戸内レモン月桂樹<br>"
+        "→ 商品を見る<br>"
+        "締めの文章です。</p>"
+        "<p>この記事に出てきた商品</p>"
+        '<p>TOY JAM 瀬戸内レモン<br><a href="https://you-ichi.jp/?pid=192116331">'
+        "→ 商品を見る</a></p>"
+        '<p>TOY JAM 瀬戸内レモン月桂樹<br><a href="https://you-ichi.jp/?pid=191552342">'
+        "→ 商品を見る</a></p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    poster._assert_links_match(page, body_locator, links, stage="保存前")  # 例外が出なければOK
+
+
 def test_find_product_link_block_matches_exact_label_with_surrounding_whitespace(page):
     # ブロック側のテキストに前後の空白が含まれていても(strip()で吸収)、
     # 完全一致判定できることを確認する。
@@ -1519,24 +1679,27 @@ def test_assert_links_match_detects_swapped_hrefs_with_article001_style_prefix_l
         poster._assert_links_match(page, body_locator, links, stage="保存前")
 
 
-def test_find_product_link_block_source_uses_adjacent_line_equality_not_substring():
-    """商品名の一致判定が、部分一致・前方一致ではなく、商品名の行の直後に
-    「→ 商品を見る」の行が続くという隣接2行の完全一致であることを
-    ソースから確認する回帰テスト(2026年8月29日、ARTICLE-001の実機実行を
-    踏まえた隣接2行判定への修正)。
+def test_find_product_link_block_source_uses_whole_block_exact_match_not_substring():
+    """商品名の候補判定が、「ブロック内のどこかに隣接2行が存在するか」
+    ではなく、「ブロック全体(正規化済みlines)が[label, CTA]の2行だけで
+    構成されているか」という全文完全一致であることをソースから確認する
+    回帰テスト(2026年8月29日、ARTICLE-001の実機再実行Artifactを踏まえた
+    再修正)。docstringの説明文中にも同種の字面が登場するため、docstring
+    を文字列置換で除去するのではなく、実際の候補判定行を正規表現で
+    直接取り出して判定する。
     """
     import inspect
+    import re
 
     source = inspect.getsource(NotePoster._find_product_link_block)
-    code_only = source.replace(NotePoster._find_product_link_block.__doc__ or "", "")
-    assert "lines[j] == link.label" in code_only
-    assert "lines[j + 1] == _PRODUCT_LINK_TEXT" in code_only
-    # `.startswith(` や `label in text` (行に分解する前の生文字列に対する
-    # 部分一致)のような、部分一致・前方一致に相当するコードが無いことを
-    # 確認する。`.nth(i)`によるブロックの列挙・一意性確認後の再取得は
-    # (audit済みの通り)既存のまま許容する。
-    assert ".startswith(" not in code_only
-    assert "label in text" not in code_only
+    match = re.search(r"if (lines == expected_lines):", source)
+    assert match is not None, "候補判定が `lines == expected_lines` になっていません"
+
+    # 「ブロック内のどこかに隣接2行が存在すれば候補」という判定
+    # (`any(...)`によるループ探索)には戻していないことを確認する。
+    assert "for j in range(len(lines) - 1)" not in source
+    assert ".startswith(" not in source
+    assert "label in text" not in source
 
 
 # -- _select_product_link_text_in_block(ブロック内の対象テキストだけを選択) --
