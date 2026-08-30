@@ -1558,22 +1558,34 @@ class NotePoster:
         商品名の先頭部分と一致する場合(例:「TOY JAM 瀬戸内レモン」と
         「TOY JAM 瀬戸内レモン月桂樹」)、実機のGitHub Actions実行
         (ARTICLE-001)で商品名を含むブロックが2件見つかったと誤判定され、
-        `needs_review`へ安全停止する事象が発生した。商品名の一致判定は
-        `text.splitlines()`で行単位に分解した各行との**完全一致**
-        (`link.label == line`)であり、`in`演算子による判定も部分一致・
-        前方一致ではなく「行のリストの中にlabelと完全に等しい要素がある
-        か」という厳密な一致であることを、改めて明示的にテストで固定した
-        (空行はここで`if line.strip()`により除外してから比較する)。
+        `needs_review`へ安全停止する事象が発生した。
 
-          - 一致させない: label=`TOY JAM 瀬戸内レモン`、
-            block=`TOY JAM 瀬戸内レモン月桂樹\\n→ 商品を見る`
-            (1行目が`TOY JAM 瀬戸内レモン月桂樹`であり、labelとは完全に
-            等しくないため)
-          - 一致させる: block=`TOY JAM 瀬戸内レモン\\n→ 商品を見る`
-            (1行目がlabelと完全に等しいため)
+        ★商品名と「→ 商品を見る」の隣接2行判定(2026年8月29日、同じ
+        ARTICLE-001の実機実行を踏まえた再修正)★
+        単に「labelと完全一致する行がブロック内に存在するか」だけを候補
+        条件にすると、本文中のふつうの文章(商品導線とは無関係な段落)に
+        たまたま商品名だけの行が出現した場合にも誤って候補に含めて
+        しまう(そしてその後、本来の商品導線ブロックと合わせて「2件」の
+        あいまいな一致として安全停止してしまう)おそれがある。そこで
+        候補条件を、`text.splitlines()`で行単位に分解し空行を除いた
+        `lines`に対して、
 
-        商品名の前後の空白は`strip()`で吸収するが、部分一致・前方一致・
-        曖昧一致には一切戻さない。
+          `lines[i] == link.label` かつ `lines[i + 1] == _PRODUCT_LINK_TEXT`
+
+        となる**隣接する2行のペア**が存在するブロックだけ、に厳密化した。
+        商品名の行だけがある場合(直後に「→ 商品を見る」が続かない)は
+        候補にしない。部分一致・前方一致は一切行わない(前後の空白のみ
+        `strip()`で吸収する)。候補が0件または2件以上であれば、これまで
+        通り推測せず`needs_review`へ安全停止する。一意に特定できた場合も
+        念のため、そのブロック全体の行構成がちょうど`[label,
+        _PRODUCT_LINK_TEXT]`の2行であることを改めて確認する(隣接ペアが
+        存在するだけでなく、ブロックにそれ以外の行が混在していないことも
+        保証するため)。
+
+        次回の実機実行でも1回で原因を切り分けられるよう、候補ブロックが
+        1件以上見つかった場合(一意に特定できた場合・複数件で安全停止する
+        場合の両方を含む)、そのブロックのindexと正規化済み`lines`を
+        `logger.info()`で記録する(本文全体ではなく候補ブロックのみ)。
         """
         blocks = body_locator.locator("p")
         try:
@@ -1582,6 +1594,7 @@ class NotePoster:
             total = 0
 
         label_match_indices: list[int] = []
+        label_match_lines: list[list[str]] = []
         for i in range(total):
             block = blocks.nth(i)
             try:
@@ -1589,15 +1602,31 @@ class NotePoster:
             except PlaywrightTimeoutError:
                 continue
             lines = [line.strip() for line in text.splitlines() if line.strip()]
-            if link.label in lines:
+            has_adjacent_pair = any(
+                lines[j] == link.label and lines[j + 1] == _PRODUCT_LINK_TEXT
+                for j in range(len(lines) - 1)
+            )
+            if has_adjacent_pair:
                 label_match_indices.append(i)
+                label_match_lines.append(lines)
+
+        if label_match_indices:
+            logger.info(
+                "商品導線ブロック候補: label=%r 候補=%s",
+                link.label,
+                [
+                    {"block_index": idx, "lines": lns}
+                    for idx, lns in zip(label_match_indices, label_match_lines)
+                ],
+            )
 
         if len(label_match_indices) != 1:
             self._capture_failure(page, "商品導線ブロック特定")
             raise NotePosterError(
-                f"商品名『{link.label}』を含むブロックが本文editor内に"
-                f"{len(label_match_indices)}件見つかりました(期待: 1件)。"
-                "商品導線を安全にスコープできないため処理を中断します。"
+                f"商品名『{link.label}』の行の直後に「{_PRODUCT_LINK_TEXT}」の"
+                f"行が続くブロックが本文editor内に{len(label_match_indices)}件"
+                "見つかりました(期待: 1件)。商品導線を安全にスコープできない"
+                "ため処理を中断します。"
             )
 
         block = blocks.nth(label_match_indices[0])

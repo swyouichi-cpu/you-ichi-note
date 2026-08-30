@@ -1061,13 +1061,36 @@ def test_find_product_link_block_finds_the_correct_block_for_each_label(page):
     assert poster._same_element(page, block_a, block_b) is False
 
 
-def test_find_product_link_block_raises_when_label_appears_in_multiple_blocks(page):
-    # 商品名が本文中に偶然複数回出現する場合、どのブロックが商品導線かを
-    # 安全に一意特定できないため中断する。
+def test_find_product_link_block_ignores_label_only_occurrence_elsewhere_in_body(page):
+    # 商品名だけの行が商品導線と無関係な場所(通常の本文)にたまたま出現
+    # しても、直後に「→ 商品を見る」が続かないため候補にはせず、本来の
+    # 商品導線ブロックだけを一意に特定できることを確認する(2026年8月29日、
+    # ARTICLE-001の実機実行を踏まえた隣接2行判定への修正)。
     page.set_content(
         '<div class="editor" contenteditable="true">'
         "<p>商品A</p>"
         "<p>この記事に出てきた商品</p>"
+        "<p>商品A<br>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    block = poster._find_product_link_block(
+        page, body_locator, ProductLink(label="商品A", url="https://example.com/a")
+    )
+
+    assert block.inner_text().strip() == "商品A\n→ 商品を見る"
+
+
+def test_find_product_link_block_raises_when_adjacent_pair_appears_in_multiple_blocks(page):
+    # 商品名の直後に「→ 商品を見る」が続く、構造上有効な商品導線ブロックが
+    # 同じ商品名で複数件あった場合(本物の曖昧さ)は、これまで通り推測せず
+    # 中断する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>商品A<br>→ 商品を見る</p>"
         "<p>商品A<br>→ 商品を見る</p>"
         "</div>"
     )
@@ -1212,6 +1235,108 @@ def test_find_product_link_block_resolves_each_label_to_its_own_block_when_one_i
     assert poster._same_element(page, block_short, block_long) is False
 
 
+def test_find_product_link_block_ignores_label_mentioned_in_ordinary_prose_article001(page):
+    # ARTICLE-001相当のケース(2026年8月29日、隣接2行判定への修正):
+    # 本文中のふつうの文章側に商品名だけの行がたまたま出現しても、
+    # 直後に「→ 商品を見る」が続かないため商品導線ブロックとしては拾わず、
+    # 本来の商品導線ブロック(商品名の直後に「→ 商品を見る」が続く)だけを
+    # 商品ごとに正しく一意特定できることを確認する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>今、その感覚につながっているマーマレードが2つある。</p>"
+        "<p>TOY JAM 瀬戸内レモン</p>"
+        "<p>について考えている。</p>"
+        "<p>この記事に出てきたジャム</p>"
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"
+        "<p>TOY JAM 瀬戸内レモン月桂樹<br>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    block_short = poster._find_product_link_block(
+        page,
+        body_locator,
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    )
+    block_long = poster._find_product_link_block(
+        page,
+        body_locator,
+        ProductLink(
+            label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"
+        ),
+    )
+
+    assert block_short.inner_text().strip() == "TOY JAM 瀬戸内レモン\n→ 商品を見る"
+    assert block_long.inner_text().strip() == "TOY JAM 瀬戸内レモン月桂樹\n→ 商品を見る"
+    assert poster._same_element(page, block_short, block_long) is False
+
+
+def test_find_product_link_block_logs_candidate_index_and_lines_on_success(page, caplog):
+    # 一意に特定できた場合も、候補ブロックのindexと正規化済みlinesを
+    # 診断ログへ記録することを確認する(次回の実機実行で失敗しても1回で
+    # 原因を切り分けられるようにするため)。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    with caplog.at_level("INFO"):
+        poster._find_product_link_block(
+            page,
+            body_locator,
+            ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+        )
+
+    assert "商品導線ブロック候補" in caplog.text
+    assert "'block_index': 1" in caplog.text
+    assert "'lines': ['TOY JAM 瀬戸内レモン', '→ 商品を見る']" in caplog.text
+
+
+def test_find_product_link_block_logs_all_candidates_when_ambiguous(page, caplog):
+    # 候補が複数件で安全停止する場合も、それぞれの候補のindexとlinesが
+    # 診断ログに記録されることを確認する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        "<p>この記事に出てきた商品</p>"
+        "<p>商品A<br>→ 商品を見る</p>"
+        "<p>商品A<br>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    with caplog.at_level("INFO"):
+        with pytest.raises(NotePosterError):
+            poster._find_product_link_block(
+                page, body_locator, ProductLink(label="商品A", url="https://example.com/a")
+            )
+
+    assert "'block_index': 1" in caplog.text
+    assert "'block_index': 2" in caplog.text
+
+
+def test_find_product_link_block_does_not_log_when_no_candidate_found(page, caplog):
+    # 候補が0件の場合は「候補ブロック」について記録すべき情報が無いため、
+    # 候補ログ自体は出力されないことを確認する(0件であることは通常の
+    # NotePosterErrorのメッセージで報告される)。
+    page.set_content('<div class="editor" contenteditable="true"></div>')
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    with caplog.at_level("INFO"):
+        with pytest.raises(NotePosterError):
+            poster._find_product_link_block(
+                page, body_locator, ProductLink(label="商品A", url="https://example.com/a")
+            )
+
+    assert "商品導線ブロック候補" not in caplog.text
+
+
 def test_find_product_link_block_matches_exact_label_with_surrounding_whitespace(page):
     # ブロック側のテキストに前後の空白が含まれていても(strip()で吸収)、
     # 完全一致判定できることを確認する。
@@ -1284,19 +1409,22 @@ def test_assert_links_match_detects_swapped_hrefs_with_article001_style_prefix_l
         poster._assert_links_match(page, body_locator, links, stage="保存前")
 
 
-def test_find_product_link_block_source_uses_exact_line_equality_not_substring():
-    """商品名の一致判定が、部分一致・前方一致ではなく行単位の完全一致
-    (`in` によるリストの要素との等価判定)であることをソースから確認する
-    回帰テスト(2026年8月29日、ARTICLE-001の修正)。
+def test_find_product_link_block_source_uses_adjacent_line_equality_not_substring():
+    """商品名の一致判定が、部分一致・前方一致ではなく、商品名の行の直後に
+    「→ 商品を見る」の行が続くという隣接2行の完全一致であることを
+    ソースから確認する回帰テスト(2026年8月29日、ARTICLE-001の実機実行を
+    踏まえた隣接2行判定への修正)。
     """
     import inspect
 
     source = inspect.getsource(NotePoster._find_product_link_block)
     code_only = source.replace(NotePoster._find_product_link_block.__doc__ or "", "")
-    assert "link.label in lines" in code_only
+    assert "lines[j] == link.label" in code_only
+    assert "lines[j + 1] == _PRODUCT_LINK_TEXT" in code_only
     # `.startswith(` や `label in text` (行に分解する前の生文字列に対する
     # 部分一致)のような、部分一致・前方一致に相当するコードが無いことを
-    # 確認する。
+    # 確認する。`.nth(i)`によるブロックの列挙・一意性確認後の再取得は
+    # (audit済みの通り)既存のまま許容する。
     assert ".startswith(" not in code_only
     assert "label in text" not in code_only
 
