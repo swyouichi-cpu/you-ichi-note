@@ -788,6 +788,29 @@ sequentially()`自体や「適用」ボタン以降の処理は変更せず、UR
   確認から「適用」ボタンのクリックまで、1回の呼び出しの中でこれまで
   通り自動的に到達する(このパスは今回変更していない)。
 
+**URL入力を`fill()`による完全置換へ変更(2026年8月29日、ARTICLE-001の
+2商品連続設定での実機実行を踏まえた修正)**: 上記の`press_sequentially()`
+を実機で2商品連続処理したところ、2商品目のURL入力欄のread-backが
+「(1商品目のURL)(2商品目のURL)」という連結された値になっており、
+`NotePosterError`(read-back不一致)で`needs_review`へ安全停止した。
+原因はURL入力欄が1商品目クリック後もクリアされておらず(noteのSPA側が
+URL入力欄のstateを商品間で再利用しているためと考えられる)、
+`press_sequentially()`(現在のカーソル位置に1文字ずつ追加するだけで、
+既存値を選択・削除しない)が「既存値への追記」になっていたことだった。
+これを受けて`url_input.click()` + `url_input.press_sequentially(link.url,
+delay=10)`を`url_input.fill(link.url)`に置き換えた。`fill()`は要素へ
+フォーカスしたうえで値を完全に置換してから`input`イベントを発生させる
+Playwrightの標準APIであり、既存値への追記にはならない。本文editor
+(ProseMirrorが管理する`contenteditable`)の入力に`press_sequentially()`
+を使っている理由(前述の「★本文入力の内部状態反映について★」)とは
+異なり、URL入力欄はふつうの`<textarea>`であり、rich textエディタが
+内部状態を再構築する必要はないため、`fill()`による一括の値設定で問題
+ないと判断した。実機と同じ属性の`<textarea>`を使ったローカルテストで
+`fill()`が既存値を正しく完全置換すること、および2商品を連続処理しても
+それぞれ正しいURLが設定される(連結されない)ことを確認済みである。
+URL入力後の`input_value()`によるread-back検証(一致しなければ安全停止)
+は変更していない。
+
 **検証方法(本文テキストとリンクの分離)**: `_assert_body_matches()`は
 引き続き「見えているテキスト」だけを検証します(商品リンク導入後も本文に
 生URLは一切含まれないため、この検証で商品カード化が起きていないことも
@@ -866,7 +889,7 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
     した`get_by_role("button", name="適用", exact=True)`で一意に特定する
     (`_find_url_apply_button()`)。動的に生成されるid(Reactの`useId`等
     由来と見られる`:r16:`のような値)はセレクタに使わない
-19. 商品リンクのURL入力後、`press_sequentially()`完了直後に同じセレクタ
+19. 商品リンクのURL入力後、`fill()`完了直後に同じセレクタ
     で`count()`を再確認する。1件でなければ(URL入力欄が消失・増減した
     可能性があるため)read-backを続行せず、`UrlInputDisappeared
     ObservationStop`で安全停止し、HTML/スクリーンショット/診断データを
@@ -896,6 +919,14 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
     確認は追加のみであり、リンクボタン自体の従来のviewport確認
     (`_ensure_link_button_in_viewport()`)は変更せず維持する(二重の
     安全確認)
+22. 商品リンクのURL入力欄への値の設定は、`press_sequentially()`(現在の
+    カーソル位置に1文字ずつ追加するだけで、既存値を選択・削除しない)では
+    なく`fill()`(要素へフォーカスしたうえで値を完全に置換してから
+    `input`イベントを発生させる)を使う。これにより、noteのSPA側がURL
+    入力欄のstateを商品間で再利用し前の商品のURLが残っていた場合でも、
+    追記・連結(例:`(URL1)(URL2)`のような値)にはならない。JavaScriptで
+    `element.value`を直接書き換える手段は使わない。`fill()`後も
+    `input_value()`によるread-back検証(一致しなければ安全停止)は維持する
 
 ## 12. Phase 1 実機検証記録
 
@@ -919,6 +950,7 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
 | `ARTICLE-001`(全文完全一致への厳密化) | direct child限定後の実機再実行Artifactの直接解析(ユーザーによる) | 真因は巨大なdirect-child `<p>`の途中にも同じ2行が含まれ候補になっていたこと。候補条件をブロック全文の完全一致へ厳密化。対応不要 |
 | `ARTICLE-001`(commit c6c3526での再実行) | 商品導線ブロック特定を突破した後の実機再実行 | 商品導線ブロックの誤判定は解消。次段階の`LinkButtonOutOfViewportError`で`needs_review`。原因は`position: fixed`要素にscroll_into_view_if_needed()が効かないこと。診断強化を追加。対応不要 |
 | `ARTICLE-001`(pre-selection scrollへの設計変更) | 診断強化(commit 7c8d810)を踏まえた原因確定・修正 | 「浮動ツールバーを後から直す」のではなく「テキスト選択前に商品導線ブロック自体をviewport内へscroll」する設計に変更。`LinkButtonOutOfViewportError`の実際の解消を狙う修正。対応不要(実機再実行は未実施) |
+| `ARTICLE-001`(commit a1ab821での再実行) | pre-selection scroll導入後の実機再実行 | ProductLinkBlock/LinkButtonOutOfViewportの問題は突破。2商品目のURL入力欄read-backが1商品目URLとの連結値になり`needs_review`。`press_sequentially()`の追記方式が原因と判明し`fill()`へ変更。対応不要(実機再実行は未実施) |
 
 `TEST-003`(2026年8月28日)での確認事項:
 GitHub Actions=Success / Sheets status=`draft_created` / note_url正常記録 /
@@ -1197,6 +1229,27 @@ ARTICLE-001相当の構造(商品導線ブロックが文書のかなり下に�
 ローカルで再現したテストで、pre-selection scrollにより選択・ツールバー
 出現・リンクボタンのクリック・URL入力・「適用」・`<a>`要素の反映まで
 viewport内で完了できることを確認した。この変更もローカルpytestでの
+確認のみで、まだ実際のGitHub Actions実行(`ARTICLE-001`の再実行)では
+検証していない。
+
+`ARTICLE-001`(commit a1ab821での再実行)で判明した事項: 上記の
+pre-selection scrollを実機で再実行したところ、`ProductLinkBlock
+OutOfViewportError`・`LinkButtonOutOfViewportError`はいずれも再発せず、
+2商品目のURL入力・read-back検証まで処理が進んだ。しかし2商品目のURL
+入力欄のread-backが「(1商品目のURL)(2商品目のURL)」という連結された
+値になっており、`NotePosterError`(read-back不一致)で`needs_review`へ
+安全停止した(read-back検証が不一致を正しく検出できたこと自体は意図
+通りの挙動)。原因はURL入力欄が1商品目クリック後もクリアされておらず
+(noteのSPA側がURL入力欄のstateを商品間で再利用しているためと考え
+られる)、`press_sequentially()`(現在のカーソル位置に1文字ずつ追加
+するだけで、既存値を選択・削除しない)による入力が「既存値への追記」に
+なっていたことだった。これを受けてURL入力欄への値の設定を`fill()`
+(要素へフォーカスしたうえで値を完全に置換する)へ変更した(詳細は
+「10. 商品リンク」)。商品導線ブロック特定・pre-selection scroll・
+リンクボタンのviewport確認・floating toolbar/link button特定・
+`_assert_links_match()`・公開安全性ロジックは今回変更していない。
+2商品を連続処理し、それぞれ正しい(取り違えず、連結もされない)hrefが
+設定されることをローカルテストで確認した。この変更もローカルpytestでの
 確認のみで、まだ実際のGitHub Actions実行(`ARTICLE-001`の再実行)では
 検証していない。
 

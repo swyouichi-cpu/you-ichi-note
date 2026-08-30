@@ -2595,6 +2595,43 @@ class NotePoster:
         いない(二重の安全確認になる)。商品導線ブロック特定ロジック
         (`_find_product_link_block()`)・URL入力/「適用」/href read-back
         ロジックも今回は変更していない。
+
+        ★URL入力を`press_sequentially()`から`fill()`へ変更・第8段階
+        (2026年8月29日時点、ARTICLE-001の2商品連続設定での実機実行を
+        踏まえた修正)★
+        上記の第7段階をARTICLE-001(2商品)で実機実行したところ、1商品目
+        のURL入力・「適用」・`<a>`生成までは成功したが、2商品目のURL
+        入力欄のread-backが`https://you-ichi.jp/?pid=192116331https://
+        you-ichi.jp/?pid=191552342`(1商品目のURL + 2商品目のURL)という
+        連結された値になっており、`NotePosterError`(read-back不一致)で
+        `needs_review`へ安全停止した。これはread-back検証が実際に不一致を
+        正しく検出できたという意味では正しい挙動だが、原因はURL入力欄が
+        1商品目クリック後もクリアされておらず(noteのSPA側がURL入力欄の
+        stateを商品間で再利用しているためと考えられる)、`url_input.click()`
+        + `url_input.press_sequentially(link.url, delay=10)`という従来の
+        入力方法が「既存値への追記」になっていたことだった。
+        `press_sequentially()`は指定した文字列を現在のカーソル位置に
+        1文字ずつ打鍵イベントとして追加するだけであり、既存の入力内容を
+        選択・削除してから入力するわけではない。
+
+        これを受けて、`url_input.click()` + `url_input.press_sequentially(
+        link.url, delay=10)`を`url_input.fill(link.url)`に置き換えた。
+        `fill()`は要素へフォーカスしたうえで値を**完全に置換**してから
+        `input`イベントを発生させるPlaywrightの標準APIであり、既存値への
+        追記にはならない。本文editor(ProseMirrorが管理する`content
+        editable`)の入力に`press_sequentially()`(1文字ずつの実キー入力
+        に近いイベント)を使っている理由(★本文入力の内部状態反映に
+        ついて★のdocstringを参照)とは異なり、URL入力欄はふつうの
+        `<textarea>`であり、rich textエディタが内部状態を再構築する
+        必要はないため、`fill()`による一括の値設定で問題ないと判断した。
+        `fill()`が実際に正しく動作する(値が完全に置換され、read-backが
+        期待通りになる)ことは、実機と同じセレクタ・属性を持つ`<textarea>`
+        を再現したローカルテストで確認済みである。URL入力後の
+        `input_value()`によるread-back検証(一致しなければ安全停止)は
+        変更していない。`fill()`後もPlaywrightのactionability check(要素
+        が表示・有効であること等)は通常通り適用されるため、`force=True`
+        やJavaScriptによる直接の値書き換え(`element.value = ...`)は
+        使っていない。Enter/Tabキー送信も引き続き行わない。
         """
         self._ensure_product_link_block_in_viewport(page, block, link)
         self._select_product_link_text_in_block(page, block)
@@ -2627,12 +2664,14 @@ class NotePoster:
         url_input = self._find_url_input_textarea(page)
         self._log_url_input_diagnostics(page, url_input, stage="A_URL入力直前")
 
-        url_input.click()
-        self._log_url_input_diagnostics(page, url_input, stage="B_click直後")
-
-        self._log_url_input_diagnostics(page, url_input, stage="C_press_sequentially開始直前")
-        url_input.press_sequentially(link.url, delay=10)
-        self._log_url_input_diagnostics(page, url_input, stage="D_press_sequentially完了直後")
+        # fill()は要素へフォーカスしたうえで値を「完全に置換」してから
+        # inputイベントを発生させる(既存値の末尾に追記されることがない)。
+        # URL入力欄は(本文editorのようなProseMirror管理下のcontenteditable
+        # ではなく)ふつうの<textarea>であるため、fill()による置換で
+        # note側の内部状態(Reactの制御コンポーネント)にも正しく反映される
+        # ことをローカルのDOM再現テストで確認している。
+        url_input.fill(link.url)
+        self._log_url_input_diagnostics(page, url_input, stage="D_fill完了直後")
 
         try:
             post_type_count = url_input.count()

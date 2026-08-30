@@ -968,9 +968,11 @@ def test_apply_product_links_clicks_toolbar_button_and_inputs_url_then_applies_l
         page.locator("#desktop-toolbar").get_by_role("button", name="適用", exact=True).count()
         == 0
     )
-    # Enter/Tabを送信していないことを確認する(press_sequentially由来の
-    # 文字キー以外が送られていないこと)。
+    # Enter/Tabを送信していないことを確認する(fill()はキーイベントを
+    # 発生させないため、keydownを記録するwindow.__urlInputKeysは空のまま
+    # のはずである)。
     sent_keys = page.evaluate("() => window.__urlInputKeys")
+    assert sent_keys == []
     assert "Enter" not in sent_keys
     assert "Tab" not in sent_keys
 
@@ -992,9 +994,7 @@ def test_apply_product_links_logs_url_input_stage_diagnostics_through_healthy_fl
 
     for stage in (
         "A_URL入力直前",
-        "B_click直後",
-        "C_press_sequentially開始直前",
-        "D_press_sequentially完了直後",
+        "D_fill完了直後",
         "E_read-back直前",
         "G_read-back成功後",
     ):
@@ -2338,9 +2338,10 @@ def test_apply_product_links_succeeds_for_long_article001_style_page_with_block_
     # (安全停止せず完了した)ことの確認。
     link_button = page.locator('#desktop-toolbar button[aria-label="リンク"]')
     assert link_button.get_attribute("data-clicked") == "true"
+    # fill()はキーイベントを発生させないため、keydownを記録する
+    # window.__urlInputKeysは空のままのはずである。
     sent_keys = page.evaluate("() => window.__urlInputKeys")
-    assert "Enter" not in sent_keys
-    assert "Tab" not in sent_keys
+    assert sent_keys == []
 
 
 # -- _bounding_box_within_viewport(viewport境界判定の純粋関数) -------------
@@ -3107,9 +3108,7 @@ def test_set_link_on_text_occurrence_logs_stage_f_only_when_url_input_disappears
 
     for stage in (
         "A_URL入力直前",
-        "B_click直後",
-        "C_press_sequentially開始直前",
-        "D_press_sequentially完了直後",
+        "D_fill完了直後",
         "F_textarea消失検知",
     ):
         assert f"診断[{stage}]" in caplog.text
@@ -3177,13 +3176,214 @@ def test_log_url_input_diagnostics_does_not_steal_focus(page):
     assert page.evaluate("() => document.activeElement.id") == "already-focused"
 
 
-def test_set_link_on_text_occurrence_source_press_sequentially_call_is_unchanged():
-    # 今回の診断強化ラウンドで、press_sequentially()自体の呼び出し(引数・
-    # delay)は変更していないことをソースから確認する。
+# -- URL入力欄の値を「追記」ではなく「完全置換」する(ARTICLE-001の2商品 -----
+# 連続設定を踏まえた修正、2026年8月29日)
+#
+# 実機のGitHub Actions実行(ARTICLE-001)で、1商品目のURL入力・「適用」・
+# <a>生成までは成功したが、2商品目のURL入力欄のread-backが
+# 「(1商品目のURL)(2商品目のURL)」という連結された値になっており、
+# NotePosterError(read-back不一致)でneeds_reviewへ安全停止した。原因は
+# URL入力欄が1商品目クリック後もクリアされておらず(noteのSPA側がURL入力欄
+# のstateを商品間で再利用しているためと考えられる)、press_sequentially()
+# (現在のカーソル位置に1文字ずつ追加するだけで、既存値を選択・削除しない)
+# を使っていたことだった。fill()(要素へフォーカスしたうえで値を完全に
+# 置換する)へ変更した。
+
+
+def test_fill_replaces_stale_value_on_realistic_url_input_textarea(page):
+    # fill()が、noteの実DOM(textarea[placeholder="https://"]
+    # [inputmode="text"][name="alt"])と同じ属性を持つ<textarea>に対して、
+    # 既存値を完全に置換する(追記にならない)ことを直接確認する
+    # (推測でfill()へ変更するのではなく、実DOMと同じ属性の要素で動作を
+    # 確認するため)。
+    page.set_content(
+        '<textarea inputmode="text" name="alt" placeholder="https://"></textarea>'
+    )
+    url_input = page.locator(_URL_INPUT_SELECTOR_FOR_TESTS)
+
+    url_input.fill("https://you-ichi.jp/?pid=192116331")
+    assert url_input.input_value() == "https://you-ichi.jp/?pid=192116331"
+
+    url_input.fill("https://you-ichi.jp/?pid=191552342")
+    actual = url_input.input_value()
+
+    assert actual == "https://you-ichi.jp/?pid=191552342"
+    assert actual != (
+        "https://you-ichi.jp/?pid=192116331https://you-ichi.jp/?pid=191552342"
+    )
+
+
+_LINK_TOOLBAR_HTML_WITH_STALE_URL_VALUE = """
+<div class="editor" contenteditable="true">
+  <p>この記事に出てきた商品</p>
+  <p>TOY JAM 瀬戸内レモン月桂樹<br>→ 商品を見る</p>
+</div>
+<div data-active="true" role="toolbar" id="desktop-toolbar">
+  <button aria-label="リンク">リンク</button>
+</div>
+<script>
+  document.querySelector('#desktop-toolbar button[aria-label="リンク"]')
+    .addEventListener('click', () => {
+      const toolbar = document.getElementById('desktop-toolbar');
+      const textarea = document.createElement('textarea');
+      textarea.setAttribute('inputmode', 'text');
+      textarea.setAttribute('name', 'alt');
+      textarea.setAttribute('placeholder', 'https://');
+      // 実機で観測された「1商品目クリック後もURL入力欄に前の商品のURLが
+      // 残ったまま」という状態をローカルで再現する。
+      textarea.value = 'https://you-ichi.jp/?pid=192116331';
+      const applyButton = document.createElement('button');
+      const applySpan = document.createElement('span');
+      applySpan.textContent = '適用';
+      applyButton.appendChild(applySpan);
+      applyButton.addEventListener('click', (ev) => {
+        ev.target.closest('button').setAttribute('data-clicked', 'true');
+        const url = textarea.value;
+        const targetP = Array.from(
+          document.querySelectorAll('.editor p')
+        ).find((el) => el.textContent.includes('瀬戸内レモン月桂樹'));
+        const textNode = targetP && Array.from(targetP.childNodes).find(
+          (node) => node.nodeType === Node.TEXT_NODE
+            && node.textContent.trim() === '→ 商品を見る'
+        );
+        if (textNode) {
+          const a = document.createElement('a');
+          a.setAttribute('href', url);
+          a.textContent = '→ 商品を見る';
+          textNode.replaceWith(a);
+        }
+        textarea.remove();
+        applyButton.remove();
+      });
+      toolbar.appendChild(textarea);
+      toolbar.appendChild(applyButton);
+    });
+</script>
+"""
+
+
+def test_set_link_on_text_occurrence_replaces_stale_leftover_url_value(page):
+    # ARTICLE-001相当のケース: URL入力欄に前の商品のURLが残った状態から
+    # 始まっても、fill()による完全置換によって、read-backおよび最終的な
+    # hrefが今回の商品のURLと完全一致し、連結された値にならないことを
+    # 確認する。
+    page.set_content(_LINK_TOOLBAR_HTML_WITH_STALE_URL_VALUE)
+    poster = _bare_poster()
+    block = page.locator(".editor p").nth(1)
+    link = ProductLink(
+        label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"
+    )
+
+    poster._set_link_on_text_occurrence(page, block, link)  # 例外が出なければOK
+
+    anchor = page.locator(".editor a")
+    assert anchor.count() == 1
+    assert anchor.get_attribute("href") == link.url
+    assert anchor.get_attribute("href") != (
+        "https://you-ichi.jp/?pid=192116331" + link.url
+    )
+
+
+_LINK_TOOLBAR_HTML_REUSED_STATE_TWO_PRODUCTS = """
+<div class="editor" contenteditable="true">
+  <p>この記事に出てきた商品</p>
+  <p data-product-id="1">TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>
+  <p data-product-id="2">TOY JAM 瀬戸内レモン月桂樹<br>→ 商品を見る</p>
+</div>
+<div data-active="true" role="toolbar" id="desktop-toolbar">
+  <button aria-label="リンク">リンク</button>
+</div>
+<script>
+  const toolbar = document.getElementById('desktop-toolbar');
+  toolbar.querySelector('button[aria-label="リンク"]').addEventListener('click', () => {
+    const sel = window.getSelection();
+    const range = sel.getRangeAt(0);
+    const targetP = range.startContainer.parentElement.closest('p');
+
+    // 実機と同様に、URL入力欄・「適用」ボタンのDOM要素そのものを商品間で
+    // 使い回す(既存要素があれば再利用する)。textareaの値は明示的に
+    // クリアしない(「前の商品のURLが残ったまま」を再現するため)。
+    let textarea = toolbar.querySelector('textarea');
+    if (!textarea) {
+      textarea = document.createElement('textarea');
+      textarea.setAttribute('inputmode', 'text');
+      textarea.setAttribute('name', 'alt');
+      textarea.setAttribute('placeholder', 'https://');
+      toolbar.appendChild(textarea);
+    }
+    textarea.dataset.targetProductId = targetP.dataset.productId;
+
+    let applyButton = toolbar.querySelector('button[data-role="apply-btn"]');
+    if (!applyButton) {
+      applyButton = document.createElement('button');
+      applyButton.setAttribute('data-role', 'apply-btn');
+      const span = document.createElement('span');
+      span.textContent = '適用';
+      applyButton.appendChild(span);
+      toolbar.appendChild(applyButton);
+      applyButton.addEventListener('click', () => {
+        const url = textarea.value;
+        const productId = textarea.dataset.targetProductId;
+        const p = document.querySelector('[data-product-id="' + productId + '"]');
+        const textNode = p && Array.from(p.childNodes).find(
+          (node) => node.nodeType === Node.TEXT_NODE
+            && node.textContent.trim() === '→ 商品を見る'
+        );
+        if (textNode) {
+          const a = document.createElement('a');
+          a.setAttribute('href', url);
+          a.textContent = '→ 商品を見る';
+          textNode.replaceWith(a);
+        }
+      });
+    }
+  });
+</script>
+"""
+
+
+def test_apply_product_links_sets_correct_url_for_each_of_two_consecutive_products(page):
+    # ARTICLE-001相当の回帰テスト: URL入力欄・「適用」ボタンのDOM要素が
+    # 商品間で使い回され(実機と同様)、1商品目クリック後もURL入力欄の値が
+    # クリアされない状態でも、2商品を連続処理したときにそれぞれ正しい
+    # (取り違えず、連結もされない)hrefが設定されることを確認する。
+    page.set_content(_LINK_TOOLBAR_HTML_REUSED_STATE_TWO_PRODUCTS)
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+    links = [
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+        ProductLink(
+            label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"
+        ),
+    ]
+
+    poster._apply_product_links(page, body_locator, links)  # 例外が出なければOK
+
+    anchor_1 = page.locator('.editor p[data-product-id="1"] a')
+    anchor_2 = page.locator('.editor p[data-product-id="2"] a')
+    assert anchor_1.count() == 1
+    assert anchor_2.count() == 1
+    assert anchor_1.get_attribute("href") == links[0].url
+    assert anchor_2.get_attribute("href") == links[1].url
+    # 2商品目のhrefが、1商品目URLと2商品目URLの連結値になっていないこと
+    # を明示的に確認する。
+    assert anchor_2.get_attribute("href") != (links[0].url + links[1].url)
+
+
+def test_set_link_on_text_occurrence_source_uses_fill_not_press_sequentially_for_url():
+    # ARTICLE-001の実機実行(2商品連続設定)で、press_sequentially()による
+    # 追記方式が原因でURL入力欄に前の商品のURLが残留・連結する事象が発生
+    # したため、fill()による完全置換へ変更したことをソースから確認する
+    # 回帰テスト(2026年8月29日)。docstringの説明文中にも
+    # press_sequentially()という字面が経緯の説明として登場するため、
+    # docstringを除いた実際のコード行だけを対象にする。
     import inspect
 
     source = inspect.getsource(NotePoster._set_link_on_text_occurrence)
-    assert "url_input.press_sequentially(link.url, delay=10)" in source
+    doc = NotePoster._set_link_on_text_occurrence.__doc__ or ""
+    code_only = source.replace(doc, "")
+    assert "url_input.fill(link.url)" in code_only
+    assert "url_input.press_sequentially(" not in code_only
 
 
 def test_set_link_on_text_occurrence_applies_publish_action_guard_before_click(page):
@@ -3242,9 +3442,10 @@ def test_set_link_on_text_occurrence_source_never_confirms_the_url():
     assert 'press("Enter")' not in code_only
     assert 'press("Tab")' not in code_only
     assert "URLの入力をやめる" not in code_only
-    # クリックしているのはlink_button・url_input・apply_buttonの3箇所だけ
-    # であることを確認する(他の要素をクリックしていないことの確認)。
-    assert code_only.count(".click(") == 3
+    # クリックしているのはlink_button・apply_buttonの2箇所だけであることを
+    # 確認する(他の要素をクリックしていないことの確認)。URL入力欄は
+    # fill()で値を設定するため、明示的なclick()は行っていない。
+    assert code_only.count(".click(") == 2
 
 
 def _product_trailer_html(entries: list[tuple[str, str | None]]) -> str:
