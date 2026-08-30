@@ -1254,11 +1254,46 @@ class NotePoster:
         本文入力欄は、タイトル入力欄と同一のDOM要素を誤って掴んでいない
         ことを確認したうえで使用し(_same_element)、実際に入力に使った
         locatorから読み戻した内容が期待した本文と一致することを確認する
-        (_assert_body_matches)。商品リンクの設定内容も、本文editor内の
-        <a>要素を個別に検証する(_assert_links_match)。この2つの検証は
-        「下書き保存」を押す前と押した後の両方で行う。いずれかに失敗した
-        場合は下書き保存を行わない、または最終的な成功とはみなさずに
-        NotePosterErrorを送出する。
+        (_assert_body_matches)。この検証は「下書き保存」を押す前と押した
+        後の両方で行う。失敗した場合は下書き保存を行わない、または最終的な
+        成功とはみなさずにNotePosterErrorを送出する。
+
+        ★商品リンクの自動設定はproductionでは呼ばない運用へ変更
+        (2026年8月29日、ARTICLE-001の実機再実行を踏まえた運用方針の変更)★
+        上記の「商品リンク設定は完成実装」段階を実機(ARTICLE-001、2商品)
+        で実行したところ、1商品目のURL入力・「適用」・<a>生成までは成功
+        したが、2商品目で`_wait_for_product_link_applied()`が3000ms以内に
+        対象ブロック内へのリンク反映を確認できず`needs_review`へ安全停止
+        した。note.com側の商品リンク設定UI(フローティング編集ツール
+        バー・URL入力欄・「適用」ボタン)はこれまでの一連の実機実行で
+        繰り返し不安定さが見つかっており(URL入力欄の消失、値の残留・
+        連結、`position: fixed`によるviewport外配置など)、これ以上の
+        自動化追跡はコストに見合わないと判断した。
+
+        そのため、`product_links`が指定されている記事についても、
+        `_apply_product_links()`・`_assert_links_match()`は**呼び出さない**
+        ように変更した。本文には`build_body_with_hashtags()`/
+        `build_product_links_trailer()`が生成する商品導線テキスト
+        (「商品名」「→ 商品を見る」)がこれまで通りプレーンテキストとして
+        入力される(ECの生URLを本文に含めないことで商品カード自動変換を
+        避ける、という既存の安全設計はそのまま維持している)が、実際の
+        リンク設定(`<a>`要素の生成)は行わない。商品名・「→ 商品を見る」は
+        リンクの無い通常のテキストとして下書きに残る。
+
+        `_apply_product_links()`・`_set_link_on_text_occurrence()`・
+        `_assert_links_match()`・`_find_product_link_block()`・
+        `_wait_for_product_link_applied()`・`_ensure_product_link_block_
+        in_viewport()`・`_find_active_link_toolbar_button()`・
+        `_ensure_link_button_in_viewport()`・`_find_url_input_textarea()`・
+        `_find_url_apply_button()`・`_log_url_input_diagnostics()`をはじめと
+        する商品リンク自動設定関連のメソッド・例外クラスは、**削除せず
+        コードとして残している**(dead code化。将来note.com側のUIが安定
+        した場合の再検証に備えるため)。`product_links`が指定された記事の
+        最終的な`status`をどう扱うか(下書き作成自体は成功しているが、
+        リンク設定は人間が行う必要があることを示す)は、このメソッドの
+        呼び出し元(`main.py`/`StatusManager`)の責務であり、
+        `create_draft()`自体はSheetsのstatusには一切関与しない(この設計は
+        従来から変更していない)。
         """
         tags = normalize_tags(article.tag_list())
         product_links = parse_product_links(article.product_links)
@@ -1299,27 +1334,19 @@ class NotePoster:
         self._screenshot(page, "03_body_filled")
 
         if product_links:
-            logger.info("商品導線に本文末尾の商品導線を設定(%d件)", len(product_links))
-            self._run_step(
-                page,
-                "商品導線リンク設定",
-                lambda: self._apply_product_links(page, body_locator, product_links),
+            logger.info(
+                "商品導線テキスト(%d件)は本文に含めていますが、リンク設定は"
+                "行いません(商品名・「→ 商品を見る」はリンクの無い通常テキスト"
+                "のまま下書きに残ります。人間による手動でのリンク設定が必要です)。",
+                len(product_links),
             )
-            self._screenshot(page, "04_product_links_applied")
 
-        logger.info("本文・商品導線の読み戻しで内容を確認(下書き保存前)")
+        logger.info("本文の読み戻しで内容を確認(下書き保存前)")
         self._run_step(
             page,
             "本文read-back確認(保存前)",
             lambda: self._assert_body_matches(
                 page, body_locator, composed_body, hashtag_line, stage="保存前"
-            ),
-        )
-        self._run_step(
-            page,
-            "商品導線リンク確認(保存前)",
-            lambda: self._assert_links_match(
-                page, body_locator, product_links, stage="保存前"
             ),
         )
 
@@ -1333,19 +1360,12 @@ class NotePoster:
         logger.info("保存完了(自動保存表示の解消)を確認")
         self._run_step(page, "保存完了確認", lambda: self._wait_for_autosave_idle(page))
 
-        logger.info("本文・商品導線の読み戻しで内容を再確認(下書き保存後)")
+        logger.info("本文の読み戻しで内容を再確認(下書き保存後)")
         self._run_step(
             page,
             "本文read-back確認(保存後)",
             lambda: self._assert_body_matches(
                 page, body_locator, composed_body, hashtag_line, stage="保存後"
-            ),
-        )
-        self._run_step(
-            page,
-            "商品導線リンク確認(保存後)",
-            lambda: self._assert_links_match(
-                page, body_locator, product_links, stage="保存後"
             ),
         )
 

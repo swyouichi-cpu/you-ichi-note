@@ -7,6 +7,7 @@ from src.models import Article, Status
 from src.status_manager import (
     DoubleProcessingGuard,
     DraftCreationVerificationError,
+    ManualLinkSetupVerificationError,
     StatusManager,
 )
 
@@ -189,6 +190,69 @@ def test_reconcile_inconsistent_ready_with_note_url_moves_to_needs_review():
     assert updated["a1"].status == Status.NEEDS_REVIEW.value
     assert updated["a1"].note_url == "https://note.com/x/n/abc"
     assert updated["a2"].status == Status.READY.value  # 正常なreadyは変更しない
+
+
+def test_mark_needs_review_with_note_url_sets_status_note_url_and_message():
+    # 商品リンク手動設定待ち(2026年8月29日、ARTICLE-001の実機実行を
+    # 踏まえた運用方針の変更): 下書き作成自体は成功したが商品リンクの
+    # 自動設定は行っていない記事を、note_urlを保持したままneeds_review
+    # へ倒せることを確認する。
+    article = make_article(status=Status.PROCESSING.value)
+    sheets = FakeSheetsClient([article])
+    manager = StatusManager(sheets)
+
+    manager.mark_needs_review_with_note_url(
+        article,
+        note_url="https://note.com/x/n/abc",
+        message="商品リンクの手動設定が必要です。",
+    )
+
+    updated = sheets.list_articles()[0]
+    assert updated.status == Status.NEEDS_REVIEW.value
+    assert updated.note_url == "https://note.com/x/n/abc"
+    assert updated.error_message == "商品リンクの手動設定が必要です。"
+
+
+def test_mark_needs_review_with_note_url_is_not_picked_up_as_ready_inconsistency():
+    # needs_review + note_url は、readyのまま残る不整合の検知
+    # (reconcile_inconsistent_ready_with_note_url)とは衝突しない
+    # (statusがreadyではないため対象外になる)ことを確認する。
+    article = make_article(status=Status.PROCESSING.value)
+    sheets = FakeSheetsClient([article])
+    manager = StatusManager(sheets)
+
+    manager.mark_needs_review_with_note_url(
+        article, note_url="https://note.com/x/n/abc", message="商品リンクの手動設定が必要です。"
+    )
+
+    inconsistent = manager.reconcile_inconsistent_ready_with_note_url()
+    assert inconsistent == []
+    updated = sheets.list_articles()[0]
+    assert updated.status == Status.NEEDS_REVIEW.value  # 変更されていない
+    assert updated.note_url == "https://note.com/x/n/abc"  # 変更されていない
+
+
+def test_mark_needs_review_with_note_url_raises_when_status_write_is_not_reflected():
+    # 実機で観測された不整合(mark_draft_created()と同種)の再現:
+    # 書き込みAPI自体が例外を出さなくても、read-back検証で不一致を検知し、
+    # ManualLinkSetupVerificationErrorを送出する(呼び出し側main.pyが
+    # 「正常成功」として扱わないようにするため)。
+    article = make_article(status=Status.PROCESSING.value)
+    sheets = FlakyStatusSheetsClient([article])
+    manager = StatusManager(sheets)
+
+    with pytest.raises(ManualLinkSetupVerificationError):
+        manager.mark_needs_review_with_note_url(
+            article,
+            note_url="https://note.com/x/n/abc",
+            message="商品リンクの手動設定が必要です。",
+        )
+
+    updated = sheets.list_articles()[0]
+    # フォールバックのmark_needs_review()により、statusは最終的に
+    # needs_reviewへ倒れる(mark_draft_createdと同じ設計)。
+    assert updated.status == Status.NEEDS_REVIEW.value
+    assert "read-back" in updated.error_message or "反映" in updated.error_message
 
 
 def test_mark_error_records_stage_in_message():

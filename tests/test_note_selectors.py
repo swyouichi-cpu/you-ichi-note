@@ -3689,6 +3689,103 @@ def test_apply_product_links_stops_before_second_link_when_first_link_never_appl
     assert page.locator(".editor a").count() == 0
 
 
+# -- 商品リンク自動設定をproductionでは呼ばない運用への変更(ARTICLE-001の -----
+# 実機実行を踏まえた運用方針の変更、2026年8月29日)
+#
+# note.com側の商品リンク設定UI(フローティング編集ツールバー・URL入力欄・
+# 「適用」ボタン)の実機での不安定さ(URL入力欄の消失、値の残留・連結、
+# position: fixedによるviewport外配置、2商品目の<a>反映timeoutなど)を
+# 受けて、create_draft()はproduct_linksが指定されていても
+# _apply_product_links()・_assert_links_match()を呼ばない運用に変更した。
+# 商品リンク自動設定関連のメソッド・例外クラス自体は削除せず、将来
+# note.com側のUIが安定した場合の再検証に備えて残している。
+
+
+def test_create_draft_source_does_not_call_product_link_automation():
+    """create_draft()のソースに、_apply_product_links()・
+    _assert_links_match()の呼び出しが含まれていないことを確認する回帰
+    テスト(2026年8月29日、商品リンク自動設定をproductionでは呼ばない
+    運用への変更)。docstringの説明文中にはこれらのメソッド名が経緯の
+    説明として登場するため、docstringを除いた実際のコード行だけを対象に
+    する。
+    """
+    import inspect
+
+    source = inspect.getsource(NotePoster.create_draft)
+    doc = NotePoster.create_draft.__doc__ or ""
+    code_only = source.replace(doc, "")
+    assert "self._apply_product_links(" not in code_only
+    assert "self._assert_links_match(" not in code_only
+
+
+def test_create_draft_source_still_saves_draft_and_verifies_body_readback():
+    """create_draft()が、商品リンク自動設定を呼ばなくなった後も、
+    タイトル・本文の入力、下書き保存、保存前後の本文read-back確認は
+    引き続き行っていることをソースから確認する回帰テスト。
+    """
+    import inspect
+
+    source = inspect.getsource(NotePoster.create_draft)
+    doc = NotePoster.create_draft.__doc__ or ""
+    code_only = source.replace(doc, "")
+    assert "self._fill_title(" in code_only
+    assert "self._fill_body(" in code_only
+    assert "self._save_draft(" in code_only
+    assert code_only.count("self._assert_body_matches(") == 2
+
+
+def test_product_link_automation_methods_still_exist_for_future_reenablement():
+    """商品リンク自動設定関連のメソッド・例外クラスが、production run
+    pathから呼ばれなくなった後も削除されずに残っていることを確認する
+    回帰テスト(将来note.com側のUIが安定した場合の再検証に備えるため)。
+    """
+    for method_name in (
+        "_apply_product_links",
+        "_assert_links_match",
+        "_set_link_on_text_occurrence",
+        "_find_product_link_block",
+        "_select_product_link_text_in_block",
+        "_wait_for_product_link_applied",
+        "_ensure_product_link_block_in_viewport",
+        "_find_active_link_toolbar_button",
+        "_find_url_input_textarea",
+        "_find_url_apply_button",
+        "_log_url_input_diagnostics",
+    ):
+        assert hasattr(NotePoster, method_name), f"{method_name} が削除されています"
+
+    from src import note as note_module
+
+    for class_name in (
+        "LinkButtonObservationStop",
+        "UrlInputObservationStop",
+        "UrlApplyObservationStop",
+        "UrlInputDisappearedObservationStop",
+        "LinkButtonOutOfViewportError",
+        "ProductLinkBlockOutOfViewportError",
+    ):
+        assert hasattr(note_module, class_name), f"{class_name} が削除されています"
+
+
+def test_build_product_links_trailer_still_produces_plain_text_without_urls(page):
+    # 商品リンク自動設定を呼ばなくなった後も、本文には商品名・「→ 商品を
+    # 見る」がプレーンテキストとして残ること(ECの生URLは含まれない)を
+    # 確認する。
+    links = [
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+        ProductLink(
+            label="TOY JAM 瀬戸内レモン月桂樹", url="https://you-ichi.jp/?pid=191552342"
+        ),
+    ]
+    body = build_body_with_hashtags("本文です。", [], links)
+
+    assert "TOY JAM 瀬戸内レモン" in body
+    assert "TOY JAM 瀬戸内レモン月桂樹" in body
+    assert body.count("→ 商品を見る") == 2
+    assert "https://" not in body
+    assert "you-ichi.jp" not in body
+
+
 def test_assert_body_matches_detects_card_like_extra_content_in_product_trailer(page):
     # 実機で発生した不具合(本文中の生URLがnoteによって商品カードへ自動
     # 変換され、本文read-backで想定外の追加テキストが検出された)の再現。

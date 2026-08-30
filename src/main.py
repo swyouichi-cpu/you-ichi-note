@@ -6,6 +6,14 @@
   fetch       次に処理すべき記事があるか確認するだけ(何も書き換えない)
   run         reconcile -> 対象記事取得 -> processing -> note下書き作成
               -> Sheetsへの書き戻し(read-back検証込み) -> draft_created
+
+product_links(商品リンク)が指定されている記事は、下書き作成自体には
+成功しても draft_created にはせず、note_url を保持したまま needs_review
+へ倒す(2026年8月29日、ARTICLE-001の実機実行を踏まえた運用方針の変更。
+詳細はsrc/note.pyのcreate_draft()・src/status_manager.pyの
+mark_needs_review_with_note_url()のdocstringを参照)。商品導線テキスト
+(商品名・「→ 商品を見る」)は本文にプレーンテキストとして残るが、実際の
+リンク設定は人間が手動で行う。
 """
 from __future__ import annotations
 
@@ -18,6 +26,7 @@ from src.sheets import SheetsClient
 from src.status_manager import (
     DoubleProcessingGuard,
     DraftCreationVerificationError,
+    ManualLinkSetupVerificationError,
     StatusManager,
 )
 
@@ -92,7 +101,7 @@ def cmd_run(_args: argparse.Namespace) -> int:
     try:
         # 遅延import。Playwright/note関連の依存を、Sheetsのみを使う
         # reconcile/fetchサブコマンドの実行時には読み込ませないため。
-        from src.note import NotePoster
+        from src.note import NotePoster, parse_product_links
     except ImportError:
         manager.mark_needs_review(
             article, stage="note", message="src/note.py の読み込みに失敗しました。"
@@ -109,6 +118,66 @@ def cmd_run(_args: argparse.Namespace) -> int:
         )
         manager.mark_needs_review(article, stage="note", message=str(exc))
         return 1
+
+    # product_linksが指定されている記事は、商品リンクの自動設定を行って
+    # いない(2026年8月29日、ARTICLE-001の実機実行を踏まえた運用方針の
+    # 変更。note.com側の商品リンク設定UIの実機での不安定さを理由に、
+    # create_draft()は_apply_product_links()を呼ばなくなった。詳細は
+    # src/note.pyのcreate_draft()のdocstringを参照)。create_draft()が
+    # 例外を出さずに戻ってきた時点でparse_product_links()自体は既に
+    # 成功しているため、ここでの再解釈は失敗しないはずだが、万一失敗
+    # した場合も安全側に倒しneeds_reviewとする。
+    try:
+        product_links = parse_product_links(article.product_links)
+    except Exception as exc:  # noqa: BLE001 - 想定外でも必ずSheetsに記録する
+        logger.exception("product_links列の再解釈に失敗しました")
+        logger.error(
+            "最終結果: id=%s note_url=%s final_status=needs_review"
+            "(product_links再解釈失敗)",
+            article.id,
+            note_url,
+        )
+        manager.mark_needs_review(
+            article,
+            stage="note",
+            message=(
+                f"note下書き作成(note_url取得)には成功しましたが、"
+                f"product_links列の再解釈に失敗しました: {exc}"
+                f" note_url={note_url}"
+            ),
+        )
+        return 1
+
+    if product_links:
+        message = (
+            f"note下書きの作成・下書き保存は成功しました(note_url={note_url})。"
+            f"商品リンク({len(product_links)}件)の自動設定は行っていません"
+            "(note.com側の商品リンク設定UIの実機での不安定さのため)。本文には"
+            "商品名・「→ 商品を見る」が通常テキストとして入っています。note"
+            "下書きを開き、該当箇所へ手動でリンクを設定したうえで、status を "
+            "draft_created に変更してください。"
+        )
+        try:
+            manager.mark_needs_review_with_note_url(
+                article, note_url=note_url, message=message
+            )
+        except ManualLinkSetupVerificationError as exc:
+            logger.error(
+                "最終結果: id=%s note_url=%s final_status=needs_review"
+                "(read-back検証失敗) detail=%s",
+                article.id,
+                note_url,
+                exc,
+            )
+            return 1
+
+        logger.info(
+            "最終結果: id=%s note_url=%s "
+            "final_status=needs_review(商品リンク手動設定待ち)",
+            article.id,
+            note_url,
+        )
+        return 0
 
     # Craft連携(Phase4)が未実装のうちは、note下書きが作れた時点でdraft_createdとする。
     # mark_draft_created() は書き込み後にSheetsを読み戻し、実際にstatusが
