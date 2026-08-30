@@ -2167,6 +2167,142 @@ def test_ensure_link_button_in_viewport_raises_when_bounding_box_is_none(page):
         poster._ensure_link_button_in_viewport(page, link_button, timeout_ms=300)
 
 
+# -- position: fixed祖先の検知(ARTICLE-001の実機再実行を踏まえた診断強化、 --
+# 2026年8月29日)。scroll_into_view_if_needed()後もbounding_box().yがほぼ
+# 変化しなかった実機事象の原因を、次回の実機実行で1回で切り分けられる
+# ようにするための診断強化。
+
+
+def test_bounding_box_within_viewport_is_a_pure_function_without_scroll_position():
+    """`_bounding_box_within_viewport()`が`box`と`viewport`だけを引数に
+    取り、`window.scrollY`のような追加のスクロール位置情報を一切必要と
+    しない(=box自体が既にviewport相対座標であることを前提とした純粋
+    関数である)ことをシグネチャから確認する回帰テスト。scroll位置を別途
+    加減算する実装に変更されていないことの確認(2026年8月29日、
+    ARTICLE-001の実機実行を踏まえた確認)。
+    """
+    import inspect
+
+    params = list(inspect.signature(_bounding_box_within_viewport).parameters)
+    assert params == ["box", "viewport"]
+
+
+def test_ensure_link_button_in_viewport_bounding_box_is_viewport_relative_after_real_scroll(
+    page,
+):
+    # Playwrightのbounding_box()は要素のgetBoundingClientRect()相当の
+    # viewport相対座標(documentページ全体に対する絶対座標ではない)で
+    # あることを、実際にブラウザをスクロールさせて確認する(ARTICLE-001の
+    # 実機実行で座標系の解釈に疑義が出たための確認)。scroll後、
+    # window.scrollYを別途加減算しなくても、bounding_box()の値をそのまま
+    # _bounding_box_within_viewport()に渡せば正しく判定できる。
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        """
+        <div style="height: 2000px;"></div>
+        <div data-active="true" role="toolbar" id="desktop-toolbar">
+          <button aria-label="リンク" style="width: 40px; height: 40px;">リンク</button>
+        </div>
+        """
+    )
+    link_button = page.locator(f'{_ACTIVE_TOOLBAR_SELECTOR_FOR_TESTS} button[aria-label="リンク"]')
+
+    box_before = link_button.bounding_box()
+    assert box_before["y"] > 600  # scroll前はまだviewport外
+
+    page.evaluate("() => window.scrollTo(0, 1600)")
+    scroll_y = page.evaluate("() => window.scrollY")
+    box_after = link_button.bounding_box()
+
+    assert scroll_y > 0
+    # bounding_box()は既にviewport相対なので、scroll_yを加減算しなくても
+    # そのままviewport内判定に使える。
+    assert 0 <= box_after["y"] <= 600
+    assert _bounding_box_within_viewport(box_after, {"width": 800, "height": 600})
+
+
+def test_ensure_link_button_in_viewport_error_mentions_fixed_position_ancestor(page):
+    # position: fixedの祖先が原因でscroll_into_view_if_needed()が効果を
+    # 持たない場合、エラーメッセージにその旨が含まれ、次回の実機実行で
+    # 「スクロールでは解決できない」ことを即座に判断できることを確認する。
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        """
+        <div data-active="true" role="toolbar" id="desktop-toolbar"
+             style="position: fixed; top: 900px; left: 10px;">
+          <button aria-label="リンク">リンク</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+    link_button = page.locator(f'{_ACTIVE_TOOLBAR_SELECTOR_FOR_TESTS} button[aria-label="リンク"]')
+
+    with pytest.raises(LinkButtonOutOfViewportError) as exc_info:
+        poster._ensure_link_button_in_viewport(page, link_button, timeout_ms=500)
+
+    assert "position: fixed" in str(exc_info.value)
+
+
+def test_ensure_link_button_in_viewport_logs_fixed_position_ancestor(page, caplog):
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        """
+        <div data-active="true" role="toolbar" id="desktop-toolbar"
+             style="position: fixed; top: 900px; left: 10px;">
+          <button aria-label="リンク">リンク</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+    link_button = page.locator(f'{_ACTIVE_TOOLBAR_SELECTOR_FOR_TESTS} button[aria-label="リンク"]')
+
+    with caplog.at_level("INFO"):
+        with pytest.raises(LinkButtonOutOfViewportError):
+            poster._ensure_link_button_in_viewport(page, link_button, timeout_ms=500)
+
+    assert "position_fixed祖先" in caplog.text
+    assert "'fixed': True" in caplog.text
+
+
+def test_ensure_link_button_in_viewport_does_not_mention_fixed_when_element_is_simply_too_tall(
+    page,
+):
+    # position: fixedが原因ではない(単に要素自体がviewportより高さが
+    # 大きく、スクロールしても全体は収まりきらない)ケースでは、誤って
+    # position: fixedの言及をしないことを確認する(scroll containerが
+    # windowではない場合に誤って安全判定しないことの確認と対をなす、
+    # 「原因ではないものを誤って原因扱いしない」確認)。
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.set_content(
+        """
+        <div data-active="true" role="toolbar" id="desktop-toolbar">
+          <button aria-label="リンク" style="width: 40px; height: 900px;">リンク</button>
+        </div>
+        """
+    )
+    poster = _bare_poster()
+    link_button = page.locator(f'{_ACTIVE_TOOLBAR_SELECTOR_FOR_TESTS} button[aria-label="リンク"]')
+
+    with pytest.raises(LinkButtonOutOfViewportError) as exc_info:
+        poster._ensure_link_button_in_viewport(page, link_button, timeout_ms=500)
+
+    assert "position: fixed" not in str(exc_info.value)
+
+
+def test_ensure_link_button_in_viewport_fixed_probe_is_read_only():
+    """position: fixed祖先の検知(`_FIXED_ANCESTOR_PROBE_JS`)が、
+    `getComputedStyle()`による読み取りのみであり、クリック・フォーカス・
+    値の変更等の操作を一切行わないことをソースから確認する回帰テスト。
+    """
+    from src import note as note_module
+
+    probe_js = note_module._FIXED_ANCESTOR_PROBE_JS
+    assert "getComputedStyle" in probe_js
+    assert ".click(" not in probe_js
+    assert ".focus(" not in probe_js
+    assert ".blur(" not in probe_js
+
+
 def test_ensure_link_button_in_viewport_does_not_use_force_or_javascript_click():
     """クリック前のviewport確認処理が、force=Trueによるactionability
     check迂回や、JavaScript経由の直接クリック(el.click()等)を一切

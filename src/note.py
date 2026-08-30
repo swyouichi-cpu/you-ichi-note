@@ -491,6 +491,31 @@ _PRODUCT_LINK_APPLY_TIMEOUT_MS = 3000
 # 診断データが際限なく増えないよう、記録件数の上限を設ける。
 _MAX_DIAG_ENTRIES = 300
 
+# クリック対象の要素自身、またはその祖先のいずれかがCSSの`position: fixed`
+# かどうかを読み取り専用で調べるためのJS(2026年8月29日、ARTICLE-001の
+# 実機実行でscroll_into_view_if_needed()後もbounding_box().yがほぼ変化
+# しない事象が発生したことを踏まえて追加)。`position: fixed`の要素は
+# ページをスクロールしても画面上の位置が変化しないため、
+# scroll_into_view_if_needed()では表示範囲内へ移動できない。クリックや
+# フォーカスの変更は一切行わない(getComputedStyle()による読み取りのみ)。
+_FIXED_ANCESTOR_PROBE_JS = """
+(el) => {
+    let node = el;
+    while (node && node !== document.documentElement) {
+        const style = window.getComputedStyle(node);
+        if (style.position === 'fixed') {
+            return {
+                fixed: true,
+                tagName: node.tagName,
+                className: node.className || null,
+            };
+        }
+        node = node.parentElement;
+    }
+    return { fixed: false };
+}
+"""
+
 
 def _strip_query(url: str) -> str:
     """URLからクエリ文字列を除去する(トークン等が紛れ込む可能性への念のための対策)。"""
@@ -1906,6 +1931,43 @@ class NotePoster:
         でHTML/スクリーンショット/診断データを保存したうえで
         `LinkButtonOutOfViewportError`を送出して安全停止する(呼び出し側
         でneeds_reviewに倒れる)。
+
+        ★`position: fixed`祖先の検知(2026年8月29日、ARTICLE-001の実機
+        再実行で判明した事象を踏まえた診断強化)★
+        実機のGitHub Actions実行(ARTICLE-001)で、`scroll_into_view_if_
+        needed()`を実行しても`bounding_box()`の`y`がほぼ変化しない
+        (例: scroll前`y≈2094`→scroll後`y≈2090`。一方`window.scrollY`は
+        `0`から`2010`へ変化していた)という事象が発生した。
+
+        `Locator.bounding_box()`はPlaywrightの公式挙動として、要素の
+        `getBoundingClientRect()`相当の**viewport相対座標**(スクロール量
+        に応じて変化する座標)を返す(document(ページ全体)相対の座標では
+        ない)。このことはローカルで実際に検証済みで、`position: static`
+        (通常の文書フロー)の要素は`window.scrollTo()`によるスクロールに
+        応じて`bounding_box().y`が変化する一方、`position: fixed`の要素は
+        スクロールしても`bounding_box().y`が(誤差程度を除き)まったく
+        変化しないことを確認している。したがって
+        `_bounding_box_within_viewport()`が`box["y"]`をそのまま
+        viewportの範囲と比較している実装自体は座標系の誤解ではなく正しい。
+
+        実機で観測された「scroll前後でほぼ`y`が変化しない」という挙動は、
+        クリック対象のボタン(またはその祖先、実機では商品導線ツールバーを
+        包む`<div class="... fixed left-0 top-0 z-50 size-full">`)が
+        `position: fixed`であるためだと考えられる。`position: fixed`の
+        要素はCSSの仕様上、ページをどれだけスクロールしても画面上の位置が
+        変化しない(=`window`のスクロールでは`viewport`内へ移動できない)
+        ため、`scroll_into_view_if_needed()`は原理的にこの状況を解決
+        できない。
+
+        この原因を次回の実機実行時により明確に切り分けられるよう、
+        ボタン自身とその祖先要素を`position: fixed`かどうか読み取り専用で
+        検査し(`getComputedStyle()`。クリック・フォーカス等の操作は
+        一切行わない)、診断ログおよび最終的なエラーメッセージへ含める
+        ようにした。`position: fixed`の祖先が見つかった場合、それは
+        「スクロールでは解決できない」ことを示す情報であり、`_bounding_
+        box_within_viewport()`によるviewport内判定そのもの・安全停止の
+        挙動(`needs_review`へ倒れること)は一切変更していない。viewport
+        サイズ(1280x800)自体も今回は変更していない。
         """
         try:
             viewport_size = page.viewport_size
@@ -1925,13 +1987,19 @@ class NotePoster:
             button_box_before = link_button.bounding_box()
         except PlaywrightError:
             button_box_before = None
+        try:
+            fixed_position_ancestor = link_button.evaluate(_FIXED_ANCESTOR_PROBE_JS)
+        except PlaywrightError:
+            fixed_position_ancestor = None
         logger.info(
             "商品導線リンクボタン クリック前診断: viewport=%s scroll=%s "
-            "toolbar_bbox=%s button_bbox(scroll前)=%s",
+            "toolbar_bbox=%s button_bbox(scroll前)=%s "
+            "position_fixed祖先=%s",
             viewport_size,
             scroll_position,
             toolbar_box,
             button_box_before,
+            fixed_position_ancestor,
         )
 
         try:
@@ -1958,8 +2026,20 @@ class NotePoster:
 
         if not _bounding_box_within_viewport(button_box_after, viewport_size):
             self._capture_failure(page, "商品導線リンクボタンviewport確認")
+            fixed_hint = ""
+            if fixed_position_ancestor and fixed_position_ancestor.get("fixed"):
+                fixed_hint = (
+                    "position: fixedの要素"
+                    f"({fixed_position_ancestor.get('tagName')}."
+                    f"{fixed_position_ancestor.get('className')})が祖先に"
+                    "見つかりました。position: fixedの要素はページの"
+                    "スクロールでは画面上の位置が変化しないため、"
+                    "scroll_into_view_if_needed()では表示範囲内へ移動でき"
+                    "ません。 "
+                )
             raise LinkButtonOutOfViewportError(
-                "リンクボタンをscroll_into_view_if_needed()した後も、"
+                f"{fixed_hint}リンクボタンをscroll_into_view_if_needed()"
+                "した後も、"
                 f"表示範囲(viewport {viewport_size['width']}x"
                 f"{viewport_size['height']})に完全には収まっていません"
                 f"(bounding_box(scroll後)={button_box_after!r}、"

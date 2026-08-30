@@ -836,7 +836,11 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
     `element.click()`のような、実際にクリック可能かどうかの保証を失う
     手段には頼らず、`LinkButtonOutOfViewportError`で安全停止する。
     クリック自体のタイムアウトも既定の30秒ではなく短い上限
-    (`_LINK_BUTTON_CLICK_TIMEOUT_MS`)にする
+    (`_LINK_BUTTON_CLICK_TIMEOUT_MS`)にする。要素(またはその祖先)が
+    `position: fixed`であるかを`getComputedStyle()`で読み取り専用に
+    検査し、診断ログとエラーメッセージへ含める(`position: fixed`の
+    要素はスクロールしても画面上の位置が変化しないため、クリック可否の
+    判定自体は変更せず、原因の切り分けに使う)
 18. 商品リンクの「適用」ボタンは、ページ全体からの文字列検索ではなく、
     URL入力欄の特定に使ったのと同じアクティブなツールバーをスコープと
     した`get_by_role("button", name="適用", exact=True)`で一意に特定する
@@ -883,6 +887,7 @@ Phase 1の完成をもって、以下の安全要件を確定事項とします�
 | `ARTICLE-001`(隣接2行判定への再修正) | 行単位の完全一致への修正後の再検討 | 実機再実行前にコードレビューで判明。商品名単独一致では誤検出の余地が残ると判断し、商品名→「→ 商品を見る」の隣接2行判定へ再修正・診断ログを追加。対応不要 |
 | `ARTICLE-001`(direct child scopeへの限定) | 実機HTMLダンプの直接解析(ユーザーによる) | 真因は探索範囲がdescendantまで及んでいたこと(隣接2行判定自体は正しかった)。`:scope > p`でdirect childのみに限定。対応不要 |
 | `ARTICLE-001`(全文完全一致への厳密化) | direct child限定後の実機再実行Artifactの直接解析(ユーザーによる) | 真因は巨大なdirect-child `<p>`の途中にも同じ2行が含まれ候補になっていたこと。候補条件をブロック全文の完全一致へ厳密化。対応不要 |
+| `ARTICLE-001`(commit c6c3526での再実行) | 商品導線ブロック特定を突破した後の実機再実行 | 商品導線ブロックの誤判定は解消。次段階の`LinkButtonOutOfViewportError`で`needs_review`。原因は`position: fixed`要素にscroll_into_view_if_needed()が効かないこと。診断強化を追加。対応不要 |
 
 `TEST-003`(2026年8月28日)での確認事項:
 GitHub Actions=Success / Sheets status=`draft_created` / note_url正常記録 /
@@ -1114,6 +1119,32 @@ scopeへの限定後、実機で`ARTICLE-001`を再実行したところ、再�
 最終チェック・診断ログの仕組み自体は変更していない(詳細は「10. 商品
 リンク」)。この修正もローカルpytestでの確認のみで、まだ実際のGitHub
 Actions実行(`ARTICLE-001`の再実行)では検証していない。
+
+`ARTICLE-001`(commit c6c3526での再実行)で判明した事項: 上記の全文
+完全一致への厳密化を実機で再実行したところ、商品導線ブロックが2件見つかる
+という従来のエラーは解消した。かわりに、`_ensure_link_button_in_
+viewport()`で`LinkButtonOutOfViewportError`が発生し`needs_review`へ
+安全停止した。`scroll_into_view_if_needed()`を実行しても`bounding_box()`
+の`y`がほぼ変化しない(scroll前`y≈2094`→scroll後`y≈2090`、一方
+`window.scrollY`は`0`から`2010`へ変化)という事象だった。ローカルで
+実際にブラウザをスクロールさせて検証した結果、Playwrightの
+`bounding_box()`は要素の`getBoundingClientRect()`相当の**viewport相対
+座標**であり(`_bounding_box_within_viewport()`の座標系の解釈自体は
+正しい)、`position: static`(通常の文書フロー)の要素はスクロールに
+応じて`bounding_box().y`が変化するのに対し、`position: fixed`の要素は
+スクロールしても`bounding_box().y`がまったく変化しないことを確認した。
+実機のツールバーは`<div class="... fixed left-0 top-0 z-50 size-full">`
+に包まれており(過去の実機Artifactで確認済み)、`position: fixed`である
+ため、CSSの仕様上ページのスクロールでは画面上の位置が変化せず、
+`scroll_into_view_if_needed()`では原理的に解決できない。判定自体を緩める
+のではなく、要素(またはその祖先)が`position: fixed`かどうかを
+`getComputedStyle()`で読み取り専用に検査し、診断ログとエラーメッセージへ
+含めるようにした(詳細は「10. 商品リンク」)。これにより次回の実機実行で
+問題が起きた場合も、原因がスクロールでは解決できない`position: fixed`に
+よるものかどうかを1回で判断できる。`_bounding_box_within_viewport()`
+自体の判定・安全停止の挙動・viewportサイズ(1280x800)は変更していない。
+この変更もローカルpytestでの確認のみで、まだ実際のGitHub Actions実行
+(`ARTICLE-001`の再実行)では検証していない。
 
 `ARTICLE-001`は人間が確認するまで`status`を`ready`に戻さない
 (対応済み・変更していない)。
