@@ -1337,6 +1337,116 @@ def test_find_product_link_block_does_not_log_when_no_candidate_found(page, capl
     assert "商品導線ブロック候補" not in caplog.text
 
 
+# -- direct child(:scope > p)へのスコープ限定(ARTICLE-001の実機Artifact直接 --
+# 解析を踏まえた修正、2026年8月29日)。本文editor配下には、ネストした
+# (direct childではない)descendant要素として同じ[label, "→ 商品を見る"]の
+# パターンが偶然出現しうる(実機で確認済み)ため、`body_locator.locator("p")`
+# (descendantまで拾う)ではなく`body_locator.locator(":scope > p")`
+# (direct childのみ)に限定して候補探索する。
+
+
+def test_find_product_link_block_ignores_nested_descendant_p_not_a_direct_child(page):
+    # ARTICLE-001相当のケース: 本文editorの直接の子ではない、ネストした
+    # (別階層の)要素の中にも同じ[label, "→ 商品を見る"]のパターンが
+    # 存在する場合でも、direct childの商品導線ブロック1件だけが候補になる
+    # ことを確認する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        '<div class="hidden-mirror">'
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"  # direct childではない(ネスト)
+        "</div>"
+        "<p>この記事に出てきた商品</p>"
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"  # 本物のdirect child
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    block = poster._find_product_link_block(
+        page,
+        body_locator,
+        ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+    )
+
+    assert block.inner_text().strip() == "TOY JAM 瀬戸内レモン\n→ 商品を見る"
+    # direct childのpであることを確認する(ネストしたものではない)。
+    assert page.evaluate(
+        "(el) => el.parentElement.classList.contains('editor')", block.element_handle()
+    )
+
+
+def test_find_product_link_block_raises_when_only_a_nested_descendant_matches(page):
+    # direct childには有効な商品導線が無く、descendant(ネストした要素)にしか
+    # 一致するpが無い場合は、0件として安全停止することを確認する
+    # (descendantまで拾ってしまう旧実装への回帰防止)。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        '<div class="hidden-mirror">'
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"
+        "</div>"
+        "<p>この記事に出てきた商品</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    with pytest.raises(NotePosterError):
+        poster._find_product_link_block(
+            page,
+            body_locator,
+            ProductLink(label="TOY JAM 瀬戸内レモン", url="https://example.com/a"),
+        )
+
+
+def test_find_product_link_block_diagnostic_log_uses_direct_child_indices_only(page, caplog):
+    # 診断ログに記録されるblock_indexは、direct child(:scope > p)として
+    # 評価した際のインデックスであり、descendant(ネストしたp)は候補にも
+    # ログにも含まれないことを確認する。
+    page.set_content(
+        '<div class="editor" contenteditable="true">'
+        '<div class="hidden-mirror">'
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"
+        "</div>"
+        "<p>この記事に出てきた商品</p>"
+        "<p>TOY JAM 瀬戸内レモン<br>→ 商品を見る</p>"
+        "</div>"
+    )
+    poster = _bare_poster()
+    body_locator = page.locator(".editor")
+
+    with caplog.at_level("INFO"):
+        poster._find_product_link_block(
+            page,
+            body_locator,
+            ProductLink(label="TOY JAM 瀬戸内レモン", url="https://you-ichi.jp/?pid=192116331"),
+        )
+
+    # direct childのp列挙(:scope > p)では [この記事に出てきた商品, 商品導線]
+    # の2件のみが対象になり、商品導線はそのうちindex=1である。
+    assert "'block_index': 1" in caplog.text
+    # ログの内容が1件の候補だけを含み、ネストしたdescendantの分は含まれて
+    # いない(=候補が1件だけなので複数件のあいまいエラーにもならない)こと。
+    assert "'block_index': 2" not in caplog.text
+
+
+def test_find_product_link_block_source_scopes_to_direct_children_only():
+    """商品導線ブロックの探索が、descendantまで拾う通常のCSSセレクタ
+    (`body_locator.locator("p")`)ではなく、`:scope > p`によるdirect
+    childへの明示的なスコープ限定であることをソースから確認する回帰
+    テスト(2026年8月29日、ARTICLE-001の実機Artifact直接解析を踏まえた
+    修正)。docstringの説明文中にも`locator("p")`という字面が登場する
+    ため、docstringを文字列置換で除去するのではなく、実際に`blocks`へ
+    代入している行を正規表現で直接取り出して判定する。
+    """
+    import inspect
+    import re
+
+    source = inspect.getsource(NotePoster._find_product_link_block)
+    match = re.search(r'blocks = body_locator\.locator\(([^)]*)\)', source)
+    assert match is not None, "blocks = body_locator.locator(...) の行が見つかりません"
+    assert match.group(1) == '":scope > p"'
+
+
 def test_find_product_link_block_matches_exact_label_with_surrounding_whitespace(page):
     # ブロック側のテキストに前後の空白が含まれていても(strip()で吸収)、
     # 完全一致判定できることを確認する。

@@ -1586,8 +1586,40 @@ class NotePoster:
         1件以上見つかった場合(一意に特定できた場合・複数件で安全停止する
         場合の両方を含む)、そのブロックのindexと正規化済み`lines`を
         `logger.info()`で記録する(本文全体ではなく候補ブロックのみ)。
+
+        ★direct child(`:scope > p`)へのスコープ限定(2026年8月29日、
+        ARTICLE-001の実機Artifactの直接解析を踏まえた修正)★
+        上記の隣接2行判定を実装した後も、実機のGitHub Actions実行
+        (ARTICLE-001)で商品名を含むブロックが2件見つかる事象が再現した。
+        今回はユーザーが実機のHTMLダンプを直接解析し、実際には「TOY JAM
+        瀬戸内レモン→ 商品を見る」というテキストが2回入力されているわけ
+        ではなく、本文editor配下に
+
+          - 本文・商品導線などをまとめて内包している(ProseMirrorが内部で
+            生成した)`<p>`要素
+          - その内部に実際の商品導線として存在する、独立した`<p>`要素
+
+        の両方が存在し、`[label, _PRODUCT_LINK_TEXT]`という隣接2行が
+        **両方の`<p>`要素で(内包関係のまま)成立してしまう**ことが原因
+        だと判明した。`body_locator.locator("p")`は通常のCSSセレクタ
+        `"p"`をそのスコープ配下に適用するため、直接の子だけでなく
+        **あらゆる深さのdescendant**(子孫)の`<p>`要素にマッチする
+        (`document.querySelectorAll`と同じ挙動)。実機DOMのdirect child
+        構造を確認すると、商品導線は本文editorの直接の子として独立した
+        `<p>`で存在しており(タイトル・本文本体・「この記事に出てきた
+        商品」見出し・各商品の導線・ハッシュタグ行が、いずれも本文editor
+        の直接の子の`<p>`として並ぶ)、descendantまで拾う必要はそもそも
+        無かった。
+
+        これを受けて、商品導線ブロックの探索スコープを
+        `body_locator.locator(":scope > p")`(本文editorの**直接の子**の
+        `<p>`だけ)に限定した。これにより、内包関係にある「大きな`<p>`」
+        (本文editorの直接の子ではない)は最初から候補探索の対象にすら
+        ならず、隣接2行判定・行構成の最終チェックはそのままdirect child
+        の候補だけに対して行われる。`.first()`/`.nth()`による位置依存の
+        回避(例えば「2件なら後ろを採用する」)は行っていない。
         """
-        blocks = body_locator.locator("p")
+        blocks = body_locator.locator(":scope > p")
         try:
             total = blocks.count()
         except PlaywrightTimeoutError:
